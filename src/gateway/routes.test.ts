@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { closeBillingPublisher, initializeBillingPublisher } from '../billing';
+import {
+  closeBillingPublisher,
+  initializeBillingPublisher,
+  type BillingQueueEvent
+} from '../billing';
 import { createGatewayRuntime } from './runtime';
 import { registerGatewayRoutes } from './routes';
 import { registerGatewayIdempotencyHooks, resetGatewayIdempotencyForTests } from './idempotency';
@@ -16,7 +20,14 @@ import { resetGatewaySchedulingStateForTests } from './scheduler';
 import { closeRawTraceManager, initializeRawTraceManager } from '../raw-trace';
 import { closeCodexOauthStateStore, updateDistributedCredentialEncryption } from '../provider/plugins';
 import { syncGatewayPluginModulesFromConfig } from '../plugins/loader';
-import type { GatewayConfig, ProviderConfig, ProviderPluginConfig, TargetAdapter } from '../types';
+import type { GatewayPluginOutbox } from '../plugins/events';
+import type {
+  GatewayConfig,
+  ProviderConfig,
+  ProviderPluginConfig,
+  SourceAdapter,
+  TargetAdapter
+} from '../types';
 
 describe('gateway routes protocol conversion', () => {
   afterEach(async () => {
@@ -6692,6 +6703,119 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('applies configured provider plugin only when model source and condition match', async () => {
+    process.env.OPENAI_MAIN_DYNAMIC_AUTH = 'dynamic-auth-token';
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const headers = (init?.headers || {}) as Record<string, string>;
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          object: 'response',
+          output_text: 'conditional-plugin',
+          auth_header: headers['x-config-auth'],
+          marker: body.config_plugin_marker
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_responses', ['glm-5', 'other-model'])],
+      [
+        {
+          key: 'openai-main-conditional',
+          enabled: true,
+          providerName: 'openai-main',
+          models: ['glm-*'],
+          sourceAdapters: ['openai_responses'],
+          when: {
+            from: 'request.headers.x-enable-plugin',
+            equals: 'yes'
+          },
+          auth: {
+            strict: true,
+            headers: {
+              'x-config-auth': 'Bearer {{ env.OPENAI_MAIN_DYNAMIC_AUTH }}'
+            },
+            query: {},
+            removeHeaders: [],
+            removeQuery: [],
+            bodySet: {},
+            bodyMerge: {},
+            bodyRemove: []
+          },
+          request: {
+            strict: true,
+            headers: {},
+            query: {},
+            removeHeaders: [],
+            removeQuery: [],
+            bodySet: {
+              config_plugin_marker: 'user={{ request.headers.x-auth-user-id }}'
+            },
+            bodyMerge: {},
+            bodyRemove: []
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const enabled = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-enable-plugin': 'yes',
+          'x-auth-user-id': 'u-conditional'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello config plugin'
+        }
+      });
+      expect(enabled.statusCode).toBe(200);
+
+      const disabled = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-auth-user-id': 'u-conditional'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello without condition'
+        }
+      });
+      expect(disabled.statusCode).toBe(200);
+
+      const [, enabledInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const [, disabledInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+      expect((enabledInit.headers as Record<string, string>)['x-config-auth']).toBe(
+        'Bearer dynamic-auth-token'
+      );
+      expect(JSON.parse(String(enabledInit.body)).config_plugin_marker).toBe('user=u-conditional');
+      expect((disabledInit.headers as Record<string, string>)['x-config-auth']).toBeUndefined();
+      expect(JSON.parse(String(disabledInit.body)).config_plugin_marker).toBeUndefined();
+    } finally {
+      delete process.env.OPENAI_MAIN_DYNAMIC_AUTH;
+      await app.close();
+    }
+  });
+
   it('loads a unified plugin module target adapter for a custom provider protocol', async () => {
     const pluginDir = await mkdtemp(join(tmpdir(), 'gateway-plugin-'));
     const pluginModulePath = join(pluginDir, 'acme-plugin.mjs');
@@ -6838,6 +6962,124 @@ export function createGatewayPlugin() {
     } finally {
       await app.close();
       await rm(pluginDir, { recursive: true, force: true });
+    }
+  });
+
+  it('dispatches plugin source adapter routes through the runtime registry', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp_plugin_source_route',
+          object: 'response',
+          status: 'completed',
+          model: 'glm-5',
+          output: [
+            {
+              id: 'msg_plugin_source_route',
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'hello from upstream',
+                  annotations: []
+                }
+              ]
+            }
+          ],
+          usage: {
+            input_tokens: 3,
+            output_tokens: 4,
+            total_tokens: 7
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([
+      createProviderConfig('openai-main', 'openai_responses', ['glm-5'])
+    ]);
+    const runtime = createGatewayRuntime(config);
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    const sourceAdapter: SourceAdapter = {
+      key: 'acme_source',
+      provider: 'acme',
+      routes: [
+        {
+          method: 'POST',
+          path: '/acme/messages',
+          metadata: {
+            protocol: 'acme'
+          }
+        }
+      ],
+      toStandardRequest(input) {
+        expect(input.source.metadata?.protocol).toBe('acme');
+        return {
+          ok: true,
+          value: {
+            model: String(input.body.model || 'glm-5'),
+            input: String(input.body.prompt || '')
+          }
+        };
+      },
+      fromStandardResponse(input) {
+        return {
+          reply: input.response.output_text,
+          model: input.response.model
+        };
+      },
+      isStreamingRequest() {
+        return false;
+      },
+      buildPassthroughRequest() {
+        return {
+          ok: false,
+          error: 'acme source passthrough is not supported'
+        };
+      }
+    };
+    runtime.sourceAdapters.register(sourceAdapter);
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/acme/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          prompt: 'hello custom source'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody).toMatchObject({
+        model: 'glm-5',
+        input: 'hello custom source'
+      });
+      expect(JSON.parse(response.body)).toEqual({
+        reply: 'hello from upstream',
+        model: 'glm-5'
+      });
+    } finally {
+      await app.close();
     }
   });
 
@@ -8278,6 +8520,105 @@ export function createGatewayPlugin() {
       expect(billingPayload.clientIp).toBe('203.0.113.42');
       expect(billingPayload.attempt).toBeUndefined();
       expect(billingPayload.billing.usage.total_tokens).toBe(20);
+      expect(billingPayload.trace?.request).not.toHaveProperty('body');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('publishes billing events to plugin outbox when webhook and queue are disabled', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_plugin_billing_1',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'hello'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 7,
+            completion_tokens: 9,
+            total_tokens: 16
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+    const billingEvents: BillingQueueEvent[] = [];
+    const outbox: GatewayPluginOutbox<BillingQueueEvent> = {
+      key: 'billing-plugin-only-outbox',
+      transport: 'kafka',
+      append: vi.fn(async (event) => {
+        billingEvents.push(event);
+        return true;
+      })
+    };
+
+    const config = createConfig([
+      createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])
+    ]);
+    config.billing.enabled = true;
+    config.billing.trace = {
+      requestBodyMode: 'full'
+    };
+    config.billingQueue.enabled = false;
+    config.billingWebhook.enabled = false;
+    await initializeBillingPublisher(config.billingQueue, config.billingWebhook, undefined, {
+      outboxes: [outbox]
+    });
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await waitForCondition(() => billingEvents.length === 1);
+      expect(outbox.append).toHaveBeenCalledTimes(1);
+      expect(billingEvents[0]).toMatchObject({
+        requestId: expect.any(String),
+        target: {
+          provider: 'openai',
+          providerName: 'openai-main',
+          model: 'glm-5'
+        },
+        outcome: {
+          status: 'success',
+          statusCode: 200
+        }
+      });
+      expect(billingEvents[0]?.billing.usage.total_tokens).toBe(16);
+      expect(billingEvents[0]?.trace?.request?.body).toEqual({
+        model: 'glm-5',
+        messages: [{ role: 'user', content: 'hello' }]
+      });
     } finally {
       await app.close();
     }

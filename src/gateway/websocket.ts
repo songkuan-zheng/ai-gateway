@@ -26,6 +26,7 @@ import {
 } from './codex-websocket-conversion';
 import { evaluateGatewayPrecheck } from './precheck';
 import type { GatewayRuntime } from './runtime';
+import { shouldRunProviderPlugin } from '../provider/plugins';
 
 interface GatewaySocketContext {
   headers: IncomingHttpHeaders;
@@ -790,22 +791,28 @@ async function applyWebSocketProviderRequestPlugins(
   let upstreamRequest = baseUpstreamRequest;
 
   for (const plugin of context.plugins) {
+    const pluginInput = {
+      request: context.request,
+      config: context.config,
+      source: context.source,
+      sourceProvider: context.sourceProvider,
+      sourceAdapterKey: context.sourceAdapterKey,
+      targetProvider: context.targetProvider,
+      targetProviderConfig: context.targetProviderConfig,
+      targetProviderName: context.targetProviderConfig?.name,
+      model: context.model,
+      passthrough: context.passthrough,
+      streaming: context.streaming,
+      forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
+      upstreamRequest,
+      standardRequest: undefined
+    };
+    if (!shouldRunProviderPlugin(plugin, pluginInput)) {
+      continue;
+    }
+
     if (plugin.authenticate) {
-      const result = await plugin.authenticate({
-        request: context.request,
-        config: context.config,
-        source: context.source,
-        sourceProvider: context.sourceProvider,
-        sourceAdapterKey: context.sourceAdapterKey,
-        targetProvider: context.targetProvider,
-        targetProviderConfig: context.targetProviderConfig,
-        model: context.model,
-        passthrough: context.passthrough,
-        streaming: context.streaming,
-        forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
-        upstreamRequest,
-        standardRequest: undefined
-      });
+      const result = await plugin.authenticate(pluginInput);
       if (!result.ok) {
         return err(`Provider plugin "${plugin.key}" auth failed: ${result.error}`);
       }
@@ -815,19 +822,8 @@ async function applyWebSocketProviderRequestPlugins(
 
     if (plugin.transformRequest) {
       const result = await plugin.transformRequest({
-        request: context.request,
-        config: context.config,
-        source: context.source,
-        sourceProvider: context.sourceProvider,
-        sourceAdapterKey: context.sourceAdapterKey,
-        targetProvider: context.targetProvider,
-        targetProviderConfig: context.targetProviderConfig,
-        model: context.model,
-        passthrough: context.passthrough,
-        streaming: context.streaming,
-        forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
-        upstreamRequest,
-        standardRequest: undefined
+        ...pluginInput,
+        upstreamRequest
       });
       if (!result.ok) {
         return err(`Provider plugin "${plugin.key}" request transform failed: ${result.error}`);

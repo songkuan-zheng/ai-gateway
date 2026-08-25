@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer } from 'ws';
 import { parseGatewayConfigFromRaw } from '../config';
 import { renderGatewayMetrics, resetGatewayMetricsForTests } from '../gateway/metrics';
+import type { GatewayPluginEventPublisher, GatewayPluginOutbox } from '../plugins/events';
 import type { BillingQueueConfig, BillingWebhookConfig } from '../types';
 import {
   closeBillingPublisher,
@@ -128,6 +129,95 @@ describe('billing publisher', () => {
     expect(renderGatewayMetricsForTest()).toContain(
       'gateway_billing_events_total{outcome="not_configured",transport="none"} 1'
     );
+  });
+
+  it('publishes billing events through plugin outboxes and publishers', async () => {
+    const outboxEvents: BillingQueueEvent[] = [];
+    const publisherEvents: BillingQueueEvent[] = [];
+    const outboxClose = vi.fn();
+    const publisherClose = vi.fn();
+    const outbox: GatewayPluginOutbox<BillingQueueEvent> = {
+      key: 'billing-kafka-outbox',
+      transport: 'kafka',
+      append: vi.fn(async (event) => {
+        outboxEvents.push(event);
+        return true;
+      }),
+      close: outboxClose
+    };
+    const publisher: GatewayPluginEventPublisher<BillingQueueEvent> = {
+      key: 'billing-kafka-publisher',
+      transport: 'kafka-live',
+      publish: vi.fn(async (event) => {
+        publisherEvents.push(event);
+        return true;
+      }),
+      close: publisherClose
+    };
+    await initializeBillingPublisher(
+      buildQueueConfig(false),
+      {
+        ...buildWebhookConfig('http', ''),
+        enabled: false
+      },
+      undefined,
+      {
+        publishers: [publisher],
+        outboxes: [outbox]
+      }
+    );
+
+    const delivered = await publishBillingEvent(buildEvent());
+
+    expect(delivered).toBe(true);
+    expect(outbox.append).toHaveBeenCalledTimes(1);
+    expect(publisher.publish).toHaveBeenCalledTimes(1);
+    expect(outboxEvents[0]?.eventId).toBe('billing-event-1');
+    expect(publisherEvents[0]?.eventId).toBe('billing-event-1');
+    const metrics = renderGatewayMetricsForTest();
+    expect(metrics).toContain(
+      'gateway_billing_events_total{outcome="delivered",transport="plugin:outbox:kafka"} 1'
+    );
+    expect(metrics).toContain(
+      'gateway_billing_events_total{outcome="delivered",transport="plugin:publisher:kafka-live"} 1'
+    );
+
+    await closeBillingPublisher();
+    expect(outboxClose).toHaveBeenCalledTimes(1);
+    expect(publisherClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries plugin billing outbox delivery when configured', async () => {
+    const append = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('temporary kafka failure'))
+      .mockResolvedValueOnce(true);
+    const outbox: GatewayPluginOutbox<BillingQueueEvent> = {
+      key: 'billing-retry-outbox',
+      transport: 'kafka',
+      delivery: {
+        maxAttempts: 2,
+        baseDelayMs: 0,
+        maxDelayMs: 0
+      },
+      append
+    };
+    await initializeBillingPublisher(
+      buildQueueConfig(false),
+      {
+        ...buildWebhookConfig('http', ''),
+        enabled: false
+      },
+      undefined,
+      {
+        outboxes: [outbox]
+      }
+    );
+
+    const delivered = await publishBillingEvent(buildEvent());
+
+    expect(delivered).toBe(true);
+    expect(append).toHaveBeenCalledTimes(2);
   });
 });
 

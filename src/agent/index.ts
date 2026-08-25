@@ -16,7 +16,11 @@ export {
 } from './publisher';
 export { createMcpAgentToolProvider } from './tools';
 export type { AgentPersistenceStore } from './persistence';
-export type { AgentEventPublisherLogger, AgentQueueEvent } from './publisher';
+export type {
+  AgentEventPublisherLogger,
+  AgentEventPublisherPluginExtensions,
+  AgentQueueEvent
+} from './publisher';
 export type {
   AgentDefinition,
   AgentEvent,

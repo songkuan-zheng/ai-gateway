@@ -1,13 +1,12 @@
 const esbuild = require('esbuild');
+const { execFileSync } = require('child_process');
 
 async function build() {
   const watchMode = process.argv.includes('--watch');
   const buildOptions = {
-    entryPoints: ['src/index.ts'],
     bundle: true,
     platform: 'node',
     target: 'node20',
-    outfile: 'dist/index.js',
     minify: !watchMode,
     sourcemap: true,
     external: ['fastify', 'undici', 'ws'],
@@ -15,12 +14,23 @@ async function build() {
 
   try {
     if (watchMode) {
-      const context = await esbuild.context(buildOptions);
-      await context.watch();
+      const contexts = await Promise.all([
+        esbuild.context({
+          ...buildOptions,
+          entryPoints: ['src/index.ts'],
+          outfile: 'dist/index.js',
+        }),
+        esbuild.context({
+          ...buildOptions,
+          entryPoints: ['src/plugins/sdk.ts'],
+          outfile: 'dist/plugins/sdk.js',
+        }),
+      ]);
+      await Promise.all(contexts.map((context) => context.watch()));
       console.log('👀 Gateway build watch 已启动');
 
       const shutdown = async () => {
-        await context.dispose();
+        await Promise.all(contexts.map((context) => context.dispose()));
         process.exit(0);
       };
 
@@ -29,7 +39,26 @@ async function build() {
       return;
     }
 
-    await esbuild.build(buildOptions);
+    await Promise.all([
+      esbuild.build({
+        ...buildOptions,
+        entryPoints: ['src/index.ts'],
+        outfile: 'dist/index.js',
+      }),
+      esbuild.build({
+        ...buildOptions,
+        entryPoints: ['src/plugins/sdk.ts'],
+        outfile: 'dist/plugins/sdk.js',
+      }),
+    ]);
+    execFileSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', [
+      'tsc',
+      '-p',
+      'tsconfig.build.json',
+      '--emitDeclarationOnly'
+    ], {
+      stdio: 'inherit'
+    });
     console.log('✅ 构建成功!');
   } catch (error) {
     console.error('❌ 构建失败:', error);

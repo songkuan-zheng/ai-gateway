@@ -4,7 +4,14 @@ import type {
   FastifyRequest,
   preHandlerHookHandler
 } from 'fastify';
-import type { GatewayConfig, ProviderConfig, VirtualModelProfileConfig } from '../types';
+import type {
+  GatewayConfig,
+  ProviderConfig,
+  SourceAdapter,
+  SourceAdapterRoute,
+  SourceAdapterRouteMethod,
+  VirtualModelProfileConfig
+} from '../types';
 import { providerFromProviderType, readHeader } from '../utils';
 import { addGatewayAuthModelCandidate, createGatewayAuthPreHandler } from './auth';
 import { handleOpenAIEmbeddingsRequest } from './embeddings';
@@ -20,8 +27,9 @@ import {
 } from './openai-json';
 import { handleGatewayRequest, parseGeminiTail } from './handler';
 import { createGatewayIdempotencyPreHandler } from './idempotency';
-import type { GatewayRuntime } from './runtime';
+import { listGatewayVirtualModelProfiles, type GatewayRuntime } from './runtime';
 import { decodeGatewayVideoId } from './video-compat';
+import { executeGatewayPluginRequestHookStage } from '../plugins/hooks';
 
 type ModelListFormat = 'openai' | 'anthropic';
 
@@ -51,6 +59,12 @@ interface BaseModelListEntry extends GatewayModelListEntry {
   modelName: string;
 }
 
+interface PluginSourceAdapterRouteMatch {
+  adapter: SourceAdapter;
+  route: SourceAdapterRoute;
+  method: SourceAdapterRouteMethod;
+}
+
 const unknownModelCreated = 0;
 const unknownModelCreatedAt = '1970-01-01T00:00:00Z';
 
@@ -60,15 +74,20 @@ export function registerGatewayRoutes(
   runtime: GatewayRuntime
 ) {
   const gatewayAuthPreHandler = createGatewayAuthPreHandler(config.auth);
+  const gatewayPluginPreAuthHandler = createGatewayPluginPreAuthHandler(config, runtime);
   const gatewayVideoModelPreHandler = createGatewayVideoModelPreHandler(config);
   const gatewayIdempotencyPreHandler = createGatewayIdempotencyPreHandler(config);
-  const gatewayWritePreHandlers = [gatewayAuthPreHandler, gatewayIdempotencyPreHandler];
+  const gatewayWritePreHandlers = [
+    gatewayPluginPreAuthHandler,
+    gatewayAuthPreHandler,
+    gatewayIdempotencyPreHandler
+  ];
 
   fastify.get<{ Querystring: ModelListQuery }>(
     '/v1/models',
     { preHandler: gatewayAuthPreHandler },
     async (request) => {
-      const entries = buildGatewayModelListEntries(config);
+      const entries = buildGatewayModelListEntries(config, runtime);
       const format = resolveModelListFormat(request);
 
       if (format === 'anthropic') {
@@ -83,7 +102,7 @@ export function registerGatewayRoutes(
     '/v1/models/:model',
     { preHandler: gatewayAuthPreHandler },
     async (request, reply) => {
-      return handleGetGatewayModel(request.params.model, reply, config);
+      return handleGetGatewayModel(request.params.model, reply, config, runtime);
     }
   );
 
@@ -91,7 +110,7 @@ export function registerGatewayRoutes(
     '/v1/models/*',
     { preHandler: gatewayAuthPreHandler },
     async (request, reply) => {
-      return handleGetGatewayModel(request.params['*'], reply, config);
+      return handleGetGatewayModel(request.params['*'], reply, config, runtime);
     }
   );
 
@@ -219,6 +238,198 @@ export function registerGatewayRoutes(
       runtime
     );
   });
+
+  fastify.all<{ Params: { '*': string } }>('/*', async (request, reply) => {
+    const match = resolvePluginSourceAdapterRoute(runtime, request.method, request.url);
+    if (!match) {
+      return reply.code(404).send({
+        error: {
+          message: 'Route not found.'
+        }
+      });
+    }
+
+    const canContinue = await runGatewayRoutePreHandlers(gatewayWritePreHandlers, request, reply);
+    if (!canContinue) {
+      return reply;
+    }
+
+    return handleGatewayRequest(
+      request,
+      reply,
+      {
+        adapterKey: match.adapter.key,
+        metadata: {
+          ...(match.route.metadata || {}),
+          sourceRoute: match.route.path,
+          sourceRouteMethod: match.method
+        }
+      },
+      config,
+      runtime
+    );
+  });
+}
+
+function resolvePluginSourceAdapterRoute(
+  runtime: GatewayRuntime,
+  method: string,
+  rawUrl: string
+): PluginSourceAdapterRouteMatch | undefined {
+  const requestMethod = normalizeSourceAdapterRouteMethod(method);
+  if (!requestMethod) {
+    return undefined;
+  }
+
+  const requestPath = normalizeRequestPath(rawUrl);
+  for (const adapter of runtime.sourceAdapters.list()) {
+    for (const route of adapter.routes || []) {
+      const routePath = normalizeSourceAdapterRoutePath(route.path);
+      if (!routePath) {
+        continue;
+      }
+
+      const routeMethod = normalizeSourceAdapterRouteMethod(route.method || 'POST');
+      if (routeMethod !== requestMethod) {
+        continue;
+      }
+
+      if (doesSourceAdapterRouteMatchPath(routePath, requestPath)) {
+        return {
+          adapter,
+          route,
+          method: routeMethod
+        };
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function runGatewayRoutePreHandlers(
+  handlers: preHandlerHookHandler[],
+  request: FastifyRequest,
+  reply: FastifyReply
+): Promise<boolean> {
+  for (const handler of handlers) {
+    await runGatewayRoutePreHandler(handler, request, reply);
+    if (reply.sent) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function runGatewayRoutePreHandler(
+  handler: preHandlerHookHandler,
+  request: FastifyRequest,
+  reply: FastifyReply
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let doneCalled = false;
+    const done = (error?: Error) => {
+      if (doneCalled) {
+        return;
+      }
+
+      doneCalled = true;
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    };
+
+    try {
+      const callable = handler as unknown as (
+        request: FastifyRequest,
+        reply: FastifyReply,
+        done: (error?: Error) => void
+      ) => unknown;
+      const result = callable(request, reply, done);
+      if (result && typeof (result as Promise<unknown>).then === 'function') {
+        void Promise.resolve(result).then(() => done(), reject);
+        return;
+      }
+
+      if (handler.length < 3) {
+        done();
+      }
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+function normalizeRequestPath(rawUrl: string): string {
+  const path = rawUrl.split('?')[0] || '/';
+  return path.startsWith('/') ? path : `/${path}`;
+}
+
+function normalizeSourceAdapterRoutePath(path: string | undefined): string | undefined {
+  const normalized = path?.trim();
+  if (!normalized || !normalized.startsWith('/')) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function normalizeSourceAdapterRouteMethod(method: string | undefined): SourceAdapterRouteMethod | undefined {
+  const normalized = method?.trim().toUpperCase();
+  if (
+    normalized === 'GET' ||
+    normalized === 'POST' ||
+    normalized === 'PUT' ||
+    normalized === 'PATCH' ||
+    normalized === 'DELETE'
+  ) {
+    return normalized;
+  }
+
+  return undefined;
+}
+
+function doesSourceAdapterRouteMatchPath(routePath: string, requestPath: string): boolean {
+  if (routePath.endsWith('/*')) {
+    const prefix = routePath.slice(0, -1);
+    return requestPath.startsWith(prefix);
+  }
+
+  return routePath === requestPath;
+}
+
+function createGatewayPluginPreAuthHandler(
+  config: GatewayConfig,
+  runtime: GatewayRuntime
+): preHandlerHookHandler {
+  return async function gatewayPluginPreAuthHandler(request, reply): Promise<void> {
+    const result = await executeGatewayPluginRequestHookStage(
+      runtime.requestHooks.list(),
+      'beforeAuth',
+      {
+        request,
+        config,
+        route: {
+          method: request.method,
+          url: request.url,
+          route: request.routeOptions?.url
+        }
+      }
+    );
+    if (result.ok) {
+      return;
+    }
+
+    reply.code(result.status || 403).send({
+      error: {
+        message: `Gateway plugin "${result.pluginKey}" beforeAuth failed: ${result.error}`,
+        details: result.details
+      }
+    });
+  };
 }
 
 function createGatewayVideoModelPreHandler(config: GatewayConfig): preHandlerHookHandler {
@@ -241,9 +452,14 @@ function createGatewayVideoModelPreHandler(config: GatewayConfig): preHandlerHoo
   };
 }
 
-function handleGetGatewayModel(rawModelId: string, reply: FastifyReply, config: GatewayConfig) {
+function handleGetGatewayModel(
+  rawModelId: string,
+  reply: FastifyReply,
+  config: GatewayConfig,
+  runtime: GatewayRuntime
+) {
   const modelId = decodeModelPathParam(rawModelId);
-  const entry = buildGatewayModelListEntries(config).find((item) => item.id === modelId);
+  const entry = buildGatewayModelListEntries(config, runtime).find((item) => item.id === modelId);
   if (!entry) {
     return reply.code(404).send({
       error: {
@@ -326,7 +542,10 @@ function formatAnthropicModelList(entries: GatewayModelListEntry[]) {
   };
 }
 
-function buildGatewayModelListEntries(config: GatewayConfig): GatewayModelListEntry[] {
+function buildGatewayModelListEntries(
+  config: GatewayConfig,
+  runtime?: Pick<GatewayRuntime, 'virtualModelProfiles'>
+): GatewayModelListEntry[] {
   const seen = new Set<string>();
   const entries: GatewayModelListEntry[] = [];
   const baseEntries: BaseModelListEntry[] = [];
@@ -364,7 +583,7 @@ function buildGatewayModelListEntries(config: GatewayConfig): GatewayModelListEn
     }
   }
 
-  for (const entry of materializeVirtualModelListEntries(config, baseEntries)) {
+  for (const entry of materializeVirtualModelListEntries(config, baseEntries, runtime)) {
     pushEntry(entry);
   }
 
@@ -373,13 +592,14 @@ function buildGatewayModelListEntries(config: GatewayConfig): GatewayModelListEn
 
 function materializeVirtualModelListEntries(
   config: GatewayConfig,
-  baseEntries: BaseModelListEntry[]
+  baseEntries: BaseModelListEntry[],
+  runtime?: Pick<GatewayRuntime, 'virtualModelProfiles'>
 ): GatewayModelListEntry[] {
   const entries: GatewayModelListEntry[] = [];
   const configuredProviderNames = new Set(baseEntries.map((entry) => entry.providerName));
   const bareModelIds = config.modelList?.bareModelIds === true;
 
-  for (const profile of config.virtualModelProfiles || []) {
+  for (const profile of listGatewayVirtualModelProfiles(config, runtime)) {
     if (!shouldMaterializeVirtualModel(profile)) {
       continue;
     }

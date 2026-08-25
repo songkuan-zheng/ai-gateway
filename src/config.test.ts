@@ -155,6 +155,9 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.BILLING_WEBHOOK_STDIO_COMMAND;
     delete process.env.BILLING_WEBHOOK_STDIO_ARGS;
     delete process.env.BILLING_WEBHOOK_STDIO_CWD;
+    delete process.env.BILLING_TRACE_REQUEST_BODY_MODE;
+    delete process.env.BILLING_TRACE_REQUEST_BODY;
+    delete process.env.BILLING_TRACE_INCLUDE_REQUEST_BODY;
     delete process.env.RAW_TRACE_SYNC_TRANSPORT;
     delete process.env.RAW_TRACE_SYNC_ENDPOINT;
     delete process.env.RAW_TRACE_SYNC_URL;
@@ -221,6 +224,56 @@ describe('Gateway config providerPlugins', () => {
     process.env.UPSTREAM_TIMEOUT_MS = '-5';
     expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: -1 }).upstreamTimeoutMs).toBe(0);
     expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: 5000 }).upstreamTimeoutMs).toBe(5000);
+  });
+
+  it('defaults billing trace request body capture to disabled', () => {
+    const config = parseGatewayConfigFromRaw({});
+
+    expect(config.billing.trace).toEqual({
+      requestBodyMode: 'disabled'
+    });
+  });
+
+  it('parses billing trace request body mode from config and env', () => {
+    const fromConfig = parseGatewayConfigFromRaw({
+      billing: {
+        trace: {
+          requestBodyMode: 'sanitized'
+        }
+      }
+    });
+
+    expect(fromConfig.billing.trace?.requestBodyMode).toBe('sanitized');
+
+    process.env.BILLING_TRACE_REQUEST_BODY_MODE = 'full';
+    const fromEnv = parseGatewayConfigFromRaw({
+      billing: {
+        trace: {
+          requestBodyMode: 'disabled'
+        }
+      }
+    });
+
+    expect(fromEnv.billing.trace?.requestBodyMode).toBe('full');
+  });
+
+  it('supports boolean billing trace request body compatibility config', () => {
+    const fromTraceBoolean = parseGatewayConfigFromRaw({
+      billing: {
+        trace: {
+          includeRequestBody: true
+        }
+      }
+    });
+    expect(fromTraceBoolean.billing.trace?.requestBodyMode).toBe('full');
+
+    process.env.BILLING_TRACE_INCLUDE_REQUEST_BODY = 'false';
+    const fromEnv = parseGatewayConfigFromRaw({
+      billing: {
+        includeTraceRequestBody: true
+      }
+    });
+    expect(fromEnv.billing.trace?.requestBodyMode).toBe('disabled');
   });
 
   it('resolves provider api keys from apiKeyEnv', () => {
@@ -341,6 +394,11 @@ describe('Gateway config providerPlugins', () => {
       plugins: [
         {
           key: 'acme-inline',
+          brokers: ['kafka-1:9092'],
+          config: {
+            topic: 'gateway-billing-events',
+            clientId: 'gateway-test'
+          },
           match: {
             provider: 'acme',
             providerName: 'acme-main'
@@ -379,6 +437,11 @@ describe('Gateway config providerPlugins', () => {
       match: {
         provider: 'acme',
         providerName: 'acme-main'
+      },
+      config: {
+        topic: 'gateway-billing-events',
+        clientId: 'gateway-test',
+        brokers: ['kafka-1:9092']
       }
     });
     expect(config.plugins?.[0]?.providerHooks[0]).toMatchObject({

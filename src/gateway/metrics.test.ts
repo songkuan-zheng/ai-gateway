@@ -3,6 +3,7 @@ import { parseGatewayConfigFromRaw } from '../config';
 import {
   recordGatewayBillingDelivery,
   recordGatewayHttpRequest,
+  recordGatewayPluginDelivery,
   recordGatewayStreamConversion,
   recordGatewayToolExecution,
   renderGatewayMetrics,
@@ -168,6 +169,53 @@ describe('gateway metrics', () => {
     );
     expect(metrics).toContain(
       'gateway_billing_events_total{outcome="failed",transport="http"} 2'
+    );
+  });
+
+  it('renders plugin delivery counters and plugin health gauges', () => {
+    const config = parseGatewayConfigFromRaw({
+      metrics: {
+        enabled: true,
+        includeProviderHealth: true
+      }
+    });
+
+    recordGatewayPluginDelivery({
+      extensionKey: 'billing-kafka',
+      transport: 'kafka',
+      outcome: 'delivered'
+    });
+    recordGatewayPluginDelivery({
+      extensionKey: 'billing-kafka',
+      transport: 'kafka',
+      outcome: 'timeout'
+    });
+
+    const metrics = renderGatewayMetrics(config, {
+      pluginHealth: [
+        {
+          kind: 'billing_outbox',
+          extensions: [
+            {
+              key: 'billing-kafka',
+              status: 'degraded'
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(metrics).toContain(
+      'gateway_plugin_deliveries_total{extension_key="billing-kafka",outcome="delivered",transport="kafka"} 1'
+    );
+    expect(metrics).toContain(
+      'gateway_plugin_deliveries_total{extension_key="billing-kafka",outcome="timeout",transport="kafka"} 1'
+    );
+    expect(metrics).toContain(
+      'gateway_plugin_health_status{extension_key="billing-kafka",kind="billing_outbox",status="degraded"} 1'
+    );
+    expect(metrics).toContain(
+      'gateway_plugin_health_status{extension_key="billing-kafka",kind="billing_outbox",status="healthy"} 0'
     );
   });
 });

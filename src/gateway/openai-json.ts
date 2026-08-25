@@ -62,6 +62,7 @@ import {
   resolveGatewayScheduledCredential,
   setGatewaySchedulingRequestEstimate
 } from './scheduler';
+import { recordGatewayPluginHookExecution } from './metrics';
 import {
   convertVideoCreateBody,
   claimVideoBillingEvent,
@@ -78,6 +79,7 @@ import {
   type GatewayVideoReference,
   type VideoApiProtocol
 } from './video-compat';
+import { shouldRunProviderPlugin } from '../provider/plugins';
 
 interface TargetProviderRoute {
   provider: Provider;
@@ -2626,24 +2628,54 @@ async function applyProviderRequestPlugins(
 ): Promise<ProviderRequestPluginResult> {
   let upstreamRequest = baseUpstreamRequest;
   for (const plugin of context.plugins) {
-    if (plugin.authenticate) {
-      try {
-        const result = await plugin.authenticate({
-          request: context.request,
-          config: context.config,
-          source: { adapterKey: context.endpoint.sourceAdapterKey },
-          sourceProvider: context.endpoint.sourceProvider || 'openai',
-          sourceAdapterKey: context.endpoint.sourceAdapterKey,
-          targetProvider: context.targetProvider,
-          targetProviderConfig: context.targetProviderConfig,
-          model: context.model,
-          passthrough: true,
-          streaming: false,
-          forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
-          upstreamRequest,
-          standardRequest: context.standardRequest
+    const pluginInput = {
+      request: context.request,
+      config: context.config,
+      source: { adapterKey: context.endpoint.sourceAdapterKey },
+      sourceProvider: context.endpoint.sourceProvider || 'openai',
+      sourceAdapterKey: context.endpoint.sourceAdapterKey,
+      targetProvider: context.targetProvider,
+      targetProviderConfig: context.targetProviderConfig,
+      targetProviderName: context.targetProviderConfig?.name,
+      model: context.model,
+      passthrough: true,
+      streaming: false,
+      forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
+      upstreamRequest,
+      standardRequest: context.standardRequest
+    };
+    if (!shouldRunProviderPlugin(plugin, pluginInput)) {
+      if (plugin.authenticate) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'skipped'
         });
+      }
+      if (plugin.transformRequest) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'skipped'
+        });
+      }
+      continue;
+    }
+
+    if (plugin.authenticate) {
+      const startedAt = process.hrtime.bigint();
+      try {
+        const result = await plugin.authenticate(pluginInput);
         if (!result.ok) {
+          recordGatewayPluginHookExecution({
+            pluginKey: plugin.key,
+            kind: 'provider',
+            hook: 'authenticate',
+            outcome: 'error',
+            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+          });
           return {
             ok: false,
             stage: 'provider_auth',
@@ -2652,7 +2684,21 @@ async function applyProviderRequestPlugins(
           };
         }
         upstreamRequest = result.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
       } catch (error) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'error',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
         return {
           ok: false,
           stage: 'provider_auth',
@@ -2663,23 +2709,20 @@ async function applyProviderRequestPlugins(
     }
 
     if (plugin.transformRequest) {
+      const startedAt = process.hrtime.bigint();
       try {
         const result = await plugin.transformRequest({
-          request: context.request,
-          config: context.config,
-          source: { adapterKey: context.endpoint.sourceAdapterKey },
-          sourceProvider: context.endpoint.sourceProvider || 'openai',
-          sourceAdapterKey: context.endpoint.sourceAdapterKey,
-          targetProvider: context.targetProvider,
-          targetProviderConfig: context.targetProviderConfig,
-          model: context.model,
-          passthrough: true,
-          streaming: false,
-          forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
-          upstreamRequest,
-          standardRequest: context.standardRequest
+          ...pluginInput,
+          upstreamRequest
         });
         if (!result.ok) {
+          recordGatewayPluginHookExecution({
+            pluginKey: plugin.key,
+            kind: 'provider',
+            hook: 'transformRequest',
+            outcome: 'error',
+            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+          });
           return {
             ok: false,
             stage: 'provider_request_transform',
@@ -2688,7 +2731,21 @@ async function applyProviderRequestPlugins(
           };
         }
         upstreamRequest = result.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
       } catch (error) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'error',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
         return {
           ok: false,
           stage: 'provider_request_transform',
@@ -2714,25 +2771,45 @@ async function applyProviderResponsePlugins(
       continue;
     }
 
-    try {
-      const result = await plugin.transformResponse({
-        request: context.request,
-        config: context.config,
-        source: { adapterKey: context.endpoint.sourceAdapterKey },
-        sourceProvider: context.endpoint.sourceProvider || 'openai',
-        sourceAdapterKey: context.endpoint.sourceAdapterKey,
-        targetProvider: context.targetProvider,
-        targetProviderConfig: context.targetProviderConfig,
-        model: context.model,
-        passthrough: true,
-        streaming: false,
-        forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
-        upstreamRequest,
-        upstreamResponse,
-        upstreamPayload: payload,
-        standardRequest: context.standardRequest
+    const pluginInput = {
+      request: context.request,
+      config: context.config,
+      source: { adapterKey: context.endpoint.sourceAdapterKey },
+      sourceProvider: context.endpoint.sourceProvider || 'openai',
+      sourceAdapterKey: context.endpoint.sourceAdapterKey,
+      targetProvider: context.targetProvider,
+      targetProviderConfig: context.targetProviderConfig,
+      targetProviderName: context.targetProviderConfig?.name,
+      model: context.model,
+      passthrough: true,
+      streaming: false,
+      forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
+      upstreamRequest,
+      upstreamResponse,
+      upstreamPayload: payload,
+      standardRequest: context.standardRequest
+    };
+    if (!shouldRunProviderPlugin(plugin, pluginInput)) {
+      recordGatewayPluginHookExecution({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformResponse',
+        outcome: 'skipped'
       });
+      continue;
+    }
+
+    const startedAt = process.hrtime.bigint();
+    try {
+      const result = await plugin.transformResponse(pluginInput);
       if (!result.ok) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformResponse',
+          outcome: 'error',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
         return {
           ok: false,
           stage: 'provider_response_transform',
@@ -2741,7 +2818,21 @@ async function applyProviderResponsePlugins(
         };
       }
       payload = result.value;
+      recordGatewayPluginHookExecution({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformResponse',
+        outcome: 'success',
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
     } catch (error) {
+      recordGatewayPluginHookExecution({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformResponse',
+        outcome: 'error',
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
       return {
         ok: false,
         stage: 'provider_response_transform',

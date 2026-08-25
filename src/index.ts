@@ -21,7 +21,11 @@ import { registerGatewayIdempotencyHooks } from './gateway/idempotency';
 import { registerLenientJsonParser } from './gateway/lenient-json-parser';
 import { recordGatewayHttpRequest, renderGatewayMetrics } from './gateway/metrics';
 import { registerGatewayRoutes } from './gateway/routes';
-import { createGatewayRuntime } from './gateway/runtime';
+import {
+  collectGatewayRuntimePluginHealth,
+  createGatewayRuntime,
+  summarizeGatewayRuntimePluginHealth
+} from './gateway/runtime';
 import { registerGatewayResponsesWebSocketRoute } from './gateway/websocket';
 import { closeGatewayPrecheckStore } from './gateway/precheck';
 import {
@@ -39,7 +43,9 @@ import {
 } from './mcp-gateway';
 import { syncGatewayPluginModulesFromConfig } from './plugins/loader';
 import { closeRawTraceManager, initializeRawTraceManager } from './raw-trace';
-import type { GatewayConfig, GatewayLoggingConfig } from './types';
+import type { AgentQueueEvent } from './agent';
+import type { BillingQueueEvent } from './billing';
+import type { GatewayConfig, GatewayLoggingConfig, GatewayPluginEventHook } from './types';
 
 const codexResponsesWebSocketPath = '/v1/responses';
 const metricsRequestStarts = new WeakMap<object, bigint>();
@@ -176,9 +182,11 @@ fastify.addHook('onClose', async () => {
 });
 
 fastify.get('/health', async () => {
+  const pluginHealth = await collectGatewayRuntimePluginHealth(runtime);
   return {
     runtimeId: process.env.CCR_GATEWAY_RUNTIME_ID,
     status: 'ok',
+    plugins: summarizeGatewayRuntimePluginHealth(pluginHealth),
     timestamp: new Date().toISOString()
   };
 });
@@ -194,7 +202,9 @@ fastify.get('/metrics', async (_request, reply) => {
 
   return reply
     .header('content-type', 'text/plain; version=0.0.4; charset=utf-8')
-    .send(renderGatewayMetrics(config));
+    .send(renderGatewayMetrics(config, {
+      pluginHealth: await collectGatewayRuntimePluginHealth(runtime)
+    }));
 });
 
 fastify.get('/', async () => {
@@ -284,6 +294,7 @@ registerProviderWebhookRoutes(fastify, {
 if (agentManagementEnabled) {
   registerManagerRoutes(fastify, {
     config,
+    runtime,
     beforeApplyConfig: async (nextConfig) => {
       await hydrateProvidersFromExternalSource(nextConfig, fastify.log);
     },
@@ -306,7 +317,11 @@ const start = async () => {
     await agentRuntime.initialize();
 
     try {
-      await initializeBillingPublisher(config.billingQueue, config.billingWebhook, fastify.log);
+      await initializeBillingPublisher(config.billingQueue, config.billingWebhook, fastify.log, {
+        publishers: runtime.billingPublishers.list(),
+        outboxes: runtime.billingOutboxes.list(),
+        eventHooks: listBillingEventHooks()
+      });
     } catch (error) {
       fastify.log.warn(
         {
@@ -328,7 +343,11 @@ const start = async () => {
     }
 
     try {
-      await initializeAgentEventPublisher(config.agent.eventQueue, config.agent.eventWebhook, fastify.log);
+      await initializeAgentEventPublisher(config.agent.eventQueue, config.agent.eventWebhook, fastify.log, {
+        publishers: runtime.agentEventPublishers.list(),
+        outboxes: runtime.agentEventOutboxes.list(),
+        eventHooks: listAgentEventHooks()
+      });
     } catch (error) {
       fastify.log.warn(
         {
@@ -359,9 +378,25 @@ start();
 
 async function reloadRuntimeFromConfig(nextConfig: GatewayConfig): Promise<void> {
   await applyStaticRuntimeConfig(nextConfig);
-  await initializeBillingPublisher(nextConfig.billingQueue, nextConfig.billingWebhook, fastify.log);
-  await initializeAgentEventPublisher(nextConfig.agent.eventQueue, nextConfig.agent.eventWebhook, fastify.log);
+  await initializeBillingPublisher(nextConfig.billingQueue, nextConfig.billingWebhook, fastify.log, {
+    publishers: runtime.billingPublishers.list(),
+    outboxes: runtime.billingOutboxes.list(),
+    eventHooks: listBillingEventHooks()
+  });
+  await initializeAgentEventPublisher(nextConfig.agent.eventQueue, nextConfig.agent.eventWebhook, fastify.log, {
+    publishers: runtime.agentEventPublishers.list(),
+    outboxes: runtime.agentEventOutboxes.list(),
+    eventHooks: listAgentEventHooks()
+  });
   await initializeRawTraceManager(nextConfig.rawTrace, fastify.log);
+}
+
+function listBillingEventHooks(): GatewayPluginEventHook<BillingQueueEvent>[] {
+  return runtime.billingEventHooks.list() as GatewayPluginEventHook<BillingQueueEvent>[];
+}
+
+function listAgentEventHooks(): GatewayPluginEventHook<AgentQueueEvent>[] {
+  return runtime.agentEventHooks.list() as GatewayPluginEventHook<AgentQueueEvent>[];
 }
 
 async function applyStaticRuntimeConfig(nextConfig: GatewayConfig): Promise<void> {

@@ -3,11 +3,13 @@ import type { FastifyRequest } from 'fastify';
 import type { ProviderPluginRegistry } from '../adapters/registry';
 import { createDeepSeekThinkingProviderPlugin } from './deepseek-thinking';
 import { err, ok } from '../types';
+import { matchesAnyPattern } from '../shared/pattern';
 import { readBearerToken } from '../utils';
 import type {
   GatewayConfig,
   ProviderPlugin,
   ProviderPluginConfig,
+  ProviderPluginConditionConfig,
   ProviderPluginCodexOAuthConfig,
   ProviderPluginMutationConfig,
   ProviderPluginResponseMutationConfig,
@@ -37,6 +39,10 @@ let distributedCredentialEncryptionConfig: DistributedCredentialEncryptionConfig
 interface PluginValueResolveContext {
   config: GatewayConfig;
   request: FastifyRequest;
+  source?: {
+    adapterKey?: string;
+    metadata?: Record<string, string>;
+  };
   sourceProvider: string;
   sourceAdapterKey: string;
   targetProvider: string;
@@ -47,6 +53,8 @@ interface PluginValueResolveContext {
   upstreamRequest: UpstreamRequest;
   upstreamPayload?: unknown;
 }
+
+export interface ProviderPluginMatchInput extends PluginValueResolveContext {}
 
 interface ResolvedValue {
   found: boolean;
@@ -135,12 +143,47 @@ export function collectConfiguredProviderPlugins(config: GatewayConfig): Provide
         key: `${gatewayPlugin.key}:${hook.key || 'provider-hook'}`,
         enabled: true,
         provider: hook.provider || gatewayPlugin.match?.provider,
-        providerName: hook.providerName || gatewayPlugin.match?.providerName
+        providerName: hook.providerName || gatewayPlugin.match?.providerName,
+        models: hook.models || gatewayPlugin.match?.models,
+        sourceAdapters: hook.sourceAdapters || gatewayPlugin.match?.sourceAdapters,
+        sourceRoutes: hook.sourceRoutes || gatewayPlugin.match?.sourceRoutes
       });
     }
   }
 
   return collected;
+}
+
+export function shouldRunProviderPlugin(
+  plugin: ProviderPlugin,
+  input: ProviderPluginMatchInput
+): boolean {
+  if (plugin.models && plugin.models.length > 0) {
+    const model = normalizeNonEmptyString(input.model);
+    if (!model || !matchesAnyPattern(model, plugin.models)) {
+      return false;
+    }
+  }
+
+  if (plugin.sourceAdapters && plugin.sourceAdapters.length > 0) {
+    const sourceAdapterKey = normalizeNonEmptyString(input.sourceAdapterKey || input.source?.adapterKey);
+    if (!sourceAdapterKey || !matchesAnyPattern(sourceAdapterKey, plugin.sourceAdapters)) {
+      return false;
+    }
+  }
+
+  if (plugin.sourceRoutes && plugin.sourceRoutes.length > 0) {
+    const sourceRoute = normalizeNonEmptyString(input.source?.metadata?.sourceRoute);
+    if (!sourceRoute || !matchesAnyPattern(sourceRoute, plugin.sourceRoutes)) {
+      return false;
+    }
+  }
+
+  if (plugin.when && !evaluateProviderPluginCondition(plugin.when, input)) {
+    return false;
+  }
+
+  return true;
 }
 
 export function updateDistributedCredentialEncryption(input?: {
@@ -192,6 +235,10 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
     key,
     provider: config.provider,
     providerName: config.providerName,
+    models: config.models,
+    sourceAdapters: config.sourceAdapters,
+    sourceRoutes: config.sourceRoutes,
+    when: config.when,
     authenticate:
       codexOauthConfig || config.auth
         ? async (input) => {
@@ -199,6 +246,7 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
             let context: PluginValueResolveContext = {
               config: input.config,
               request: input.request,
+              source: input.source,
               sourceProvider: input.sourceProvider,
               sourceAdapterKey: input.sourceAdapterKey,
               targetProvider: input.targetProvider,
@@ -252,6 +300,7 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
               {
                 config: input.config,
                 request: input.request,
+                source: input.source,
                 sourceProvider: input.sourceProvider,
                 sourceAdapterKey: input.sourceAdapterKey,
                 targetProvider: input.targetProvider,
@@ -286,6 +335,7 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
             {
               config: input.config,
               request: input.request,
+              source: input.source,
               sourceProvider: input.sourceProvider,
               sourceAdapterKey: input.sourceAdapterKey,
               targetProvider: input.targetProvider,
@@ -1605,24 +1655,39 @@ function resolvePluginValue(value: unknown, context: PluginValueResolveContext):
 
   if (typeof value === 'string') {
     const reference = parseReferenceTemplate(value);
-    if (!reference) {
+    if (reference) {
+      const resolved = resolveReference(reference, context);
+      if (resolved === undefined) {
+        return {
+          found: false,
+          missingRef: reference
+        };
+      }
+
+      return {
+        found: true,
+        value: cloneUnknown(resolved)
+      };
+    }
+
+    const interpolated = resolveReferenceInterpolation(value, context);
+    if (!interpolated) {
       return {
         found: true,
         value
       };
     }
 
-    const resolved = resolveReference(reference, context);
-    if (resolved === undefined) {
+    if (!interpolated.found) {
       return {
         found: false,
-        missingRef: reference
+        missingRef: interpolated.missingRef
       };
     }
 
     return {
       found: true,
-      value: cloneUnknown(resolved)
+      value: interpolated.value
     };
   }
 
@@ -1676,6 +1741,135 @@ function parseReferenceTemplate(value: string): string | undefined {
   return reference || undefined;
 }
 
+function resolveReferenceInterpolation(
+  value: string,
+  context: PluginValueResolveContext
+): ResolvedValue | undefined {
+  if (!value.includes('{{')) {
+    return undefined;
+  }
+
+  let missingRef: string | undefined;
+  const interpolated = value.replace(/\{\{\s*([^\s}].*?)\s*\}\}/g, (_match, rawReference: string) => {
+    const reference = rawReference.trim();
+    const resolved = reference ? resolveReference(reference, context) : undefined;
+    if (resolved === undefined) {
+      missingRef = reference || '<empty>';
+      return '';
+    }
+    return serializeValueForTemplate(resolved);
+  });
+
+  if (missingRef) {
+    return {
+      found: false,
+      missingRef
+    };
+  }
+
+  return {
+    found: true,
+    value: interpolated
+  };
+}
+
+function serializeValueForTemplate(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    return String(value);
+  }
+  if (value === null || value === undefined) {
+    return '';
+  }
+  return JSON.stringify(value);
+}
+
+function evaluateProviderPluginCondition(
+  condition: ProviderPluginConditionConfig,
+  context: PluginValueResolveContext
+): boolean {
+  if (condition.all && condition.all.length > 0) {
+    return condition.all.every((item) => evaluateProviderPluginCondition(item, context));
+  }
+
+  if (condition.any && condition.any.length > 0) {
+    return condition.any.some((item) => evaluateProviderPluginCondition(item, context));
+  }
+
+  if (condition.not) {
+    return !evaluateProviderPluginCondition(condition.not, context);
+  }
+
+  const hasReference = Boolean(condition.from?.trim());
+  const resolved = hasReference ? resolvePluginValue({ from: condition.from }, context) : undefined;
+  const exists = !hasReference || resolved?.found === true;
+  const value = resolved?.value;
+
+  if (condition.exists !== undefined && exists !== condition.exists) {
+    return false;
+  }
+
+  if (!exists) {
+    return false;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(condition, 'equals')) {
+    const expected = resolveComparableConditionValue(condition.equals, context);
+    if (!expected.found || !areConditionValuesEqual(value, expected.value)) {
+      return false;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(condition, 'notEquals')) {
+    const expected = resolveComparableConditionValue(condition.notEquals, context);
+    if (!expected.found || areConditionValuesEqual(value, expected.value)) {
+      return false;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(condition, 'includes')) {
+    const expected = resolveComparableConditionValue(condition.includes, context);
+    if (!expected.found || !doesConditionValueInclude(value, expected.value)) {
+      return false;
+    }
+  }
+
+  if (condition.matches) {
+    const pattern = condition.matches;
+    if (typeof value !== 'string' || !matchesAnyPattern(value, [pattern])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function resolveComparableConditionValue(
+  value: unknown,
+  context: PluginValueResolveContext
+): ResolvedValue {
+  return resolvePluginValue(value, context);
+}
+
+function areConditionValuesEqual(left: unknown, right: unknown): boolean {
+  if (left === right) {
+    return true;
+  }
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function doesConditionValueInclude(value: unknown, expected: unknown): boolean {
+  if (typeof value === 'string') {
+    return value.includes(String(expected));
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => areConditionValuesEqual(item, expected));
+  }
+  return false;
+}
+
 function resolveReference(reference: string, context: PluginValueResolveContext): unknown {
   const normalized = reference.trim();
   if (!normalized) {
@@ -1691,7 +1885,16 @@ function resolveReference(reference: string, context: PluginValueResolveContext)
   }
 
   if (normalized === 'source.adapterKey') {
-    return context.sourceAdapterKey;
+    return context.source?.adapterKey || context.sourceAdapterKey;
+  }
+
+  if (normalized === 'source.route') {
+    return context.source?.metadata?.sourceRoute;
+  }
+
+  if (normalized.startsWith('source.metadata.')) {
+    const path = normalized.slice('source.metadata.'.length).trim();
+    return readValueByPath(context.source?.metadata, path);
   }
 
   if (normalized === 'target.provider') {

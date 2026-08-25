@@ -493,6 +493,97 @@ describe('buildGatewayBillingTraceSnapshot', () => {
 
     expect(trace?.response?.statusCode).toBe(200);
   });
+
+  it('omits request bodies by default', () => {
+    const trace = buildGatewayBillingTraceSnapshot(
+      {
+        headers: {},
+        body: {
+          model: 'gpt-5',
+          input: 'sensitive prompt'
+        }
+      } as any,
+      {
+        statusCode: 200,
+        getHeaders: () => ({})
+      } as any,
+      {
+        responseBody: {
+          id: 'resp_123'
+        }
+      }
+    );
+
+    expect(trace?.request).toBeUndefined();
+    expect(trace?.response?.body).toEqual({
+      id: 'resp_123'
+    });
+  });
+
+  it('includes the full request body when billing trace config allows it', () => {
+    const requestBody = {
+      model: 'gpt-5',
+      input: 'internal debugging prompt',
+      access_token: 'raw-secret'
+    };
+    const trace = buildGatewayBillingTraceSnapshot(
+      {
+        headers: {},
+        body: requestBody
+      } as any,
+      {
+        statusCode: 200,
+        getHeaders: () => ({})
+      } as any,
+      {
+        billingTrace: {
+          requestBodyMode: 'full'
+        },
+        responseBody: {
+          id: 'resp_123'
+        }
+      }
+    );
+
+    expect(trace?.request?.body).toBe(requestBody);
+  });
+
+  it('sanitizes request bodies when billing trace config requests sanitized bodies', () => {
+    const trace = buildGatewayBillingTraceSnapshot(
+      {
+        headers: {},
+        body: {
+          model: 'gpt-5',
+          input: 'prompt text',
+          access_token: 'raw-secret',
+          nested: {
+            session_token: 'nested-secret'
+          }
+        }
+      } as any,
+      {
+        statusCode: 200,
+        getHeaders: () => ({})
+      } as any,
+      {
+        billingTrace: {
+          requestBodyMode: 'sanitized'
+        },
+        responseBody: {
+          id: 'resp_123'
+        }
+      }
+    );
+
+    expect(trace?.request?.body).toEqual({
+      model: 'gpt-5',
+      input: 'prompt text',
+      access_token: '***',
+      nested: {
+        session_token: '***'
+      }
+    });
+  });
 });
 
 describe('extractGatewayRequestClientContext', () => {

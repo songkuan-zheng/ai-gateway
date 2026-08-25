@@ -1,20 +1,28 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { initializeAgentEventPublisher } from '../agent';
-import { initializeBillingPublisher } from '../billing';
 import {
   applyGatewayConfigInPlace,
   parseGatewayConfigFromRaw,
   resolveGatewayConfigPath
 } from '../config';
 import { checkProviderHealth } from '../gateway/provider-health-check';
+import {
+  collectGatewayRuntimePluginHealth,
+  summarizeGatewayRuntimePluginHealth,
+  type GatewayRuntime
+} from '../gateway/runtime';
+import {
+  clearGatewayPluginDeadLetters,
+  listGatewayPluginDeadLetters
+} from '../plugins/events';
 import { isProviderExternalSourceEnabled } from '../provider/external';
 import type { GatewayConfig, ProviderConfig } from '../types';
 import { isObject, parseProvider, providerFromProviderType, readBearerToken, readHeader } from '../utils';
 
 interface ManagerRouteOptions {
   config: GatewayConfig;
+  runtime?: GatewayRuntime;
   beforeApplyConfig?: (nextConfig: GatewayConfig) => Promise<void>;
   onConfigReload?: (nextConfig: GatewayConfig) => Promise<void>;
 }
@@ -22,6 +30,14 @@ interface ManagerRouteOptions {
 interface ManagerConfigQuery {
   revealSecrets?: string;
   reveal_secrets?: string;
+}
+
+interface ManagerPluginParams {
+  key: string;
+}
+
+interface ManagerPluginStateBody {
+  enabled?: unknown;
 }
 
 const PROVIDER_MANAGEMENT_DISABLED_MESSAGE =
@@ -40,6 +56,36 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
         message: authResult.message
       }
     });
+  };
+
+  const applyConfigUpdate = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    bodyForApply: Record<string, unknown>
+  ) => {
+    const path = resolveGatewayConfigPath();
+    const next = parseGatewayConfigFromRaw(bodyForApply);
+    if (containsProviderPayload(bodyForApply) && isProviderExternalSourceEnabled(next)) {
+      return sendProviderManagementDisabled(reply);
+    }
+
+    if (options.beforeApplyConfig) {
+      await options.beforeApplyConfig(next);
+    }
+
+    const before = cloneJsonObject(options.config as unknown as Record<string, unknown>);
+    writeJsonFile(path, bodyForApply);
+    applyGatewayConfigInPlace(options.config, next);
+    if (options.onConfigReload) {
+      await options.onConfigReload(options.config);
+    }
+
+    return {
+      ok: true,
+      path,
+      reloadedAt: new Date().toISOString(),
+      warnings: collectReloadWarnings(before, options.config, bodyForApply)
+    };
   };
 
   fastify.get<{ Querystring: ManagerConfigQuery }>('/manager/config', { preHandler }, async (request, reply) => {
@@ -103,6 +149,234 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
     };
   });
 
+  fastify.get('/manager/plugins', { preHandler }, async () => {
+    return {
+      configured: {
+        plugins: options.config.plugins || [],
+        providerPlugins: options.config.providerPlugins || []
+      },
+      runtime: options.runtime
+        ? {
+            sourceAdapters: options.runtime.sourceAdapters.list().map((adapter) => ({
+              key: adapter.key,
+              provider: adapter.provider,
+              routes: adapter.routes || []
+            })),
+            targetAdapters: options.runtime.targetAdapters.list().map((adapter) => ({
+              key: adapter.key,
+              provider: adapter.provider,
+              providerTypes: adapter.providerTypes || []
+            })),
+            providerPlugins: options.runtime.providerPlugins.list().map((plugin) => ({
+              key: plugin.key,
+              provider: plugin.provider,
+              providerName: plugin.providerName,
+              models: plugin.models,
+              sourceAdapters: plugin.sourceAdapters,
+              sourceRoutes: plugin.sourceRoutes
+            })),
+            requestHooks: options.runtime.requestHooks.list().map((hook) => ({
+              key: hook.key,
+              provider: hook.provider,
+              providerName: hook.providerName,
+              models: hook.models,
+              sourceAdapters: hook.sourceAdapters,
+              sourceRoutes: hook.sourceRoutes
+            })),
+            streamHooks: options.runtime.streamHooks.list().map((hook) => ({
+              key: hook.key,
+              provider: hook.provider,
+              providerName: hook.providerName,
+              models: hook.models,
+              sourceAdapters: hook.sourceAdapters,
+              sourceRoutes: hook.sourceRoutes
+            })),
+            billingEventHooks: options.runtime.billingEventHooks.list().map((hook) => ({
+              key: hook.key
+            })),
+            agentEventHooks: options.runtime.agentEventHooks.list().map((hook) => ({
+              key: hook.key
+            })),
+            virtualModelProfiles: options.runtime.virtualModelProfiles.list().map((profile) => ({
+              id: profile.id,
+              key: profile.key,
+              displayName: profile.displayName,
+              match: profile.match
+            })),
+            billingPublishers: options.runtime.billingPublishers.list().map(formatPluginExtensionSummary),
+            billingOutboxes: options.runtime.billingOutboxes.list().map(formatPluginExtensionSummary),
+            agentEventPublishers: options.runtime.agentEventPublishers.list().map(formatPluginExtensionSummary),
+            agentEventOutboxes: options.runtime.agentEventOutboxes.list().map(formatPluginExtensionSummary)
+          }
+        : undefined
+    };
+  });
+
+  fastify.get('/manager/plugins/health', { preHandler }, async () => {
+    if (!options.runtime) {
+      return {
+        summary: {
+          status: 'ok',
+          total: 0,
+          degraded: 0,
+          unhealthy: 0
+        },
+        groups: []
+      };
+    }
+
+    const groups = await collectGatewayRuntimePluginHealth(options.runtime);
+    return {
+      summary: summarizeGatewayRuntimePluginHealth(groups),
+      groups
+    };
+  });
+
+  fastify.get('/manager/plugins/catalog', { preHandler }, async () => {
+    return {
+      configured: (options.config.plugins || []).map((plugin) => ({
+        key: plugin.key,
+        enabled: plugin.enabled,
+        modulePath: plugin.modulePath,
+        manifest: plugin.manifest,
+        capabilities: plugin.manifest?.capabilities || [],
+        providerHooks: plugin.providerHooks.length
+      })),
+      runtime: options.runtime
+        ? {
+            providers: options.config.providers.map((provider) => ({
+              name: provider.name,
+              type: provider.type,
+              models: provider.models
+            })),
+            sourceAdapters: options.runtime.sourceAdapters.list().map((adapter) => adapter.key),
+            targetAdapters: options.runtime.targetAdapters.list().map((adapter) => ({
+              key: adapter.key,
+              provider: adapter.provider,
+              providerTypes: adapter.providerTypes || []
+            })),
+            requestHooks: options.runtime.requestHooks.list().map((hook) => hook.key),
+            streamHooks: options.runtime.streamHooks.list().map((hook) => hook.key),
+            billingEventHooks: options.runtime.billingEventHooks.list().map((hook) => hook.key),
+            agentEventHooks: options.runtime.agentEventHooks.list().map((hook) => hook.key)
+          }
+        : undefined
+    };
+  });
+
+  fastify.post('/manager/plugins/reload', { preHandler }, async (request, reply) => {
+    try {
+      const path = resolveGatewayConfigPath();
+      const fileConfig = readGatewayConfigFile(path);
+      return await applyConfigUpdate(request, reply, fileConfig);
+    } catch (error) {
+      request.log.warn(
+        {
+          details: error instanceof Error ? error.message : String(error)
+        },
+        'Failed to reload gateway plugins.'
+      );
+      return reply.code(400).send({
+        error: {
+          message: error instanceof Error ? error.message : String(error)
+        }
+      });
+    }
+  });
+
+  fastify.post('/manager/plugins', { preHandler }, async (request, reply) => {
+    if (!isObject(request.body)) {
+      return reply.code(400).send({
+        error: {
+          message: 'Request body must be a plugin object.'
+        }
+      });
+    }
+
+    const plugin = request.body as Record<string, unknown>;
+    const key = readStringValue(plugin.key);
+    if (!key) {
+      return reply.code(400).send({
+        error: {
+          message: 'Plugin key is required.'
+        }
+      });
+    }
+
+    try {
+      const path = resolveGatewayConfigPath();
+      const fileConfig = readGatewayConfigFile(path);
+      const plugins = Array.isArray(fileConfig.plugins) ? [...fileConfig.plugins] : [];
+      const index = plugins.findIndex((item) => isObject(item) && readStringValue((item as Record<string, unknown>).key) === key);
+      if (index >= 0) {
+        plugins[index] = plugin;
+      } else {
+        plugins.push(plugin);
+      }
+      const bodyForApply = {
+        ...fileConfig,
+        plugins
+      };
+      return await applyConfigUpdate(request, reply, bodyForApply);
+    } catch (error) {
+      request.log.warn(
+        {
+          plugin: key,
+          details: error instanceof Error ? error.message : String(error)
+        },
+        'Failed to add or update gateway plugin.'
+      );
+      return reply.code(400).send({
+        error: {
+          message: error instanceof Error ? error.message : String(error)
+        }
+      });
+    }
+  });
+
+  fastify.patch<{ Params: ManagerPluginParams; Body: ManagerPluginStateBody }>(
+    '/manager/plugins/:key',
+    { preHandler },
+    async (request, reply) => {
+      const enabled = readBooleanValue(request.body?.enabled);
+      if (enabled === undefined) {
+        return reply.code(400).send({
+          error: {
+            message: 'enabled must be a boolean.'
+          }
+        });
+      }
+
+      return updateConfiguredPluginEnabled(request.params.key, enabled, request, reply, applyConfigUpdate);
+    }
+  );
+
+  fastify.post<{ Params: ManagerPluginParams }>(
+    '/manager/plugins/:key/enable',
+    { preHandler },
+    async (request, reply) =>
+      updateConfiguredPluginEnabled(request.params.key, true, request, reply, applyConfigUpdate)
+  );
+
+  fastify.post<{ Params: ManagerPluginParams }>(
+    '/manager/plugins/:key/disable',
+    { preHandler },
+    async (request, reply) =>
+      updateConfiguredPluginEnabled(request.params.key, false, request, reply, applyConfigUpdate)
+  );
+
+  fastify.get('/manager/plugins/dead-letters', { preHandler }, async () => ({
+    deadLetters: listGatewayPluginDeadLetters()
+  }));
+
+  fastify.delete<{ Params: ManagerPluginParams }>(
+    '/manager/plugins/:key/dead-letters',
+    { preHandler },
+    async (request) => ({
+      cleared: clearGatewayPluginDeadLetters(request.params.key)
+    })
+  );
+
   fastify.post<{ Querystring: ManagerConfigQuery }>('/manager/config/validate', { preHandler }, async (request, reply) => {
     if (!isObject(request.body)) {
       return reply.code(400).send({
@@ -124,7 +398,7 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
       }
 
       const before = cloneJsonObject(options.config as unknown as Record<string, unknown>);
-      const warnings = collectReloadWarnings(before, next);
+      const warnings = collectReloadWarnings(before, next, bodyForApply);
 
       return {
         ok: true,
@@ -202,13 +476,11 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
       const before = cloneJsonObject(options.config as unknown as Record<string, unknown>);
       writeJsonFile(path, bodyForApply);
       applyGatewayConfigInPlace(options.config, next);
-      await initializeBillingPublisher(options.config.billingQueue, options.config.billingWebhook, fastify.log);
-      await initializeAgentEventPublisher(options.config.agent.eventQueue, options.config.agent.eventWebhook, fastify.log);
       if (options.onConfigReload) {
         await options.onConfigReload(options.config);
       }
 
-      const warnings = collectReloadWarnings(before, options.config);
+      const warnings = collectReloadWarnings(before, options.config, bodyForApply);
 
       return {
         ok: true,
@@ -233,8 +505,84 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
   });
 }
 
+async function updateConfiguredPluginEnabled(
+  pluginKey: string,
+  enabled: boolean,
+  request: FastifyRequest,
+  reply: FastifyReply,
+  applyConfigUpdate: (
+    request: FastifyRequest,
+    reply: FastifyReply,
+    bodyForApply: Record<string, unknown>
+  ) => Promise<unknown>
+) {
+  try {
+    const path = resolveGatewayConfigPath();
+    const fileConfig = readGatewayConfigFile(path);
+    const plugins = Array.isArray(fileConfig.plugins) ? [...fileConfig.plugins] : [];
+    const index = plugins.findIndex((item) => isObject(item) && readStringValue((item as Record<string, unknown>).key) === pluginKey);
+    if (index < 0) {
+      return reply.code(404).send({
+        error: {
+          message: `Plugin not found: ${pluginKey}`
+        }
+      });
+    }
+
+    const plugin = plugins[index];
+    if (!isObject(plugin)) {
+      return reply.code(400).send({
+        error: {
+          message: `Plugin entry is invalid: ${pluginKey}`
+        }
+      });
+    }
+
+    plugins[index] = {
+      ...(plugin as Record<string, unknown>),
+      enabled
+    };
+    return await applyConfigUpdate(request, reply, {
+      ...fileConfig,
+      plugins
+    });
+  } catch (error) {
+    request.log.warn(
+      {
+        plugin: pluginKey,
+        enabled,
+        details: error instanceof Error ? error.message : String(error)
+      },
+      'Failed to update gateway plugin state.'
+    );
+    return reply.code(400).send({
+      error: {
+        message: error instanceof Error ? error.message : String(error)
+      }
+    });
+  }
+}
+
 function shouldRevealSecrets(query: ManagerConfigQuery | undefined): boolean {
   return readBooleanQueryValue(query?.revealSecrets) || readBooleanQueryValue(query?.reveal_secrets);
+}
+
+function readBooleanValue(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on') {
+    return true;
+  }
+  if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off') {
+    return false;
+  }
+  return undefined;
 }
 
 function readBooleanQueryValue(value: string | undefined): boolean {
@@ -500,6 +848,13 @@ function sendProviderManagementDisabled(reply: FastifyReply) {
   });
 }
 
+function formatPluginExtensionSummary(extension: { key: string; transport?: string }) {
+  return {
+    key: extension.key,
+    transport: extension.transport
+  };
+}
+
 function buildProviderHealthSnapshots(providers: ProviderConfig[]) {
   return providers.map((providerConfig) => ({
     name: providerConfig.name,
@@ -593,7 +948,8 @@ function writeJsonFile(path: string, payload: Record<string, unknown>): void {
 
 function collectReloadWarnings(
   previousConfig: Record<string, unknown>,
-  nextConfig: GatewayConfig
+  nextConfig: GatewayConfig,
+  rawNextConfig?: Record<string, unknown>
 ): string[] {
   const warnings: string[] = [];
 
@@ -636,6 +992,66 @@ function collectReloadWarnings(
     (previousWsEndpoint && previousWsEndpoint !== nextConfig.mcpGateway.websocket.endpoint)
   ) {
     warnings.push('mcpGateway endpoint path changed, but HTTP/WS route bindings require process restart.');
+  }
+
+  warnings.push(...collectPluginConfigWarnings(rawNextConfig, nextConfig));
+
+  return warnings;
+}
+
+function collectPluginConfigWarnings(
+  rawConfig: Record<string, unknown> | undefined,
+  nextConfig: GatewayConfig
+): string[] {
+  const warnings: string[] = [];
+  const rawPlugins = rawConfig?.plugins;
+  if (rawPlugins !== undefined && !Array.isArray(rawPlugins)) {
+    warnings.push('plugins must be an array; configured gateway plugins were ignored.');
+    return warnings;
+  }
+
+  if (Array.isArray(rawPlugins)) {
+    const parsedPluginKeys = new Set((nextConfig.plugins || []).map((plugin) => plugin.key));
+    for (const [index, entry] of rawPlugins.entries()) {
+      if (!isObject(entry)) {
+        warnings.push(`plugins[${index}] is not an object and was ignored.`);
+        continue;
+      }
+
+      const rawPlugin = entry as Record<string, unknown>;
+      const key = readStringValue(rawPlugin.key);
+      if (!key) {
+        warnings.push(`plugins[${index}] is missing key and was ignored.`);
+        continue;
+      }
+
+      if (rawPlugin.enabled === false) {
+        continue;
+      }
+
+      const hasModulePath = Boolean(readStringValue(rawPlugin.modulePath) || readStringValue(rawPlugin.path));
+      const hasHooks = rawPlugin.providerHooks !== undefined || rawPlugin.providerHook !== undefined || rawPlugin.hooks !== undefined;
+      if (!hasModulePath && !hasHooks) {
+        warnings.push(`plugins[${index}] "${key}" has no modulePath or providerHooks and was ignored.`);
+      }
+
+      if (isObject(rawPlugin.manifest) && !readStringValue((rawPlugin.manifest as Record<string, unknown>).name)) {
+        warnings.push(`plugins[${index}] "${key}" manifest.name is missing; manifest metadata was ignored.`);
+      }
+
+      if (rawPlugin.watchFiles !== undefined && !Array.isArray(rawPlugin.watchFiles) && typeof rawPlugin.watchFiles !== 'string') {
+        warnings.push(`plugins[${index}] "${key}" watchFiles must be an array or comma-delimited string.`);
+      }
+
+      if (!parsedPluginKeys.has(key) && hasModulePath) {
+        warnings.push(`plugins[${index}] "${key}" was not loaded by config parser; check enabled/key/modulePath fields.`);
+      }
+    }
+  }
+
+  const rawProviderPlugins = rawConfig?.providerPlugins;
+  if (rawProviderPlugins !== undefined && !Array.isArray(rawProviderPlugins)) {
+    warnings.push('providerPlugins must be an array; configured legacy provider plugins were ignored.');
   }
 
   return warnings;

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GatewayConfig, ProviderConfig } from '../types';
+import { createGatewayRuntime } from '../gateway/runtime';
 import { registerManagerRoutes } from './routes';
 
 const ORIGINAL_GATEWAY_CONFIG_PATH = process.env.GATEWAY_CONFIG_PATH;
@@ -127,6 +128,72 @@ describe('manager config routes', () => {
       expect(revealedBody.fileConfig.providerPlugins[0].codexOauth.refreshToken).toBe('file-refresh-token');
       expect(revealedBody.effectiveConfig.openaiApiKey).toBe('runtime-openai-key');
       expect(revealedBody.effectiveConfig.providers[0].apikey).toBe('runtime-provider-key');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('returns runtime plugin summaries and health', async () => {
+    delete process.env.MANAGER_API_KEY;
+    const app = Fastify({ logger: false });
+    const runtimeConfig = createRuntimeConfig({
+      plugins: [
+        {
+          key: 'billing-plugin',
+          enabled: true,
+          providerHooks: []
+        }
+      ]
+    });
+    const runtime = createGatewayRuntime(runtimeConfig);
+    runtime.billingOutboxes.register({
+      key: 'billing-kafka',
+      transport: 'kafka',
+      health() {
+        return {
+          status: 'degraded',
+          message: 'lagging'
+        };
+      },
+      append() {
+        return true;
+      }
+    });
+    registerManagerRoutes(app, { config: runtimeConfig, runtime });
+    await app.ready();
+
+    try {
+      const plugins = await app.inject({
+        method: 'GET',
+        url: '/manager/plugins'
+      });
+      expect(plugins.statusCode).toBe(200);
+      const pluginsBody = JSON.parse(plugins.body);
+      expect(pluginsBody.configured.plugins[0].key).toBe('billing-plugin');
+      expect(pluginsBody.runtime.billingOutboxes).toEqual([
+        {
+          key: 'billing-kafka',
+          transport: 'kafka'
+        }
+      ]);
+
+      const health = await app.inject({
+        method: 'GET',
+        url: '/manager/plugins/health'
+      });
+      expect(health.statusCode).toBe(200);
+      const healthBody = JSON.parse(health.body);
+      expect(healthBody.summary).toMatchObject({
+        status: 'degraded',
+        total: 1,
+        degraded: 1,
+        unhealthy: 0
+      });
+      expect(healthBody.groups[1].extensions[0]).toMatchObject({
+        key: 'billing-kafka',
+        status: 'degraded',
+        message: 'lagging'
+      });
     } finally {
       await app.close();
     }

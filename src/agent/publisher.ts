@@ -1,5 +1,13 @@
 import { publishJsonEventToExternalSink } from '../external-event-sink';
-import type { AgentEventQueueConfig, AgentEventWebhookConfig } from '../types';
+import { recordGatewayPluginHookExecution } from '../gateway/metrics';
+import {
+  closeGatewayPluginExtensions,
+  executeGatewayPluginEventDelivery,
+  initializeGatewayPluginExtensions,
+  type GatewayPluginEventPublisher,
+  type GatewayPluginOutbox
+} from '../plugins/events';
+import type { AgentEventQueueConfig, AgentEventWebhookConfig, GatewayPluginEventHook } from '../types';
 import type { AgentEvent, AgentEventType } from './types';
 
 export interface AgentEventPublisherLogger {
@@ -21,24 +29,92 @@ export interface AgentQueueEvent {
 let queueConfig: AgentEventQueueConfig | undefined;
 let webhookConfig: AgentEventWebhookConfig | undefined;
 let logger: AgentEventPublisherLogger | undefined;
+let pluginPublishers: GatewayPluginEventPublisher<AgentQueueEvent>[] = [];
+let pluginOutboxes: GatewayPluginOutbox<AgentQueueEvent>[] = [];
+let pluginEventHooks: GatewayPluginEventHook<AgentQueueEvent>[] = [];
+
+export interface AgentEventPublisherPluginExtensions {
+  publishers?: GatewayPluginEventPublisher<AgentQueueEvent>[];
+  outboxes?: GatewayPluginOutbox<AgentQueueEvent>[];
+  eventHooks?: GatewayPluginEventHook<AgentQueueEvent>[];
+}
 
 export async function initializeAgentEventPublisher(
   config: AgentEventQueueConfig | undefined,
   webhookPublisherConfig?: AgentEventWebhookConfig,
-  log?: AgentEventPublisherLogger
+  log?: AgentEventPublisherLogger,
+  pluginExtensions?: AgentEventPublisherPluginExtensions
 ): Promise<void> {
   logger = log;
+  await closeGatewayPluginExtensions([...pluginPublishers, ...pluginOutboxes]);
+  pluginPublishers = pluginExtensions?.publishers || [];
+  pluginOutboxes = pluginExtensions?.outboxes || [];
+  pluginEventHooks = pluginExtensions?.eventHooks || [];
+  try {
+    await initializeGatewayPluginExtensions([...pluginPublishers, ...pluginOutboxes], { logger });
+  } catch (error) {
+    pluginPublishers = [];
+    pluginOutboxes = [];
+    throw error;
+  }
   initializeWebhookPublisher(webhookPublisherConfig);
   const normalizedConfig = normalizeConfig(config);
   initializeQueuePublisher(normalizedConfig);
+  initializePluginPublishers(pluginPublishers, pluginOutboxes);
 }
 
 export async function publishAgentEventToExternalSink(event: AgentEvent): Promise<boolean> {
-  if (!webhookConfig?.enabled || !normalizeWebhookTarget(webhookConfig)) {
+  const preparedEvent = await applyAgentEventHooks(toWebhookEvent(event));
+  if (!preparedEvent) {
+    return false;
+  }
+  const deliveries: Array<Promise<boolean>> = [];
+
+  if (webhookConfig?.enabled && normalizeWebhookTarget(webhookConfig)) {
+    deliveries.push(publishJsonEventToExternalSink(preparedEvent, webhookConfig));
+  }
+
+  for (const outbox of pluginOutboxes) {
+    deliveries.push(appendAgentEventToPluginOutbox(outbox, preparedEvent));
+  }
+
+  for (const publisher of pluginPublishers) {
+    deliveries.push(publishAgentEventToPluginPublisher(publisher, preparedEvent));
+  }
+
+  if (deliveries.length === 0) {
     return false;
   }
 
-  return publishJsonEventToExternalSink(toWebhookEvent(event), webhookConfig);
+  const settled = await Promise.allSettled(deliveries);
+  let delivered = false;
+  const failures: string[] = [];
+  for (const result of settled) {
+    if (result.status === 'fulfilled') {
+      delivered = delivered || result.value;
+      continue;
+    }
+
+    failures.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
+  }
+
+  if (delivered) {
+    if (failures.length > 0) {
+      logger?.warn(
+        {
+          details: failures
+        },
+        'One or more agent event publishers failed after another publisher accepted the event.'
+      );
+    }
+    return true;
+  }
+
+  if (failures.length > 0) {
+    throw new Error(failures.join(' | '));
+  }
+
+  return false;
 }
 
 export async function publishAgentEventToQueue(event: AgentEvent): Promise<boolean> {
@@ -46,6 +122,10 @@ export async function publishAgentEventToQueue(event: AgentEvent): Promise<boole
 }
 
 export async function closeAgentEventPublisher(): Promise<void> {
+  await closeGatewayPluginExtensions([...pluginPublishers, ...pluginOutboxes]);
+  pluginPublishers = [];
+  pluginOutboxes = [];
+  pluginEventHooks = [];
   queueConfig = undefined;
   webhookConfig = undefined;
 }
@@ -149,4 +229,111 @@ function toWebhookEvent(event: AgentEvent): AgentQueueEvent {
     eventTimestamp: event.timestamp,
     payload: event.payload
   };
+}
+
+function initializePluginPublishers(
+  publishers: GatewayPluginEventPublisher<AgentQueueEvent>[],
+  outboxes: GatewayPluginOutbox<AgentQueueEvent>[]
+): void {
+  if (publishers.length === 0 && outboxes.length === 0) {
+    return;
+  }
+
+  logger?.info(
+    {
+      eventPublishers: publishers.map((publisher) => publisher.key),
+      eventOutboxes: outboxes.map((outbox) => outbox.key)
+    },
+    'Agent event plugin publishers initialized.'
+  );
+}
+
+async function appendAgentEventToPluginOutbox(
+  outbox: GatewayPluginOutbox<AgentQueueEvent>,
+  event: AgentQueueEvent
+): Promise<boolean> {
+  return executeGatewayPluginEventDelivery(outbox, event, (context) => outbox.append(event, context));
+}
+
+async function publishAgentEventToPluginPublisher(
+  publisher: GatewayPluginEventPublisher<AgentQueueEvent>,
+  event: AgentQueueEvent
+): Promise<boolean> {
+  return executeGatewayPluginEventDelivery(publisher, event, (context) => publisher.publish(event, context));
+}
+
+async function applyAgentEventHooks(event: AgentQueueEvent): Promise<AgentQueueEvent | undefined> {
+  let nextEvent = event;
+  for (const hook of pluginEventHooks) {
+    const startedAt = process.hrtime.bigint();
+    try {
+      const result = await hook.transform?.({
+        event: nextEvent
+      });
+      if (result === false) {
+        recordGatewayPluginHookExecution({
+          pluginKey: hook.key,
+          kind: 'agent_event',
+          hook: 'transform',
+          outcome: 'dropped',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
+        return undefined;
+      }
+      if (result && typeof result === 'object' && 'ok' in result) {
+        if (!result.ok) {
+          throw new Error(result.error);
+        }
+        if (result.value === false) {
+          recordGatewayPluginHookExecution({
+            pluginKey: hook.key,
+            kind: 'agent_event',
+            hook: 'transform',
+            outcome: 'dropped',
+            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+          });
+          return undefined;
+        }
+        if (result.value && typeof result.value === 'object') {
+          nextEvent = result.value as AgentQueueEvent;
+        }
+        recordGatewayPluginHookExecution({
+          pluginKey: hook.key,
+          kind: 'agent_event',
+          hook: 'transform',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
+        continue;
+      }
+      if (result && typeof result === 'object') {
+        nextEvent = result as AgentQueueEvent;
+      }
+      recordGatewayPluginHookExecution({
+        pluginKey: hook.key,
+        kind: 'agent_event',
+        hook: 'transform',
+        outcome: 'success',
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
+    } catch (error) {
+      recordGatewayPluginHookExecution({
+        pluginKey: hook.key,
+        kind: 'agent_event',
+        hook: 'transform',
+        outcome: 'error',
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
+      logger?.warn(
+        {
+          hook: hook.key,
+          details: error instanceof Error ? error.message : String(error)
+        },
+        'Agent event plugin hook failed.'
+      );
+      throw error;
+    }
+  }
+
+  return nextEvent;
 }

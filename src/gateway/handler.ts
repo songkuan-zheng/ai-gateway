@@ -2,7 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { BillingResult } from '../billing';
-import { buildBillingHeaders, calculateUsageBilling, publishBillingEvent } from '../billing';
+import {
+  buildBillingHeaders,
+  calculateUsageBilling,
+  hasBillingEventPublisher,
+  publishBillingEvent
+} from '../billing';
 import type { AgentToolDefinition } from '../agent/types';
 import type {
   GatewayBillingTrace,
@@ -73,7 +78,7 @@ import {
   applyOpenAIChatStreamUsageOption,
   rewriteOpenAIChatCompatibleRequest
 } from '../adapters/builtins/target/shared';
-import type { GatewayRuntime } from './runtime';
+import { listGatewayVirtualModelProfiles, type GatewayRuntime } from './runtime';
 import { applyHealthAwareRouting } from './health-routing';
 import { evaluateGatewayPolicy, type GatewayPolicyResult } from './policy';
 import { recordProviderHealthFailure, recordProviderHealthResponse } from './provider-health';
@@ -86,6 +91,7 @@ import {
 import { acquireProviderConcurrencySlot } from './upstream-concurrency';
 import { resolveGatewayClientIp } from './client-ip';
 import {
+  recordGatewayPluginHookExecution,
   recordGatewayStreamConversion,
   recordGatewayToolExecution
 } from './metrics';
@@ -103,6 +109,11 @@ import {
 } from '../raw-trace';
 import { matchesAnyPattern } from '../shared/pattern';
 import { evaluateApiKeyModelRestriction } from './auth';
+import { shouldRunProviderPlugin } from '../provider/plugins';
+import {
+  applyGatewayPluginStreamResponseHooks,
+  executeGatewayPluginRequestHookStage
+} from '../plugins/hooks';
 
 interface ProviderAttemptFailure {
   provider: Provider;
@@ -299,8 +310,37 @@ export async function handleGatewayRequest(
   };
   const requestedModelSelector =
     readHeader(request.headers['x-target-model']) || resolvePassthroughModel(body, source);
+  const beforeRoutingResult = await executeGatewayPluginRequestHookStage(
+    runtime.requestHooks.list(),
+    'beforeRouting',
+    {
+      request,
+      config,
+      route: {
+        method: request.method,
+        url: request.url,
+        route: request.routeOptions?.url,
+        sourceAdapterKey: source.adapterKey,
+        sourceRoute: source.metadata?.sourceRoute
+      },
+      source,
+      sourceProvider: sourceAdapter.provider,
+      sourceAdapterKey: source.adapterKey,
+      model: requestedModelSelector,
+      requestBody: body
+    }
+  );
+  if (!beforeRoutingResult.ok) {
+    return reply.code(beforeRoutingResult.status || 403).send({
+      error: {
+        message: `Gateway plugin "${beforeRoutingResult.pluginKey}" beforeRouting failed: ${beforeRoutingResult.error}`,
+        details: beforeRoutingResult.details
+      }
+    });
+  }
+
   const virtualModelResolution = requestedModelSelector
-    ? resolveVirtualModelRequest(config, requestedModelSelector)
+    ? resolveVirtualModelRequest(config, runtime, requestedModelSelector)
     : undefined;
 
   const targetProvidersResult = resolveTargetProviders(
@@ -352,6 +392,53 @@ export async function handleGatewayRequest(
       return { ok: true };
     }
 
+    const hookInput = {
+      request,
+      config,
+      route: {
+        method: request.method,
+        url: request.url,
+        route: request.routeOptions?.url,
+        sourceAdapterKey: source.adapterKey,
+        sourceRoute: source.metadata?.sourceRoute
+      },
+      source,
+      sourceProvider: sourceAdapter.provider,
+      sourceAdapterKey: source.adapterKey,
+      targetProvider,
+      targetProviderConfig,
+      model,
+      standardRequest,
+      requestBody
+    };
+    const beforePrecheckResult = await executeGatewayPluginRequestHookStage<{
+      allow: false;
+      statusCode?: number;
+      message: string;
+      details?: Record<string, unknown>;
+    }>(
+      runtime.requestHooks.list(),
+      'beforePrecheck',
+      hookInput
+    );
+    if (!beforePrecheckResult.ok) {
+      return buildGatewayPluginPrecheckFailure(beforePrecheckResult);
+    }
+    const precheckDecision = beforePrecheckResult.value;
+    if (
+      precheckDecision &&
+      typeof precheckDecision === 'object' &&
+      'allow' in precheckDecision &&
+      precheckDecision.allow === false
+    ) {
+      return buildGatewayPluginPrecheckFailure({
+        pluginKey: beforePrecheckResult.pluginKey || 'beforePrecheck',
+        status: precheckDecision.statusCode,
+        error: precheckDecision.message,
+        details: precheckDecision.details
+      });
+    }
+
     const result = await evaluateGatewayPrecheck({
       request,
       config,
@@ -361,6 +448,17 @@ export async function handleGatewayRequest(
       standardRequest,
       requestBody
     });
+    const afterPrecheckResult = await executeGatewayPluginRequestHookStage(
+      runtime.requestHooks.list(),
+      'afterPrecheck',
+      ({
+        ...hookInput,
+        result
+      } as typeof hookInput & { result: GatewayPrecheckResult })
+    );
+    if (!afterPrecheckResult.ok) {
+      return buildGatewayPluginPrecheckFailure(afterPrecheckResult);
+    }
     if (result.ok) {
       precheckApplied = true;
     }
@@ -579,6 +677,7 @@ export async function handleGatewayRequest(
         continue;
       }
 
+      let passthroughStreamResponse = upstreamResponse;
       if (!isStreaming) {
         const hasResponseTransformPlugin = providerPlugins.some((plugin) => Boolean(plugin.transformResponse));
         let transformedPayload: unknown | undefined;
@@ -686,7 +785,49 @@ export async function handleGatewayRequest(
         }
         return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
       } else {
-        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, upstreamResponse);
+        const streamHookResult = await applyGatewayPluginStreamResponseHooks(runtime.streamHooks.list(), {
+          request,
+          config,
+          source,
+          sourceProvider: sourceAdapter.provider,
+          sourceAdapterKey: source.adapterKey,
+          targetProvider,
+          targetProviderConfig,
+          model: passthroughModel,
+          passthrough: true,
+          streaming: true,
+          upstreamRequest,
+          upstreamResponse
+        });
+        if (!streamHookResult.ok) {
+          const attempt: ProviderAttemptFailure = {
+            provider: targetProvider,
+            providerName: targetProviderConfig?.name,
+            stage: 'plugin_stream_transform',
+            message: `Gateway plugin "${streamHookResult.pluginKey}" stream transform failed: ${streamHookResult.error}`,
+            status: streamHookResult.status || 502,
+            upstreamRequest
+          };
+          attempts.push(attempt);
+          publishFailedAttemptEventSafe(
+            request,
+            reply,
+            config,
+            sourceAdapter.provider,
+            source.adapterKey,
+            attempt,
+            passthroughModel,
+            currentAttemptSequence,
+            attempts,
+            targetProviderConfig
+          );
+          if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+            break;
+          }
+          continue;
+        }
+        passthroughStreamResponse = streamHookResult.value;
+        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, passthroughStreamResponse);
         void tryPublishStreamingBillingEventFromUpstreamResponse(
           request,
           reply,
@@ -698,7 +839,7 @@ export async function handleGatewayRequest(
           currentAttemptSequence,
           targetAdapter,
           upstreamRequest,
-          upstreamResponse.clone(),
+          passthroughStreamResponse.clone(),
           passthroughModel,
           targetProviderConfig,
           rawTraceStreamResponse,
@@ -718,7 +859,7 @@ export async function handleGatewayRequest(
       if (shouldForceEventStreamHeaders(source, isStreaming)) {
         forceEventStreamHeaders(reply);
       }
-      return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
+      return relayUpstreamResponse(reply, passthroughStreamResponse, clientAbortSignal);
     }
 
     if (isStreaming) {
@@ -928,13 +1069,56 @@ export async function handleGatewayRequest(
       }
 
       if (canTreatAsLiveStreamResponse(source, targetProvider, upstreamResponse)) {
+        const streamHookResult = await applyGatewayPluginStreamResponseHooks(runtime.streamHooks.list(), {
+          request,
+          config,
+          source,
+          sourceProvider: sourceAdapter.provider,
+          sourceAdapterKey: source.adapterKey,
+          targetProvider,
+          targetProviderConfig,
+          model,
+          passthrough: false,
+          streaming: true,
+          upstreamRequest,
+          upstreamResponse,
+          standardRequest
+        });
+        if (!streamHookResult.ok) {
+          const attempt: ProviderAttemptFailure = {
+            provider: targetProvider,
+            providerName: targetProviderConfig?.name,
+            stage: 'plugin_stream_transform',
+            message: `Gateway plugin "${streamHookResult.pluginKey}" stream transform failed: ${streamHookResult.error}`,
+            status: streamHookResult.status || 502,
+            upstreamRequest
+          };
+          attempts.push(attempt);
+          publishFailedAttemptEventSafe(
+            request,
+            reply,
+            config,
+            sourceAdapter.provider,
+            source.adapterKey,
+            attempt,
+            model,
+            currentAttemptSequence,
+            attempts,
+            targetProviderConfig
+          );
+          if (!shouldTryNextTargetAfterFailure(config, targetProviders, targetIndex, attempt)) {
+            break;
+          }
+          continue;
+        }
+        const transformedStreamResponse = streamHookResult.value;
         recordGatewayStreamConversion({
           sourceAdapter: source.adapterKey,
           targetProvider,
           targetProviderName: targetProviderConfig?.name,
           mode: 'live'
         });
-        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, upstreamResponse);
+        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, transformedStreamResponse);
         void tryPublishStreamingBillingEventFromUpstreamResponse(
           request,
           reply,
@@ -946,7 +1130,7 @@ export async function handleGatewayRequest(
           currentAttemptSequence,
           targetAdapter,
           upstreamRequest,
-          upstreamResponse.clone(),
+          transformedStreamResponse.clone(),
           model,
           targetProviderConfig,
           rawTraceStreamResponse,
@@ -956,7 +1140,7 @@ export async function handleGatewayRequest(
         return relayConvertedStreamFromUpstreamResponse(
           reply,
           source,
-          upstreamResponse,
+          transformedStreamResponse,
           standardRequest,
           clientAbortSignal
         );
@@ -1105,6 +1289,7 @@ export async function handleGatewayRequest(
         resolveBillingModel(standardResponseResult.value.model, model),
         targetProviderConfig,
         buildGatewayBillingTraceSnapshot(request, reply, {
+          billingTrace: config.billing.trace,
           responseBody: sourceStandardResponse,
           standardResponse: sourceStandardResponse
         }),
@@ -1491,6 +1676,7 @@ export async function handleGatewayRequest(
       resolveBillingModel(transparentToolExecutionResult.standardResponse.model, model),
       targetProviderConfig,
       buildGatewayBillingTraceSnapshot(request, reply, {
+        billingTrace: config.billing.trace,
         responseBody: sourcePayload,
         standardResponse: sourceStandardResponse
       }),
@@ -1549,6 +1735,7 @@ export async function handleGatewayRequest(
       attempts[attempts.length - 1]?.message || fallbackFailure.payload.error.message,
       failureTarget.providerConfig,
       buildGatewayBillingTraceSnapshot(request, reply, {
+        billingTrace: config.billing.trace,
         responseBody: fallbackFailure.payload,
       }),
       resolveAttemptRawTraceCapture(lastTraceableAttempt),
@@ -2087,6 +2274,53 @@ async function handleVirtualModelRequest(
       return { ok: true };
     }
 
+    const hookInput = {
+      request,
+      config,
+      route: {
+        method: request.method,
+        url: request.url,
+        route: request.routeOptions?.url,
+        sourceAdapterKey: source.adapterKey,
+        sourceRoute: source.metadata?.sourceRoute
+      },
+      source,
+      sourceProvider: sourceAdapter.provider,
+      sourceAdapterKey: source.adapterKey,
+      targetProvider,
+      targetProviderConfig,
+      model,
+      standardRequest,
+      requestBody: adapterInput.body
+    };
+    const beforePrecheckResult = await executeGatewayPluginRequestHookStage<{
+      allow: false;
+      statusCode?: number;
+      message: string;
+      details?: Record<string, unknown>;
+    }>(
+      runtime.requestHooks.list(),
+      'beforePrecheck',
+      hookInput
+    );
+    if (!beforePrecheckResult.ok) {
+      return buildGatewayPluginPrecheckFailure(beforePrecheckResult);
+    }
+    const precheckDecision = beforePrecheckResult.value;
+    if (
+      precheckDecision &&
+      typeof precheckDecision === 'object' &&
+      'allow' in precheckDecision &&
+      precheckDecision.allow === false
+    ) {
+      return buildGatewayPluginPrecheckFailure({
+        pluginKey: beforePrecheckResult.pluginKey || 'beforePrecheck',
+        status: precheckDecision.statusCode,
+        error: precheckDecision.message,
+        details: precheckDecision.details
+      });
+    }
+
     const result = await evaluateGatewayPrecheck({
       request,
       config,
@@ -2096,6 +2330,17 @@ async function handleVirtualModelRequest(
       standardRequest,
       requestBody: adapterInput.body
     });
+    const afterPrecheckResult = await executeGatewayPluginRequestHookStage(
+      runtime.requestHooks.list(),
+      'afterPrecheck',
+      ({
+        ...hookInput,
+        result
+      } as typeof hookInput & { result: GatewayPrecheckResult })
+    );
+    if (!afterPrecheckResult.ok) {
+      return buildGatewayPluginPrecheckFailure(afterPrecheckResult);
+    }
     if (result.ok) {
       precheckApplied = true;
     }
@@ -2719,6 +2964,7 @@ async function handleVirtualModelRequest(
       attempts[attempts.length - 1]?.message || fallbackFailure.payload.error.message,
       failureTarget.providerConfig,
       buildGatewayBillingTraceSnapshot(request, reply, {
+        billingTrace: config.billing.trace,
         responseBody: fallbackFailure.payload,
       }),
       resolveAttemptRawTraceCapture(lastTraceableAttempt),
@@ -4124,6 +4370,7 @@ function publishOptimisticVirtualModelBillingEvent(
     billing,
     input.targetProviderConfig,
     buildGatewayBillingTraceSnapshot(input.request, input.reply, {
+      billingTrace: input.config.billing.trace,
       standardResponse: response
     })
   );
@@ -4170,6 +4417,7 @@ function sendVirtualModelResponse(
       resolveBillingModel(standardResponse.model, model),
       targetProviderConfig,
       buildGatewayBillingTraceSnapshot(request, reply, {
+        billingTrace: config.billing.trace,
         responseBody: sourcePayload,
         standardResponse: sourceStandardResponse
       }),
@@ -4194,6 +4442,7 @@ function sendVirtualModelResponse(
     resolveBillingModel(standardResponse.model, model),
     targetProviderConfig,
     buildGatewayBillingTraceSnapshot(request, reply, {
+      billingTrace: config.billing.trace,
       responseBody: sourceStandardResponse,
       standardResponse: sourceStandardResponse
     }),
@@ -4226,9 +4475,10 @@ function shouldUseTransparentToolExecutionPath(
 
 function resolveVirtualModelRequest(
   config: GatewayConfig,
+  runtime: Pick<GatewayRuntime, 'virtualModelProfiles'>,
   requestedModel: string
 ): VirtualModelResolution | undefined {
-  const profiles = config.virtualModelProfiles || [];
+  const profiles = listGatewayVirtualModelProfiles(config, runtime);
   const requestRef = parseModelReference(requestedModel, config.providers);
   if (!requestRef) {
     return undefined;
@@ -5576,6 +5826,31 @@ function sendGatewayPrecheckFailure(reply: FastifyReply, result: GatewayPrecheck
   });
 }
 
+function buildGatewayPluginPrecheckFailure(input: {
+  pluginKey: string;
+  status?: number;
+  error: string;
+  details?: unknown;
+}): GatewayPrecheckResult {
+  return {
+    ok: false,
+    kind: 'quota',
+    statusCode: input.status || 403,
+    code: 'plugin_precheck_denied',
+    message: `Gateway plugin "${input.pluginKey}" precheck failed: ${input.error}`,
+    details: {
+      subject: 'plugin',
+      scope: 'plugin',
+      window_ms: 0,
+      limit: 0,
+      used: 0,
+      requested: 0,
+      metric: 'plugin',
+      limit_name: input.pluginKey
+    }
+  };
+}
+
 function sendCountedBadRequest(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -5609,6 +5884,7 @@ function sendCountedBadRequest(
     message,
     resolveProviderConfig(config, target),
     buildGatewayBillingTraceSnapshot(request, reply, {
+      billingTrace: config.billing.trace,
       responseBody: payload,
     }),
   );
@@ -6182,6 +6458,7 @@ async function tryAttachBillingHeadersFromUpstreamResponse(
     resolveBillingModel(billingResponseResult.value.model, fallbackModel),
     targetProviderConfig,
     buildGatewayBillingTraceSnapshot(request, reply, {
+      billingTrace: config.billing.trace,
       responseBody: upstreamPayload,
       responseStatusCode: upstreamResponse.status
     }),
@@ -6264,6 +6541,7 @@ function tryAttachBillingHeadersFromUpstreamPayload(
     resolveBillingModel(billingResponseResult.value.model, fallbackModel),
     targetProviderConfig,
     buildGatewayBillingTraceSnapshot(request, reply, {
+      billingTrace: config.billing.trace,
       responseBody: responsePayload ?? upstreamPayload,
       responseStatusCode
     }),
@@ -6425,6 +6703,7 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
     billing,
     targetProviderConfig,
     buildGatewayBillingTraceSnapshot(request, reply, {
+      billingTrace: config.billing.trace,
       responseBody: upstreamPayload,
       responseStatusCode: upstreamResponse.status
     }),
@@ -7111,24 +7390,54 @@ async function applyProviderRequestPlugins(
   let upstreamRequest = baseUpstreamRequest;
 
   for (const plugin of context.plugins) {
-    if (plugin.authenticate) {
-      try {
-        const result = await plugin.authenticate({
-          request: context.request,
-          config: context.config,
-          source: context.source,
-          sourceProvider: context.sourceProvider,
-          sourceAdapterKey: context.sourceAdapterKey,
-          targetProvider: context.targetProvider,
-          targetProviderConfig: context.targetProviderConfig,
-          model: context.model,
-          passthrough: context.passthrough,
-          streaming: context.streaming,
-          forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
-          upstreamRequest,
-          standardRequest
+    const pluginInput = {
+      request: context.request,
+      config: context.config,
+      source: context.source,
+      sourceProvider: context.sourceProvider,
+      sourceAdapterKey: context.sourceAdapterKey,
+      targetProvider: context.targetProvider,
+      targetProviderConfig: context.targetProviderConfig,
+      targetProviderName: context.targetProviderConfig?.name,
+      model: context.model,
+      passthrough: context.passthrough,
+      streaming: context.streaming,
+      forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
+      upstreamRequest,
+      standardRequest
+    };
+    if (!shouldRunProviderPlugin(plugin, pluginInput)) {
+      if (plugin.authenticate) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'skipped'
         });
+      }
+      if (plugin.transformRequest) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'skipped'
+        });
+      }
+      continue;
+    }
+
+    if (plugin.authenticate) {
+      const startedAt = process.hrtime.bigint();
+      try {
+        const result = await plugin.authenticate(pluginInput);
         if (!result.ok) {
+          recordGatewayPluginHookExecution({
+            pluginKey: plugin.key,
+            kind: 'provider',
+            hook: 'authenticate',
+            outcome: 'error',
+            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+          });
           return {
             ok: false,
             stage: 'provider_auth',
@@ -7138,7 +7447,21 @@ async function applyProviderRequestPlugins(
         }
 
         upstreamRequest = result.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
       } catch (error) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'error',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
         return {
           ok: false,
           stage: 'provider_auth',
@@ -7149,23 +7472,20 @@ async function applyProviderRequestPlugins(
     }
 
     if (plugin.transformRequest) {
+      const startedAt = process.hrtime.bigint();
       try {
         const result = await plugin.transformRequest({
-          request: context.request,
-          config: context.config,
-          source: context.source,
-          sourceProvider: context.sourceProvider,
-          sourceAdapterKey: context.sourceAdapterKey,
-          targetProvider: context.targetProvider,
-          targetProviderConfig: context.targetProviderConfig,
-          model: context.model,
-          passthrough: context.passthrough,
-          streaming: context.streaming,
-          forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
-          upstreamRequest,
-          standardRequest
+          ...pluginInput,
+          upstreamRequest
         });
         if (!result.ok) {
+          recordGatewayPluginHookExecution({
+            pluginKey: plugin.key,
+            kind: 'provider',
+            hook: 'transformRequest',
+            outcome: 'error',
+            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+          });
           return {
             ok: false,
             stage: 'provider_request_transform',
@@ -7175,7 +7495,21 @@ async function applyProviderRequestPlugins(
         }
 
         upstreamRequest = result.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
       } catch (error) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'error',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
         return {
           ok: false,
           stage: 'provider_request_transform',
@@ -7206,25 +7540,45 @@ async function applyProviderResponsePlugins(
       continue;
     }
 
-    try {
-      const result = await plugin.transformResponse({
-        request: context.request,
-        config: context.config,
-        source: context.source,
-        sourceProvider: context.sourceProvider,
-        sourceAdapterKey: context.sourceAdapterKey,
-        targetProvider: context.targetProvider,
-        targetProviderConfig: context.targetProviderConfig,
-        model: context.model,
-        passthrough: context.passthrough,
-        streaming: context.streaming,
-        forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
-        upstreamRequest,
-        upstreamResponse,
-        upstreamPayload: payload,
-        standardRequest
+    const pluginInput = {
+      request: context.request,
+      config: context.config,
+      source: context.source,
+      sourceProvider: context.sourceProvider,
+      sourceAdapterKey: context.sourceAdapterKey,
+      targetProvider: context.targetProvider,
+      targetProviderConfig: context.targetProviderConfig,
+      targetProviderName: context.targetProviderConfig?.name,
+      model: context.model,
+      passthrough: context.passthrough,
+      streaming: context.streaming,
+      forceCodexOauthRefreshOnce: context.forceCodexOauthRefreshOnce,
+      upstreamRequest,
+      upstreamResponse,
+      upstreamPayload: payload,
+      standardRequest
+    };
+    if (!shouldRunProviderPlugin(plugin, pluginInput)) {
+      recordGatewayPluginHookExecution({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformResponse',
+        outcome: 'skipped'
       });
+      continue;
+    }
+
+    const startedAt = process.hrtime.bigint();
+    try {
+      const result = await plugin.transformResponse(pluginInput);
       if (!result.ok) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformResponse',
+          outcome: 'error',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
         return {
           ok: false,
           stage: 'provider_response_transform',
@@ -7234,7 +7588,21 @@ async function applyProviderResponsePlugins(
       }
 
       payload = result.value;
+      recordGatewayPluginHookExecution({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformResponse',
+        outcome: 'success',
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
     } catch (error) {
+      recordGatewayPluginHookExecution({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformResponse',
+        outcome: 'error',
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
       return {
         ok: false,
         stage: 'provider_response_transform',
@@ -7647,6 +8015,7 @@ export function buildGatewayBillingTraceSnapshot(
   request: FastifyRequest,
   reply: FastifyReply,
   options: {
+    billingTrace?: GatewayConfig['billing']['trace'];
     responseBody?: unknown;
     responseStatusCode?: number;
     standardResponse?: StandardResponse;
@@ -7658,7 +8027,7 @@ export function buildGatewayBillingTraceSnapshot(
   const responseHeaders = sanitizeHeadersForLog(
     normalizeHeaderBagForTrace(reply.getHeaders()),
   );
-  const requestBody = request.body;
+  const requestBody = resolveBillingTraceRequestBody(request, options.billingTrace?.requestBodyMode);
   const responseBody =
     options.responseBody !== undefined
       ? sanitizePayloadForLog(options.responseBody)
@@ -7690,7 +8059,7 @@ export function buildGatewayBillingTraceSnapshot(
       requestBody !== undefined || Object.keys(requestHeaders).length > 0
         ? {
             headers: requestHeaders,
-            body: requestBody
+            ...(requestBody !== undefined ? { body: requestBody } : {})
           }
         : undefined,
     response:
@@ -7707,6 +8076,25 @@ export function buildGatewayBillingTraceSnapshot(
           }
         : undefined
   };
+}
+
+function resolveBillingTraceRequestBody(
+  request: FastifyRequest,
+  mode: NonNullable<GatewayConfig['billing']['trace']>['requestBodyMode'] | undefined
+): unknown {
+  if (request.body === undefined) {
+    return undefined;
+  }
+
+  if (mode === 'full') {
+    return request.body;
+  }
+
+  if (mode === 'sanitized') {
+    return sanitizePayloadForLog(request.body);
+  }
+
+  return undefined;
 }
 
 function normalizeHeaderBagForTrace(headers: Record<string, unknown>): Record<string, string> {
@@ -8098,7 +8486,11 @@ function publishBillingEventSafe(
   trace?: GatewayBillingTrace,
   rawTraceCapture?: GatewayRawTraceCapture
 ) {
-  if (!config.billingQueue.enabled && !config.billingWebhook.enabled) {
+  if (
+    !config.billingQueue.enabled &&
+    !config.billingWebhook.enabled &&
+    !hasBillingEventPublisher()
+  ) {
     if (config.rawTrace.enabled) {
       publishRawTraceCaptureSafe(
         request,
@@ -8198,7 +8590,11 @@ function publishRequestFailureEventSafe(
   trace?: GatewayBillingTrace,
   rawTraceCapture?: GatewayRawTraceCapture
 ) {
-  if (!config.billingQueue.enabled && !config.billingWebhook.enabled) {
+  if (
+    !config.billingQueue.enabled &&
+    !config.billingWebhook.enabled &&
+    !hasBillingEventPublisher()
+  ) {
     if (config.rawTrace.enabled) {
       publishRawTraceCaptureSafe(
         request,

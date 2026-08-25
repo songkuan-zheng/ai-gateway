@@ -1,4 +1,5 @@
 import type { GatewayConfig, ProviderConfig, ProviderHealthStatus } from '../types';
+import type { GatewayRuntimePluginHealthGroup } from './runtime';
 import { providerFromProviderType } from '../utils';
 
 interface GatewayHttpMetricKey {
@@ -46,6 +47,28 @@ interface GatewayBillingDeliveryMetricValue extends GatewayBillingDeliveryMetric
   count: number;
 }
 
+interface GatewayPluginDeliveryMetricKey {
+  extensionKey: string;
+  transport: string;
+  outcome: string;
+}
+
+interface GatewayPluginDeliveryMetricValue extends GatewayPluginDeliveryMetricKey {
+  count: number;
+}
+
+interface GatewayPluginHookExecutionMetricKey {
+  pluginKey: string;
+  kind: string;
+  hook: string;
+  outcome: string;
+}
+
+interface GatewayPluginHookExecutionMetricValue extends GatewayPluginHookExecutionMetricKey {
+  count: number;
+  durationMsSum: number;
+}
+
 export interface GatewayHttpMetricInput {
   method: string;
   route?: string;
@@ -72,10 +95,30 @@ export interface GatewayBillingDeliveryMetricInput {
   transport?: string;
 }
 
+export interface GatewayPluginDeliveryMetricInput {
+  extensionKey: string;
+  transport?: string;
+  outcome: 'delivered' | 'not_delivered' | 'failed' | 'timeout' | 'queue_full';
+}
+
+export interface GatewayPluginHookExecutionMetricInput {
+  pluginKey: string;
+  kind: string;
+  hook: string;
+  outcome: 'matched' | 'skipped' | 'success' | 'error' | 'blocked' | 'dropped';
+  durationMs?: number;
+}
+
+export interface RenderGatewayMetricsOptions {
+  pluginHealth?: GatewayRuntimePluginHealthGroup[];
+}
+
 const httpMetrics = new Map<string, GatewayHttpMetricValue>();
 const toolExecutionMetrics = new Map<string, GatewayToolExecutionMetricValue>();
 const streamConversionMetrics = new Map<string, GatewayStreamConversionMetricValue>();
 const billingDeliveryMetrics = new Map<string, GatewayBillingDeliveryMetricValue>();
+const pluginDeliveryMetrics = new Map<string, GatewayPluginDeliveryMetricValue>();
+const pluginHookExecutionMetrics = new Map<string, GatewayPluginHookExecutionMetricValue>();
 const providerHealthStatuses: ProviderHealthStatus[] = ['healthy', 'degraded', 'unknown', 'down'];
 const httpDurationBucketsSeconds = [0.05, 0.1, 0.25, 0.5, 1, 3, 10, 30];
 
@@ -158,7 +201,45 @@ export function recordGatewayBillingDelivery(input: GatewayBillingDeliveryMetric
   billingDeliveryMetrics.set(metricKey, metric);
 }
 
-export function renderGatewayMetrics(config: GatewayConfig): string {
+export function recordGatewayPluginDelivery(input: GatewayPluginDeliveryMetricInput): void {
+  const key: GatewayPluginDeliveryMetricKey = {
+    extensionKey: normalizeLabel(input.extensionKey),
+    transport: normalizeLabel(input.transport || 'unknown'),
+    outcome: normalizeLabel(input.outcome)
+  };
+  const metricKey = serializePluginDeliveryMetricKey(key);
+  const metric = pluginDeliveryMetrics.get(metricKey) || {
+    ...key,
+    count: 0
+  };
+
+  metric.count += 1;
+  pluginDeliveryMetrics.set(metricKey, metric);
+}
+
+export function recordGatewayPluginHookExecution(input: GatewayPluginHookExecutionMetricInput): void {
+  const key: GatewayPluginHookExecutionMetricKey = {
+    pluginKey: normalizeLabel(input.pluginKey),
+    kind: normalizeLabel(input.kind),
+    hook: normalizeLabel(input.hook),
+    outcome: normalizeLabel(input.outcome)
+  };
+  const metricKey = serializePluginHookExecutionMetricKey(key);
+  const metric = pluginHookExecutionMetrics.get(metricKey) || {
+    ...key,
+    count: 0,
+    durationMsSum: 0
+  };
+
+  metric.count += 1;
+  metric.durationMsSum += normalizeDurationMs(input.durationMs || 0);
+  pluginHookExecutionMetrics.set(metricKey, metric);
+}
+
+export function renderGatewayMetrics(
+  config: GatewayConfig,
+  options: RenderGatewayMetricsOptions = {}
+): string {
   const lines: string[] = [];
 
   lines.push('# HELP gateway_http_requests_total Total HTTP requests handled by the gateway.');
@@ -237,8 +318,33 @@ export function renderGatewayMetrics(config: GatewayConfig): string {
     );
   }
 
+  lines.push('# HELP gateway_plugin_deliveries_total Gateway plugin delivery attempts by outcome.');
+  lines.push('# TYPE gateway_plugin_deliveries_total counter');
+  for (const metric of sortedPluginDeliveryMetrics()) {
+    lines.push(
+      `gateway_plugin_deliveries_total${formatLabels(pluginDeliveryMetricLabels(metric))} ${metric.count}`
+    );
+  }
+
+  lines.push('# HELP gateway_plugin_hook_executions_total Gateway plugin hook executions by outcome.');
+  lines.push('# TYPE gateway_plugin_hook_executions_total counter');
+  for (const metric of sortedPluginHookExecutionMetrics()) {
+    lines.push(
+      `gateway_plugin_hook_executions_total${formatLabels(pluginHookExecutionMetricLabels(metric))} ${metric.count}`
+    );
+  }
+
+  lines.push('# HELP gateway_plugin_hook_duration_ms_sum Sum of gateway plugin hook execution durations in milliseconds.');
+  lines.push('# TYPE gateway_plugin_hook_duration_ms_sum counter');
+  for (const metric of sortedPluginHookExecutionMetrics()) {
+    lines.push(
+      `gateway_plugin_hook_duration_ms_sum${formatLabels(pluginHookExecutionMetricLabels(metric))} ${formatMetricNumber(metric.durationMsSum)}`
+    );
+  }
+
   if (config.metrics.includeProviderHealth) {
     appendProviderHealthMetrics(lines, config.providers);
+    appendPluginHealthMetrics(lines, options.pluginHealth || []);
   }
 
   return `${lines.join('\n')}\n`;
@@ -249,6 +355,8 @@ export function resetGatewayMetricsForTests(): void {
   toolExecutionMetrics.clear();
   streamConversionMetrics.clear();
   billingDeliveryMetrics.clear();
+  pluginDeliveryMetrics.clear();
+  pluginHookExecutionMetrics.clear();
 }
 
 function appendProviderHealthMetrics(lines: string[], providers: ProviderConfig[]): void {
@@ -291,6 +399,33 @@ function appendProviderHealthMetrics(lines: string[], providers: ProviderConfig[
   }
 }
 
+function appendPluginHealthMetrics(lines: string[], groups: GatewayRuntimePluginHealthGroup[]): void {
+  const pluginHealthStatuses = ['healthy', 'degraded', 'unhealthy', 'unknown'];
+  lines.push('# HELP gateway_plugin_info Registered gateway plugin extension metadata.');
+  lines.push('# TYPE gateway_plugin_info gauge');
+  lines.push('# HELP gateway_plugin_health_status Current plugin extension health status, represented as one-hot status labels.');
+  lines.push('# TYPE gateway_plugin_health_status gauge');
+
+  for (const group of groups) {
+    for (const extension of group.extensions) {
+      const baseLabels = {
+        kind: group.kind,
+        extension_key: extension.key
+      };
+      const healthStatus = pluginHealthStatuses.includes(extension.status)
+        ? extension.status
+        : 'unknown';
+
+      lines.push(`gateway_plugin_info${formatLabels(baseLabels)} 1`);
+      for (const status of pluginHealthStatuses) {
+        lines.push(
+          `gateway_plugin_health_status${formatLabels({ ...baseLabels, status })} ${healthStatus === status ? 1 : 0}`
+        );
+      }
+    }
+  }
+}
+
 function sortedHttpMetrics(): GatewayHttpMetricValue[] {
   return Array.from(httpMetrics.values()).sort((left, right) => {
     const leftKey = serializeHttpMetricKey(left);
@@ -319,6 +454,22 @@ function sortedBillingDeliveryMetrics(): GatewayBillingDeliveryMetricValue[] {
   return Array.from(billingDeliveryMetrics.values()).sort((left, right) => {
     const leftKey = serializeBillingDeliveryMetricKey(left);
     const rightKey = serializeBillingDeliveryMetricKey(right);
+    return leftKey.localeCompare(rightKey);
+  });
+}
+
+function sortedPluginDeliveryMetrics(): GatewayPluginDeliveryMetricValue[] {
+  return Array.from(pluginDeliveryMetrics.values()).sort((left, right) => {
+    const leftKey = serializePluginDeliveryMetricKey(left);
+    const rightKey = serializePluginDeliveryMetricKey(right);
+    return leftKey.localeCompare(rightKey);
+  });
+}
+
+function sortedPluginHookExecutionMetrics(): GatewayPluginHookExecutionMetricValue[] {
+  return Array.from(pluginHookExecutionMetrics.values()).sort((left, right) => {
+    const leftKey = serializePluginHookExecutionMetricKey(left);
+    const rightKey = serializePluginHookExecutionMetricKey(right);
     return leftKey.localeCompare(rightKey);
   });
 }
@@ -357,6 +508,23 @@ function billingDeliveryMetricLabels(metric: GatewayBillingDeliveryMetricValue):
   };
 }
 
+function pluginDeliveryMetricLabels(metric: GatewayPluginDeliveryMetricValue): Record<string, string> {
+  return {
+    extension_key: metric.extensionKey,
+    outcome: metric.outcome,
+    transport: metric.transport
+  };
+}
+
+function pluginHookExecutionMetricLabels(metric: GatewayPluginHookExecutionMetricValue): Record<string, string> {
+  return {
+    hook: metric.hook,
+    kind: metric.kind,
+    outcome: metric.outcome,
+    plugin_key: metric.pluginKey
+  };
+}
+
 function serializeHttpMetricKey(key: GatewayHttpMetricKey): string {
   return `${key.method}\n${key.route}\n${key.statusCode}\n${key.statusClass}`;
 }
@@ -371,6 +539,14 @@ function serializeStreamConversionMetricKey(key: GatewayStreamConversionMetricKe
 
 function serializeBillingDeliveryMetricKey(key: GatewayBillingDeliveryMetricKey): string {
   return `${key.outcome}\n${key.transport}`;
+}
+
+function serializePluginDeliveryMetricKey(key: GatewayPluginDeliveryMetricKey): string {
+  return `${key.extensionKey}\n${key.transport}\n${key.outcome}`;
+}
+
+function serializePluginHookExecutionMetricKey(key: GatewayPluginHookExecutionMetricKey): string {
+  return `${key.pluginKey}\n${key.kind}\n${key.hook}\n${key.outcome}`;
 }
 
 function normalizeMethod(value: string): string {

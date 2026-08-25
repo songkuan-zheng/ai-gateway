@@ -35,6 +35,12 @@ export interface BillingRate {
   tiers?: BillingTierSet;
 }
 
+export type BillingTraceRequestBodyMode = 'disabled' | 'sanitized' | 'full';
+
+export interface BillingTraceConfig {
+  requestBodyMode: BillingTraceRequestBodyMode;
+}
+
 export interface ModelScopedHeadersConfig {
   default: Record<string, string>;
   byModel: Record<string, Record<string, string>>;
@@ -121,6 +127,14 @@ export interface ProviderConfig {
   credentialSourceProviderName?: string;
 }
 
+export interface GatewayPluginRouteContext {
+  method: string;
+  url: string;
+  route?: string;
+  sourceAdapterKey?: string;
+  sourceRoute?: string;
+}
+
 export interface ProviderExternalSourceConfig {
   enabled: boolean;
   transport: GatewayExternalEventSinkTransport;
@@ -180,6 +194,7 @@ export interface BillingConfig {
   enabled: boolean;
   currency: 'USD';
   rates: Record<Provider, BillingRate>;
+  trace?: BillingTraceConfig;
 }
 
 export interface BillingQueueConfig {
@@ -337,6 +352,16 @@ export interface GatewayRequestIdentity {
   organizationId?: string;
   plan?: string;
   apiKeyId?: string;
+}
+
+export interface GatewayPluginManifest {
+  name: string;
+  version?: string;
+  description?: string;
+  gatewayVersion?: string;
+  capabilities?: string[];
+  configSchema?: Record<string, unknown>;
+  files?: string[];
 }
 
 export type GatewayPrecheckSubject =
@@ -1077,9 +1102,18 @@ export interface SourceAdapterResponseInput {
   config: GatewayConfig;
 }
 
+export type SourceAdapterRouteMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+
+export interface SourceAdapterRoute {
+  method?: SourceAdapterRouteMethod;
+  path: string;
+  metadata?: Record<string, string>;
+}
+
 export interface SourceAdapter {
   key: string;
   provider: Provider;
+  routes?: SourceAdapterRoute[];
   toStandardRequest(input: SourceAdapterRequestInput): Result<StandardRequest>;
   fromStandardResponse(input: SourceAdapterResponseInput): unknown;
   isStreamingRequest(input: SourceAdapterRequestInput): boolean;
@@ -1130,6 +1164,18 @@ export interface ProviderPluginValueRef {
 
 export type ProviderPluginValue = unknown;
 
+export interface ProviderPluginConditionConfig {
+  from?: string;
+  exists?: boolean;
+  equals?: ProviderPluginValue;
+  notEquals?: ProviderPluginValue;
+  includes?: ProviderPluginValue;
+  matches?: string;
+  all?: ProviderPluginConditionConfig[];
+  any?: ProviderPluginConditionConfig[];
+  not?: ProviderPluginConditionConfig;
+}
+
 export interface ProviderPluginMutationConfig {
   strict: boolean;
   headers: Record<string, ProviderPluginValue>;
@@ -1174,6 +1220,10 @@ export interface ProviderPluginConfig {
   enabled: boolean;
   provider?: Provider;
   providerName?: string;
+  models?: string[];
+  sourceAdapters?: string[];
+  sourceRoutes?: string[];
+  when?: ProviderPluginConditionConfig;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
   auth?: ProviderPluginMutationConfig;
@@ -1184,6 +1234,9 @@ export interface ProviderPluginConfig {
 export interface GatewayPluginMatchConfig {
   provider?: Provider;
   providerName?: string;
+  models?: string[];
+  sourceAdapters?: string[];
+  sourceRoutes?: string[];
 }
 
 export interface GatewayPluginProviderHookConfig {
@@ -1191,6 +1244,10 @@ export interface GatewayPluginProviderHookConfig {
   enabled: boolean;
   provider?: Provider;
   providerName?: string;
+  models?: string[];
+  sourceAdapters?: string[];
+  sourceRoutes?: string[];
+  when?: ProviderPluginConditionConfig;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
   auth?: ProviderPluginMutationConfig;
@@ -1202,7 +1259,10 @@ export interface GatewayPluginConfig {
   key: string;
   enabled: boolean;
   modulePath?: string;
+  manifest?: GatewayPluginManifest;
+  watchFiles?: string[];
   match?: GatewayPluginMatchConfig;
+  config?: Record<string, unknown>;
   providerHooks: GatewayPluginProviderHookConfig[];
 }
 
@@ -1222,9 +1282,91 @@ export interface ProviderPlugin {
   key: string;
   provider?: Provider;
   providerName?: string;
+  models?: string[];
+  sourceAdapters?: string[];
+  sourceRoutes?: string[];
+  when?: ProviderPluginConditionConfig;
   authenticate?(input: ProviderPluginRequestInput): Result<UpstreamRequest> | Promise<Result<UpstreamRequest>>;
   transformRequest?(input: ProviderPluginRequestInput): Result<UpstreamRequest> | Promise<Result<UpstreamRequest>>;
   transformResponse?(input: ProviderPluginResponseInput): Result<unknown> | Promise<Result<unknown>>;
+}
+
+export interface GatewayPluginHookFailure {
+  ok: false;
+  status?: number;
+  error: string;
+  details?: unknown;
+}
+
+export type GatewayPluginHookResult<T = void> =
+  | { ok: true; value?: T }
+  | GatewayPluginHookFailure;
+
+export interface GatewayPluginMatchable {
+  provider?: Provider;
+  providerName?: string;
+  models?: string[];
+  sourceAdapters?: string[];
+  sourceRoutes?: string[];
+}
+
+export interface GatewayPluginRequestHookInput {
+  request: FastifyRequest;
+  config: GatewayConfig;
+  route: GatewayPluginRouteContext;
+  source?: GatewaySourceContext;
+  sourceProvider?: Provider;
+  sourceAdapterKey?: string;
+  targetProvider?: Provider;
+  targetProviderConfig?: ProviderConfig;
+  model?: string;
+  requestBody?: unknown;
+  standardRequest?: StandardRequest;
+}
+
+export interface GatewayPluginPrecheckDecision {
+  allow: false;
+  statusCode?: number;
+  code?: string;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface GatewayPluginRequestHook extends GatewayPluginMatchable {
+  key: string;
+  beforeAuth?(input: GatewayPluginRequestHookInput): GatewayPluginHookResult | Promise<GatewayPluginHookResult>;
+  beforeRouting?(input: GatewayPluginRequestHookInput): GatewayPluginHookResult | Promise<GatewayPluginHookResult>;
+  beforePrecheck?(
+    input: GatewayPluginRequestHookInput
+  ): GatewayPluginHookResult<GatewayPluginPrecheckDecision | void> | Promise<GatewayPluginHookResult<GatewayPluginPrecheckDecision | void>>;
+  afterPrecheck?(
+    input: GatewayPluginRequestHookInput & { result: unknown }
+  ): GatewayPluginHookResult | Promise<GatewayPluginHookResult>;
+}
+
+export interface GatewayPluginStreamHookInput extends ProviderPluginContext {
+  upstreamRequest: UpstreamRequest;
+  upstreamResponse: Response;
+  standardRequest?: StandardRequest;
+}
+
+export interface GatewayPluginStreamHook extends GatewayPluginMatchable {
+  key: string;
+  transformResponse?(
+    input: GatewayPluginStreamHookInput
+  ): GatewayPluginHookResult<Response> | Response | Promise<GatewayPluginHookResult<Response> | Response>;
+}
+
+export interface GatewayPluginEventHookInput<TEvent = unknown> {
+  event: TEvent;
+  config?: GatewayConfig;
+}
+
+export interface GatewayPluginEventHook<TEvent = unknown> {
+  key: string;
+  transform?(
+    input: GatewayPluginEventHookInput<TEvent>
+  ): GatewayPluginHookResult<TEvent | false | void> | TEvent | false | void | Promise<GatewayPluginHookResult<TEvent | false | void> | TEvent | false | void>;
 }
 
 export type Result<T> =

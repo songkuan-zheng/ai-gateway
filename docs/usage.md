@@ -245,7 +245,7 @@ docker compose up --build
 - 示例文件见 `gateway.config.example.json`
 - 推荐使用 `Providers` 数组配置供应商（数组顺序即默认 fallback 顺序）
 - `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`openaiChatStreamUsage`、`openaiChatReasoningSplit`、`openaiChatThinkingOptions`、`extraHeaders`、`extraBody`、`billing`
-- `plugins` 是统一插件入口；可声明 `providerHooks`，也可通过 `modulePath` 加载本地模块插件注册 `targetAdapters` / `sourceAdapters` / `providerHooks`，详见 [Gateway Plugins](plugins.md)
+- `plugins` 是统一插件入口；可声明 `providerHooks`，也可通过 `modulePath` 加载本地模块插件注册 `targetAdapters` / `sourceAdapters` / `providerHooks` / `billingPublishers` / `billingOutboxes` / `eventPublishers` / `eventOutboxes`，并可通过 `plugins[].config` 给模块插件透传私有配置；`sourceAdapters[].routes` 会由 gateway 动态分发，详见 [Gateway Plugins](plugins.md)
 - `providerPlugins` 仍兼容旧配置；新配置建议迁移到 `plugins[].providerHooks`
 - `type` 同时用于声明 provider 类别和上游协议，支持：
   - OpenAI：`openai`（等价 `openai_responses`）、`openai_responses`、`openai_chat_completions`、`openai_image_generations`、`openai_video_generations`
@@ -269,7 +269,7 @@ docker compose up --build
 - `configExternal` 用于从外部服务动态获取完整 gateway 配置（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`method`、`timeoutMs`、`intervalMs|intervalSeconds`、`apiKeyHeader`、`apiKey|apiKeyEnv`、`headers`）；外部返回体可为完整配置对象、`{"config": {...}}` 或 `{"gatewayConfig": {...}}`。gRPC 使用 JSON unary，默认 path 为 `/gateway.config.v1.ConfigService/GetConfig`。
 - `trustedProxyCidrs` 用于配置可信反向代理来源网段；`trustedProxyHeader` 用于选择唯一可信的客户端 IP 转发头（`forwarded|x-forwarded-for|x-real-ip|x-client-ip`，默认 `x-forwarded-for`）。billing webhook 事件的 `clientIp` 仅在直连来源为 loopback 或命中可信网段时解析该头，并从右向左剔除可信代理；其他转发头会被忽略。
 - `billingWebhook` 用于配置事件上报（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`timeoutMs`、`maxAttempts`、`baseDelayMs`、`maxDelayMs`、`requireAck`、`headers`）；gRPC 使用 JSON unary，默认 path 为 `/gateway.events.v1.EventSink/Publish`。
-- `billingQueue` 为历史兼容字段；gateway 不会创建队列连接，开启后也只记录禁用日志。需要队列时请通过 `billingWebhook` 或外部协议适配服务实现。
+- `billingQueue` 为历史兼容字段；gateway 不会创建队列连接，开启后也只记录禁用日志。需要 Kafka、Pulsar、NATS、Postgres outbox 等队列能力时，请通过模块插件注册 `billingPublishers` 或 `billingOutboxes`，也可继续使用 `billingWebhook` 对接外部协议适配服务。
 - `rawTrace` 用于捕获原始请求/上游链路包；gateway 只写本地 spool bundle，`rawTrace.sync` 通过 HTTP/WebSocket/gRPC/stdio 上报 manifest，支持失败重试，由外部服务负责持久化、索引和归档。
 - `auth` 用于配置客户侧鉴权（`enabled`、`mode`、`required`、`trustedCidrs`、`identityHeaders`、`signature`、`introspection`、`staticApiKeys`）。`http_introspection` 响应中的 API Key `restrictions` 支持 `ipWhitelist|allowedIps`、`allowedOrigins|allowedDomains`、`allowedModels|modelWhitelist`、`rateLimit|requestsPerMinute`、`rateLimitWindowSeconds`，gateway 会在请求前拒绝不匹配的 IP、来源、请求/路由模型，并按 API Key 执行请求数限流。
 - `precheck` 用于请求前治理（`rateLimit`、`quota`、`budget`、`estimation`）。`precheck.storage.type` 支持 `memory` 与 `redis`；生产多实例要使用 `redis` 才能让单用户/单 Key/单 IP 的限流、配额和预算在实例间共享计数。Redis 后端通过 Lua 原子检查并预留计数，Redis 不可用时请求会 fail-closed 返回 `precheck_store_unavailable`。
@@ -290,7 +290,7 @@ docker compose up --build
 - `agent.runtime` 用于配置运行时健壮性（`sessionLockTimeoutMs`、`eventWorkerConcurrency`、`llmRetry`、`toolRetry`）
 - `agent.external` 可配置通过 HTTP/WebSocket/gRPC/stdio 从外部服务加载 agent/session，并将 session 变更同步回外部服务。
 - `agent.eventWebhook` 用于通过 HTTP、WebSocket、gRPC 或 stdio transport 上报 Agent 事件（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`timeoutMs`、`maxAttempts`、`baseDelayMs`、`maxDelayMs`、`requireAck`、`headers`）
-- `agent.eventQueue` 为历史兼容字段；gateway 不会创建队列连接。Agent 事件需要上报时优先使用 `agent.eventWebhook`。
+- `agent.eventQueue` 为历史兼容字段；gateway 不会创建队列连接。Agent 事件需要上报时可使用 `agent.eventWebhook`，或通过模块插件注册 `eventPublishers` / `eventOutboxes`。
 - `mcpGateway` 用于配置 MCP 网关访问控制（`enabled`、`endpoint`、`websocket`、`principals`、`serverExposure`、`guardrails`、`oauth`）
 - 配置优先级：请求头 > 环境变量 > JSON 配置文件 > 内置默认值
 

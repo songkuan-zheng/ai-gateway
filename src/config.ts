@@ -12,6 +12,7 @@ import type {
   AgentMcpServerConfig,
   AgentMcpServerTransport,
   BillingRate,
+  BillingTraceRequestBodyMode,
   BillingTier,
   BillingQueueConfig,
   BillingWebhookConfig,
@@ -42,6 +43,7 @@ import type {
   GatewayTransparentToolUnknownPolicy,
   GatewayTrustedProxyHeader,
   GatewayPluginConfig,
+  GatewayPluginManifest,
   GatewayPluginProviderHookConfig,
   GatewayUpstreamCircuitBreakerConfig,
   GatewayUpstreamConcurrencyConfig,
@@ -58,6 +60,7 @@ import type {
   ModelScopedHeadersConfig,
   Provider,
   ProviderPluginConfig,
+  ProviderPluginConditionConfig,
   ProviderPluginCodexOAuthConfig,
   ProviderPluginDeepSeekThinkingConfig,
   ProviderPluginMutationConfig,
@@ -131,6 +134,12 @@ interface BillingRateJsonConfig {
 interface BillingTierJsonConfig {
   upToTokens?: unknown;
   perMillionUsd?: unknown;
+}
+
+interface BillingTraceJsonConfig {
+  requestBodyMode?: unknown;
+  requestBody?: unknown;
+  includeRequestBody?: unknown;
 }
 
 interface ProviderJsonConfig {
@@ -607,6 +616,9 @@ interface GatewayJsonConfig {
   scheduling?: unknown;
   billing?: {
     enabled?: unknown;
+    trace?: unknown;
+    traceRequestBodyMode?: unknown;
+    includeTraceRequestBody?: unknown;
     rates?: {
       openai?: unknown;
       anthropic?: unknown;
@@ -779,6 +791,13 @@ interface ProviderPluginJsonConfig {
   enabled?: unknown;
   provider?: unknown;
   providerName?: unknown;
+  models?: unknown;
+  model?: unknown;
+  sourceAdapters?: unknown;
+  sourceAdapter?: unknown;
+  sourceRoutes?: unknown;
+  sourceRoute?: unknown;
+  when?: unknown;
   codexOauth?: unknown;
   deepseekThinking?: unknown;
   deepSeekThinking?: unknown;
@@ -790,6 +809,12 @@ interface ProviderPluginJsonConfig {
 interface GatewayPluginMatchJsonConfig {
   provider?: unknown;
   providerName?: unknown;
+  models?: unknown;
+  model?: unknown;
+  sourceAdapters?: unknown;
+  sourceAdapter?: unknown;
+  sourceRoutes?: unknown;
+  sourceRoute?: unknown;
 }
 
 interface GatewayPluginJsonConfig {
@@ -797,7 +822,13 @@ interface GatewayPluginJsonConfig {
   enabled?: unknown;
   modulePath?: unknown;
   path?: unknown;
+  manifest?: unknown;
+  watchFiles?: unknown;
+  files?: unknown;
   match?: unknown;
+  config?: unknown;
+  settings?: unknown;
+  options?: unknown;
   providerHooks?: unknown;
   providerHook?: unknown;
   hooks?: unknown;
@@ -1070,6 +1101,7 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
     billing: {
       enabled: resolveBoolean(process.env.BILLING_ENABLED, jsonConfig.billing?.enabled, true),
       currency: 'USD',
+      trace: parseBillingTraceConfig(jsonConfig.billing),
       rates: {
         openai: {
           inputPerMillionUsd: resolveNonNegativeNumber(
@@ -2535,6 +2567,72 @@ function parseGatewayAuthStaticApiKeysConfig(
   };
 }
 
+function parseBillingTraceConfig(value: unknown): NonNullable<GatewayConfig['billing']['trace']> {
+  const billing = isPlainObject(value)
+    ? (value as {
+        trace?: unknown;
+        traceRequestBodyMode?: unknown;
+        includeTraceRequestBody?: unknown;
+      })
+    : undefined;
+  const trace = isPlainObject(billing?.trace)
+    ? (billing.trace as BillingTraceJsonConfig)
+    : undefined;
+  const requestBodyMode = parseBillingTraceRequestBodyMode(
+    readString(process.env.BILLING_TRACE_REQUEST_BODY_MODE) ||
+      readString(process.env.BILLING_TRACE_REQUEST_BODY) ||
+      readString(trace?.requestBodyMode) ||
+      readString(trace?.requestBody) ||
+      readString(billing?.traceRequestBodyMode),
+    undefined
+  );
+  if (requestBodyMode) {
+    return {
+      requestBodyMode
+    };
+  }
+
+  const includeRequestBody =
+    readBoolean(process.env.BILLING_TRACE_INCLUDE_REQUEST_BODY) ??
+    readBoolean(trace?.includeRequestBody) ??
+    readBoolean(billing?.includeTraceRequestBody);
+
+  return {
+    requestBodyMode: includeRequestBody ? 'full' : 'disabled'
+  };
+}
+
+function parseBillingTraceRequestBodyMode(
+  value: string | undefined,
+  fallback: BillingTraceRequestBodyMode | undefined
+): BillingTraceRequestBodyMode | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === 'disabled' ||
+    normalized === 'none' ||
+    normalized === 'omit' ||
+    normalized === 'omitted' ||
+    normalized === 'false' ||
+    normalized === 'off'
+  ) {
+    return 'disabled';
+  }
+
+  if (
+    normalized === 'sanitized' ||
+    normalized === 'redacted' ||
+    normalized === 'body_redacted'
+  ) {
+    return 'sanitized';
+  }
+
+  if (normalized === 'full' || normalized === 'body_full' || normalized === 'true' || normalized === 'on') {
+    return 'full';
+  }
+
+  return fallback;
+}
+
 function parseBillingQueueConfig(value: unknown): BillingQueueConfig {
   const raw = isPlainObject(value) ? (value as BillingQueueJsonConfig) : undefined;
   return {
@@ -3813,12 +3911,159 @@ function parseGatewayPluginsConfig(value: unknown): GatewayPluginConfig[] {
       key,
       enabled: true,
       modulePath,
+      manifest: parseGatewayPluginManifest(raw.manifest),
+      watchFiles: parseGatewayPluginWatchFiles(raw.watchFiles ?? raw.files),
       match,
+      config: parseGatewayPluginPrivateConfig(raw),
       providerHooks
     });
   }
 
   return parsed;
+}
+
+function parseGatewayPluginPrivateConfig(raw: GatewayPluginJsonConfig): Record<string, unknown> | undefined {
+  const config: Record<string, unknown> = {};
+  const explicitConfig = isPlainObject(raw.config)
+    ? raw.config
+    : isPlainObject(raw.settings)
+      ? raw.settings
+      : isPlainObject(raw.options)
+        ? raw.options
+        : undefined;
+
+  if (explicitConfig) {
+    Object.assign(config, explicitConfig as Record<string, unknown>);
+  }
+
+  const reservedKeys = new Set([
+    'key',
+    'enabled',
+    'modulePath',
+    'path',
+    'manifest',
+    'watchFiles',
+    'files',
+    'match',
+    'config',
+    'settings',
+    'options',
+    'providerHooks',
+    'providerHook',
+    'hooks'
+  ]);
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!reservedKeys.has(key)) {
+      config[key] = value;
+    }
+  }
+
+  return Object.keys(config).length > 0 ? config : undefined;
+}
+
+function parseGatewayPluginManifest(value: unknown): GatewayPluginManifest | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const name = readString(value.name);
+  if (!name) {
+    return undefined;
+  }
+
+  const manifest: GatewayPluginManifest = {
+    name,
+    version: readString(value.version),
+    description: readString(value.description),
+    gatewayVersion: readString(value.gatewayVersion ?? value.gateway_version),
+    capabilities: parseModelList(value.capabilities),
+    configSchema: readRecord(value.configSchema ?? value.config_schema),
+    files: parseModelList(value.files)
+  };
+
+  return pruneGatewayPluginManifest(manifest);
+}
+
+function pruneGatewayPluginManifest(manifest: GatewayPluginManifest): GatewayPluginManifest {
+  return {
+    name: manifest.name,
+    ...(manifest.version ? { version: manifest.version } : {}),
+    ...(manifest.description ? { description: manifest.description } : {}),
+    ...(manifest.gatewayVersion ? { gatewayVersion: manifest.gatewayVersion } : {}),
+    ...(manifest.capabilities && manifest.capabilities.length > 0
+      ? { capabilities: manifest.capabilities }
+      : {}),
+    ...(manifest.configSchema ? { configSchema: manifest.configSchema } : {}),
+    ...(manifest.files && manifest.files.length > 0 ? { files: manifest.files } : {})
+  };
+}
+
+function parseGatewayPluginWatchFiles(value: unknown): string[] | undefined {
+  const files = parseModelList(value);
+  return files.length > 0 ? files : undefined;
+}
+
+function parseProviderPluginCondition(value: unknown): ProviderPluginConditionConfig | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const condition: ProviderPluginConditionConfig = {};
+  const from = readString(value.from);
+  if (from) {
+    condition.from = from;
+  }
+
+  const exists = readBoolean(value.exists);
+  if (exists !== undefined) {
+    condition.exists = exists;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, 'equals')) {
+    condition.equals = cloneUnknown(value.equals);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'notEquals')) {
+    condition.notEquals = cloneUnknown(value.notEquals);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'not_equals')) {
+    condition.notEquals = cloneUnknown(value.not_equals);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'includes')) {
+    condition.includes = cloneUnknown(value.includes);
+  }
+
+  const matches = readString(value.matches);
+  if (matches) {
+    condition.matches = matches;
+  }
+
+  const all = parseProviderPluginConditionList(value.all);
+  if (all.length > 0) {
+    condition.all = all;
+  }
+
+  const any = parseProviderPluginConditionList(value.any);
+  if (any.length > 0) {
+    condition.any = any;
+  }
+
+  const not = parseProviderPluginCondition(value.not);
+  if (not) {
+    condition.not = not;
+  }
+
+  return Object.keys(condition).length > 0 ? condition : undefined;
+}
+
+function parseProviderPluginConditionList(value: unknown): ProviderPluginConditionConfig[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    const condition = parseProviderPluginCondition(entry);
+    return condition ? [condition] : [];
+  });
 }
 
 function parseProviderPluginEntry(
@@ -3828,6 +4073,9 @@ function parseProviderPluginEntry(
     keyPrefix?: string;
     provider?: Provider;
     providerName?: string;
+    models?: string[];
+    sourceAdapters?: string[];
+    sourceRoutes?: string[];
   }
 ): ProviderPluginConfig | undefined {
   if (!isPlainObject(entry)) {
@@ -3858,6 +4106,10 @@ function parseProviderPluginEntry(
 
   const provider = parseProvider(readString(item.provider)) || defaults?.provider;
   const providerName = readString(item.providerName) || defaults?.providerName;
+  const models = parseModelList(item.models ?? item.model);
+  const sourceAdapters = parseModelList(item.sourceAdapters ?? item.sourceAdapter);
+  const sourceRoutes = parseModelList(item.sourceRoutes ?? item.sourceRoute);
+  const when = parseProviderPluginCondition(item.when);
   const key = uniqueProviderName(keyBase, usedKeys);
 
   return {
@@ -3865,6 +4117,10 @@ function parseProviderPluginEntry(
     enabled: true,
     provider,
     providerName,
+    models: models.length > 0 ? models : defaults?.models,
+    sourceAdapters: sourceAdapters.length > 0 ? sourceAdapters : defaults?.sourceAdapters,
+    sourceRoutes: sourceRoutes.length > 0 ? sourceRoutes : defaults?.sourceRoutes,
+    when,
     codexOauth,
     deepseekThinking,
     auth,
@@ -3881,13 +4137,19 @@ function parseGatewayPluginMatch(value: unknown): GatewayPluginConfig['match'] |
   const raw = value as GatewayPluginMatchJsonConfig;
   const provider = parseProvider(readString(raw.provider));
   const providerName = readString(raw.providerName);
-  if (!provider && !providerName) {
+  const models = parseModelList(raw.models ?? raw.model);
+  const sourceAdapters = parseModelList(raw.sourceAdapters ?? raw.sourceAdapter);
+  const sourceRoutes = parseModelList(raw.sourceRoutes ?? raw.sourceRoute);
+  if (!provider && !providerName && models.length === 0 && sourceAdapters.length === 0 && sourceRoutes.length === 0) {
     return undefined;
   }
 
   return {
     provider,
-    providerName
+    providerName,
+    models: models.length > 0 ? models : undefined,
+    sourceAdapters: sourceAdapters.length > 0 ? sourceAdapters : undefined,
+    sourceRoutes: sourceRoutes.length > 0 ? sourceRoutes : undefined
   };
 }
 
@@ -3908,7 +4170,10 @@ function parseGatewayPluginProviderHooks(
     const hook = parseProviderPluginEntry(rawHook, usedKeys, {
       keyPrefix: pluginKey,
       provider: match?.provider,
-      providerName: match?.providerName
+      providerName: match?.providerName,
+      models: match?.models,
+      sourceAdapters: match?.sourceAdapters,
+      sourceRoutes: match?.sourceRoutes
     });
     if (!hook) {
       continue;

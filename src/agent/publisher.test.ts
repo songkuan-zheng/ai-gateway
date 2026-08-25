@@ -2,12 +2,14 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { GatewayPluginEventPublisher, GatewayPluginOutbox } from '../plugins/events';
 import type { AgentEventQueueConfig, AgentEventWebhookConfig } from '../types';
 import type { AgentEvent } from './types';
 import {
   closeAgentEventPublisher,
   initializeAgentEventPublisher,
-  publishAgentEventToQueue
+  publishAgentEventToQueue,
+  type AgentQueueEvent
 } from './publisher';
 
 describe('agent event queue publisher', () => {
@@ -105,6 +107,60 @@ describe('agent event queue publisher', () => {
     await expect(publishAgentEventToQueue(buildEvent())).rejects.toThrow(
       'HTTP event sink request failed with status 502: bad gateway'
     );
+  });
+
+  it('publishes agent events through plugin outboxes and publishers', async () => {
+    const outboxEvents: AgentQueueEvent[] = [];
+    const publisherEvents: AgentQueueEvent[] = [];
+    const outboxClose = vi.fn();
+    const publisherClose = vi.fn();
+    const outbox: GatewayPluginOutbox<AgentQueueEvent> = {
+      key: 'agent-event-outbox',
+      transport: 'kafka',
+      append: vi.fn(async (event) => {
+        outboxEvents.push(event);
+        return true;
+      }),
+      close: outboxClose
+    };
+    const publisher: GatewayPluginEventPublisher<AgentQueueEvent> = {
+      key: 'agent-event-publisher',
+      transport: 'kafka-live',
+      publish: vi.fn(async (event) => {
+        publisherEvents.push(event);
+        return true;
+      }),
+      close: publisherClose
+    };
+    await initializeAgentEventPublisher(
+      buildQueueConfig(false),
+      buildWebhookConfig(false),
+      undefined,
+      {
+        publishers: [publisher],
+        outboxes: [outbox]
+      }
+    );
+
+    const delivered = await publishAgentEventToQueue(buildEvent());
+
+    expect(delivered).toBe(true);
+    expect(outbox.append).toHaveBeenCalledTimes(1);
+    expect(publisher.publish).toHaveBeenCalledTimes(1);
+    expect(outboxEvents[0]).toMatchObject({
+      eventId: 'event-1',
+      eventType: 'USER_INPUT',
+      sessionId: 'session-1'
+    });
+    expect(publisherEvents[0]).toMatchObject({
+      eventId: 'event-1',
+      eventType: 'USER_INPUT',
+      sessionId: 'session-1'
+    });
+
+    await closeAgentEventPublisher();
+    expect(outboxClose).toHaveBeenCalledTimes(1);
+    expect(publisherClose).toHaveBeenCalledTimes(1);
   });
 });
 
