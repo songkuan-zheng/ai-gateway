@@ -9,7 +9,12 @@ import {
   publishAgentEventToExternalSink,
   registerAgentRoutes
 } from './agent';
-import { closeBillingPublisher, initializeBillingPublisher } from './billing';
+import {
+  closeBillingPublisher,
+  drainBillingPublisher,
+  initializeBillingPublisher,
+  validateBillingPublisherRequirements
+} from './billing';
 import { config } from './config';
 import {
   refreshGatewayConfigFromExternalSource,
@@ -17,7 +22,10 @@ import {
   type GatewayExternalConfigPoller
 } from './external-config';
 import { buildCorsResponseHeaders } from './gateway/cors';
-import { registerGatewayIdempotencyHooks } from './gateway/idempotency';
+import {
+  closeGatewayIdempotencyStore,
+  registerGatewayIdempotencyHooks
+} from './gateway/idempotency';
 import { registerLenientJsonParser } from './gateway/lenient-json-parser';
 import { recordGatewayHttpRequest, renderGatewayMetrics } from './gateway/metrics';
 import { registerGatewayRoutes } from './gateway/routes';
@@ -28,6 +36,11 @@ import {
 } from './gateway/runtime';
 import { registerGatewayResponsesWebSocketRoute } from './gateway/websocket';
 import { closeGatewayPrecheckStore } from './gateway/precheck';
+import { closeProviderConcurrencyStore } from './gateway/upstream-concurrency';
+import { closeProviderCircuitBreakerStore } from './gateway/upstream-circuit-breaker';
+import { closeProviderHealthStore } from './gateway/provider-health';
+import { closeGatewaySchedulingStore } from './gateway/scheduler';
+import { buildGatewayReadinessSnapshot } from './gateway/readiness';
 import {
   closeProviderHealthScheduler,
   initializeProviderHealthScheduler
@@ -42,6 +55,10 @@ import {
   registerMcpGatewayWebSocketRoute
 } from './mcp-gateway';
 import { syncGatewayPluginModulesFromConfig } from './plugins/loader';
+import {
+  closeGatewayPluginExtensions,
+  configureGatewayPluginDeliveryStateStores
+} from './plugins/events';
 import { closeRawTraceManager, initializeRawTraceManager } from './raw-trace';
 import type { AgentQueueEvent } from './agent';
 import type { BillingQueueEvent } from './billing';
@@ -176,19 +193,37 @@ fastify.addHook('onClose', async () => {
   gatewayExternalConfigPoller = undefined;
   closeProviderHealthScheduler();
   await closeGatewayPrecheckStore();
+  await closeGatewayIdempotencyStore();
+  await closeProviderConcurrencyStore();
+  await closeProviderCircuitBreakerStore();
+  await closeProviderHealthStore();
+  await closeGatewaySchedulingStore();
   await closeCodexOauthStateStore();
+  configureGatewayPluginDeliveryStateStores([]);
+  await closeGatewayPluginExtensions(runtime.deliveryStateStores.list());
   await mcpGatewayRuntime.close();
   await agentRuntime.close();
 });
 
 fastify.get('/health', async () => {
-  const pluginHealth = await collectGatewayRuntimePluginHealth(runtime);
   return {
     runtimeId: process.env.CCR_GATEWAY_RUNTIME_ID,
     status: 'ok',
-    plugins: summarizeGatewayRuntimePluginHealth(pluginHealth),
     timestamp: new Date().toISOString()
   };
+});
+
+fastify.get('/ready', async (_request, reply) => {
+  const pluginHealth = await collectGatewayRuntimePluginHealth(runtime);
+  const readiness = await buildGatewayReadinessSnapshot(
+    config,
+    summarizeGatewayRuntimePluginHealth(pluginHealth)
+  );
+  return reply.code(readiness.ready ? 200 : 503).send({
+    runtimeId: process.env.CCR_GATEWAY_RUNTIME_ID,
+    ...readiness,
+    timestamp: new Date().toISOString()
+  });
 });
 
 fastify.get('/metrics', async (_request, reply) => {
@@ -236,6 +271,8 @@ fastify.get('/', async () => {
     name: 'next-ai-gateway',
     standard_model: 'openai_responses',
     endpoints: [
+      'GET /health',
+      'GET /ready',
       'POST /v1/responses',
       'WS /v1/responses',
       'GET /v1/models',
@@ -309,7 +346,6 @@ const start = async () => {
     await refreshGatewayConfigFromExternalSource({
       config,
       logger: fastify.log,
-      onConfigReload: applyStaticRuntimeConfig,
       reason: 'external_config_startup'
     });
     await hydrateProvidersFromExternalSource(config, fastify.log);
@@ -321,8 +357,15 @@ const start = async () => {
         publishers: runtime.billingPublishers.list(),
         outboxes: runtime.billingOutboxes.list(),
         eventHooks: listBillingEventHooks()
-      });
+      }, config.billing.delivery);
+      validateBillingPublisherRequirements(config.billing);
     } catch (error) {
+      if (
+        config.billing.enabled &&
+        (config.billing.delivery.requirePublisher || config.billing.delivery.requireOutbox)
+      ) {
+        throw error;
+      }
       fastify.log.warn(
         {
           details: error instanceof Error ? error.message : String(error)
@@ -377,12 +420,22 @@ const start = async () => {
 start();
 
 async function reloadRuntimeFromConfig(nextConfig: GatewayConfig): Promise<void> {
+  await drainBillingPublisher();
   await applyStaticRuntimeConfig(nextConfig);
+  validateBillingPublisherRequirements(
+    nextConfig.billing,
+    {
+      publishers: runtime.billingPublishers.list(),
+      outboxes: runtime.billingOutboxes.list(),
+      eventHooks: listBillingEventHooks()
+    },
+    nextConfig.billingWebhook
+  );
   await initializeBillingPublisher(nextConfig.billingQueue, nextConfig.billingWebhook, fastify.log, {
     publishers: runtime.billingPublishers.list(),
     outboxes: runtime.billingOutboxes.list(),
     eventHooks: listBillingEventHooks()
-  });
+  }, nextConfig.billing.delivery);
   await initializeAgentEventPublisher(nextConfig.agent.eventQueue, nextConfig.agent.eventWebhook, fastify.log, {
     publishers: runtime.agentEventPublishers.list(),
     outboxes: runtime.agentEventOutboxes.list(),
@@ -400,8 +453,19 @@ function listAgentEventHooks(): GatewayPluginEventHook<AgentQueueEvent>[] {
 }
 
 async function applyStaticRuntimeConfig(nextConfig: GatewayConfig): Promise<void> {
+  await syncGatewayPluginModulesFromConfig(runtime, nextConfig, fastify.log, {
+    beforeSwap: ({ billingPublishers, billingOutboxes }) => {
+      validateBillingPublisherRequirements(
+        nextConfig.billing,
+        {
+          publishers: billingPublishers,
+          outboxes: billingOutboxes
+        },
+        nextConfig.billingWebhook
+      );
+    }
+  });
   syncProviderPluginsFromConfig(runtime.providerPlugins, nextConfig);
-  await syncGatewayPluginModulesFromConfig(runtime, nextConfig, fastify.log);
   initializeProviderHealthScheduler(nextConfig, fastify.log);
 }
 

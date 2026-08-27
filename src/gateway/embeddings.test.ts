@@ -232,7 +232,10 @@ describe('openai embeddings gateway route', () => {
     config.upstreamConcurrency = {
       enabled: true,
       maxInFlightPerProvider: 1,
-      queueTimeoutMs: 1
+      queueTimeoutMs: 1,
+      storage: {
+        type: 'memory'
+      }
     };
 
     const app = Fastify({ logger: false });
@@ -346,7 +349,10 @@ describe('openai embeddings gateway route', () => {
       enabled: true,
       failureThreshold: 1,
       cooldownMs: 60000,
-      failureStatusCodes: [500]
+      failureStatusCodes: [500],
+      storage: {
+        type: 'memory'
+      }
     };
 
     const app = Fastify({ logger: false });
@@ -1159,6 +1165,52 @@ describe('openai image generations gateway route', () => {
     }
   });
 
+  it('rejects explicit media streams before upstream dispatch when strict billing is enabled', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+    const config = createConfig([
+      createProviderConfig('openai-image', ['gpt-image-1'], {
+        baseurl: 'https://images.example/v1',
+        type: 'openai_image_generations'
+      })
+    ]);
+    config.billing = {
+      ...config.billing,
+      enabled: true,
+      delivery: {
+        mode: 'async',
+        requirePublisher: false,
+        requireOutbox: false,
+        shutdownDrainTimeoutMs: 100
+      },
+      requireUsage: true,
+      requireRates: false
+    };
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/images/edits',
+        headers: { 'content-type': 'application/json' },
+        payload: {
+          model: 'gpt-image-1',
+          prompt: 'Stream the edit',
+          image: { image_url: 'data:image/png;base64,abc' },
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).error.message).toContain('strict billing enforcement');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
   it('publishes billing usage from completed image event streams', async () => {
     const billingEvents: Array<Record<string, unknown>> = [];
     const largeImagePayload = 'a'.repeat(300 * 1024);
@@ -1345,7 +1397,7 @@ describe('openai media gateway routes', () => {
     vi.restoreAllMocks();
   });
 
-  it('hashes binary scheduling bodies without enumerating their properties', () => {
+  it('hashes binary scheduling bodies without enumerating their properties', async () => {
     const provider = createProviderConfig('openai-image', ['gpt-image-1'], {
       type: 'openai_image_generations'
     });
@@ -1374,12 +1426,12 @@ describe('openai media gateway routes', () => {
       }
     } as unknown as FastifyRequest;
 
-    expect(() =>
+    await expect(
       applyGatewayScheduling(
         [{ provider: 'openai' as const, providerConfig: provider }],
         { config, request, requestModel: 'gpt-image-1' }
       )
-    ).not.toThrow();
+    ).resolves.toHaveLength(1);
   });
 
   it('routes JSON and multipart image edits without changing multipart bytes', async () => {
@@ -3973,7 +4025,10 @@ function createConfig(providers: ProviderConfig[]): GatewayConfig {
       enabled: false,
       intervalMs: 60000,
       timeoutMs: 5000,
-      initialDelayMs: 0
+      initialDelayMs: 0,
+      storage: {
+        type: 'memory'
+      }
     },
     metrics: {
       enabled: false,
@@ -4084,6 +4139,9 @@ function enableGatewayScheduling(config: GatewayConfig): void {
       crossProviderStatusCodes: [401, 403, 404, 429, 500, 502, 503, 504],
       preserveCache: 'prefer',
       maxCacheWaitMs: 3_000
+    },
+    storage: {
+      type: 'memory'
     }
   };
 }

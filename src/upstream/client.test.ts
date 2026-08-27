@@ -4,7 +4,7 @@ const undiciMock = vi.hoisted(() => ({
   dispatch: vi.fn(() => true),
   fetch: vi.fn((input: string | URL | Request, init?: RequestInit) => globalThis.fetch(input, init)),
   proxyAgentInputs: [] as unknown[],
-  proxyDispatch: vi.fn(() => true),
+  proxyDispatch: vi.fn((_options: Record<string, unknown>, _handler: unknown) => true),
   getGlobalDispatcher: vi.fn()
 }));
 

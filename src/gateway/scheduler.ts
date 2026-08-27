@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import { SimpleRedisClient, type RedisReply } from '../redis-client';
 import type {
   GatewayConfig,
+  GatewaySchedulingRedisStorageConfig,
   Provider,
   ProviderCacheConfig,
   ProviderConfig,
@@ -59,7 +61,11 @@ interface GatewaySchedulingRequestEstimate {
 
 const credentialStates = new Map<string, CredentialRuntimeState>();
 const cacheAffinityBindings = new Map<string, CacheAffinityBinding>();
+const redisSchedulingClients = new Map<string, SimpleRedisClient>();
 let requestEstimates = new WeakMap<FastifyRequest, GatewaySchedulingRequestEstimate>();
+let redisSchedulingCommandExecutorForTests:
+  | ((storage: GatewaySchedulingRedisStorageConfig, args: string[]) => Promise<RedisReply>)
+  | undefined;
 const defaultProviderCacheConfig: ProviderCacheConfig = {
   enabled: true,
   scope: 'credential_model',
@@ -68,18 +74,20 @@ const defaultProviderCacheConfig: ProviderCacheConfig = {
   maxWaitMs: 3000
 };
 
-export function applyGatewayScheduling<T extends GatewaySchedulingRoute>(
+export async function applyGatewayScheduling<T extends GatewaySchedulingRoute>(
   routes: T[],
   input: {
     config: GatewayConfig;
     request: FastifyRequest;
     requestModel?: string;
   }
-): T[] {
+): Promise<T[]> {
   const scheduling = input.config.scheduling;
   if (!scheduling?.enabled || routes.length === 0) {
     return routes;
   }
+
+  await hydrateGatewaySchedulingState(routes, input);
 
   const candidates: CredentialCandidate<T>[] = [];
   for (const [index, route] of routes.entries()) {
@@ -90,7 +98,9 @@ export function applyGatewayScheduling<T extends GatewaySchedulingRoute>(
     return routes;
   }
 
-  const ranked = rankCredentialCandidates(candidates).map((candidate) => candidate.route);
+  const rankedCandidates = rankCredentialCandidates(candidates);
+  writeGatewaySchedulingCandidateStatesToStore(scheduling.storage, rankedCandidates);
+  const ranked = rankedCandidates.map((candidate) => candidate.route);
   const maxAttempts = resolveSchedulingMaxAttempts(input.config);
   return maxAttempts > 0 ? ranked.slice(0, maxAttempts) : ranked;
 }
@@ -118,13 +128,16 @@ export function recordGatewaySchedulingResponse(input: {
     if (providerConfig.credentialLimits) {
       incrementCredentialCounters(providerConfig, estimateRequestUsage(input.request, input.config));
     }
-    updateCacheAffinity(input.config, input.request, providerConfig, input.model, input.usage);
+    const binding = updateCacheAffinity(input.config, input.request, providerConfig, input.model, input.usage);
+    writeGatewaySchedulingStateToStore(scheduling.storage, providerConfig, state);
+    writeGatewaySchedulingCacheAffinityToStore(scheduling.storage, binding);
     return;
   }
 
   if (statusCode !== undefined && statusCode < 500 && statusCode !== 401 && statusCode !== 403 && statusCode !== 429) {
     state.consecutiveFailures = 0;
     state.cooldownUntil = undefined;
+    writeGatewaySchedulingStateToStore(scheduling.storage, providerConfig, state);
     return;
   }
 
@@ -132,6 +145,7 @@ export function recordGatewaySchedulingResponse(input: {
     state.consecutiveFailures += 1;
     const cooldownMs = resolveCredentialCooldownMs(scheduling.credentialScheduler.cooldownMs, statusCode, input.error);
     state.cooldownUntil = Date.now() + cooldownMs;
+    writeGatewaySchedulingStateToStore(scheduling.storage, providerConfig, state);
   }
 }
 
@@ -146,7 +160,8 @@ export function recordGatewaySchedulingUsage(input: {
     return;
   }
 
-  updateCacheAffinity(input.config, input.request, input.providerConfig, input.model, input.usage);
+  const binding = updateCacheAffinity(input.config, input.request, input.providerConfig, input.model, input.usage);
+  writeGatewaySchedulingCacheAffinityToStore(input.config.scheduling.storage, binding);
 }
 
 export function attachGatewaySchedulingHeaders(
@@ -189,6 +204,100 @@ export function resetGatewaySchedulingStateForTests(): void {
   credentialStates.clear();
   cacheAffinityBindings.clear();
   requestEstimates = new WeakMap<FastifyRequest, GatewaySchedulingRequestEstimate>();
+  redisSchedulingCommandExecutorForTests = undefined;
+}
+
+export function setGatewaySchedulingRedisCommandExecutorForTests(
+  executor:
+    | ((storage: GatewaySchedulingRedisStorageConfig, args: string[]) => Promise<RedisReply>)
+    | undefined
+): void {
+  redisSchedulingCommandExecutorForTests = executor;
+}
+
+export async function closeGatewaySchedulingStore(): Promise<void> {
+  const clients = Array.from(redisSchedulingClients.values());
+  redisSchedulingClients.clear();
+  await Promise.allSettled(clients.map((client) => client.close()));
+}
+
+async function hydrateGatewaySchedulingState<T extends GatewaySchedulingRoute>(
+  routes: T[],
+  input: {
+    config: GatewayConfig;
+    request: FastifyRequest;
+    requestModel?: string;
+  }
+): Promise<void> {
+  const storage = input.config.scheduling.storage;
+  if (storage?.type !== 'redis') {
+    return;
+  }
+
+  const stateProviderConfigs = collectSchedulingStateProviderConfigs(routes, input);
+  const stateKeys = Array.from(
+    new Set(stateProviderConfigs.map((providerConfig) => credentialStateKey(providerConfig)))
+  );
+  const cacheAffinityKey = buildCacheAffinityKey(input.config, input.request, input.requestModel);
+  const redisStateKeys = stateKeys.map((key) => buildRedisSchedulingStateKey(storage, key));
+  const redisCacheKey = cacheAffinityKey
+    ? buildRedisSchedulingCacheAffinityKey(storage, cacheAffinityKey)
+    : undefined;
+  const redisKeys = redisCacheKey ? [...redisStateKeys, redisCacheKey] : redisStateKeys;
+  if (redisKeys.length === 0) {
+    return;
+  }
+
+  try {
+    const reply = await commandRedisScheduling(storage, ['MGET', ...redisKeys]);
+    if (!Array.isArray(reply)) {
+      return;
+    }
+    for (let index = 0; index < stateKeys.length; index += 1) {
+      const state = parseStoredCredentialRuntimeState(reply[index]);
+      if (state) {
+        credentialStates.set(stateKeys[index], state);
+      }
+    }
+
+    if (cacheAffinityKey && redisCacheKey) {
+      const binding = parseStoredCacheAffinityBinding(reply[stateKeys.length], cacheAffinityKey);
+      if (binding) {
+        cacheAffinityBindings.set(cacheAffinityKey, binding);
+      }
+    }
+  } catch {
+    // Scheduling Redis state is an optimization; local state remains available on Redis errors.
+  }
+}
+
+function collectSchedulingStateProviderConfigs<T extends GatewaySchedulingRoute>(
+  routes: T[],
+  input: {
+    config: GatewayConfig;
+    request: FastifyRequest;
+    requestModel?: string;
+  }
+): ProviderConfig[] {
+  const providerConfigs: ProviderConfig[] = [];
+  for (const route of routes) {
+    const providerConfig = resolveRouteProviderConfig(input.config, route);
+    if (!providerConfig) {
+      continue;
+    }
+    const activeCredentials = input.config.scheduling.credentialScheduler.enabled
+      ? (providerConfig.credentials || []).filter((credential) => credential.enabled !== false && Boolean(credential.apikey))
+      : [];
+    if (activeCredentials.length === 0 || providerConfig.credentialId) {
+      providerConfigs.push(providerConfig);
+      continue;
+    }
+    for (const credential of activeCredentials) {
+      providerConfigs.push(providerConfigForCredential(providerConfig, credential));
+    }
+  }
+
+  return providerConfigs;
 }
 
 function expandSchedulingRoute<T extends GatewaySchedulingRoute>(
@@ -470,8 +579,257 @@ function getCredentialRuntimeState(providerConfig: ProviderConfig): CredentialRu
   return state;
 }
 
+function writeGatewaySchedulingCandidateStatesToStore<T extends GatewaySchedulingRoute>(
+  storage: GatewayConfig['scheduling']['storage'],
+  candidates: CredentialCandidate<T>[]
+): void {
+  if (storage?.type !== 'redis') {
+    return;
+  }
+
+  const providerConfigs = new Map<string, ProviderConfig>();
+  for (const candidate of candidates) {
+    providerConfigs.set(credentialStateKey(candidate.providerConfig), candidate.providerConfig);
+  }
+  for (const providerConfig of providerConfigs.values()) {
+    writeGatewaySchedulingStateToStore(
+      storage,
+      providerConfig,
+      getCredentialRuntimeState(providerConfig)
+    );
+  }
+}
+
+function writeGatewaySchedulingStateToStore(
+  storage: GatewayConfig['scheduling']['storage'],
+  providerConfig: ProviderConfig,
+  state: CredentialRuntimeState
+): void {
+  if (storage?.type !== 'redis') {
+    return;
+  }
+
+  const stateKey = credentialStateKey(providerConfig);
+  void commandRedisScheduling(storage, [
+    'SET',
+    buildRedisSchedulingStateKey(storage, stateKey),
+    JSON.stringify(serializeCredentialRuntimeState(state)),
+    'PX',
+    String(resolveSchedulingStateTtlMs(storage))
+  ]).catch(() => {
+    // Scheduling state is advisory; failed Redis writes should not affect the upstream call.
+  });
+}
+
+function writeGatewaySchedulingCacheAffinityToStore(
+  storage: GatewayConfig['scheduling']['storage'],
+  binding: CacheAffinityBinding | undefined
+): void {
+  if (storage?.type !== 'redis' || !binding) {
+    return;
+  }
+
+  void commandRedisScheduling(storage, [
+    'SET',
+    buildRedisSchedulingCacheAffinityKey(storage, binding.key),
+    JSON.stringify(binding),
+    'PX',
+    String(Math.max(resolveSchedulingStateTtlMs(storage), Math.max(1, binding.expiresAt - Date.now())))
+  ]).catch(() => {
+    // Cache affinity is a preference, not a hard routing requirement.
+  });
+}
+
 function credentialStateKey(providerConfig: ProviderConfig): string {
   return `${providerConfig.credentialSourceProviderName || providerConfig.name}:${providerConfig.credentialId || 'default'}`;
+}
+
+function serializeCredentialRuntimeState(
+  state: CredentialRuntimeState
+): {
+  cooldownUntil?: number;
+  consecutiveFailures: number;
+  currentWeight: number;
+  counters: Record<string, WindowCounter>;
+} {
+  const now = Date.now();
+  const counters: Record<string, WindowCounter> = {};
+  for (const [key, counter] of state.counters) {
+    if (counter.expiresAt > now) {
+      counters[key] = {
+        expiresAt: counter.expiresAt,
+        value: counter.value
+      };
+    }
+  }
+
+  return {
+    cooldownUntil: state.cooldownUntil,
+    consecutiveFailures: normalizeNonNegativeInteger(state.consecutiveFailures, 0),
+    currentWeight: normalizeFiniteNumber(state.currentWeight, 0),
+    counters
+  };
+}
+
+function parseStoredCredentialRuntimeState(reply: RedisReply | undefined): CredentialRuntimeState | undefined {
+  if (typeof reply !== 'string' || !reply) {
+    return undefined;
+  }
+
+  try {
+    const raw = JSON.parse(reply) as {
+      cooldownUntil?: unknown;
+      consecutiveFailures?: unknown;
+      currentWeight?: unknown;
+      counters?: unknown;
+    };
+    const now = Date.now();
+    const counters = new Map<string, WindowCounter>();
+    if (raw.counters && typeof raw.counters === 'object' && !Array.isArray(raw.counters)) {
+      for (const [key, value] of Object.entries(raw.counters as Record<string, unknown>)) {
+        if (!value || typeof value !== 'object') {
+          continue;
+        }
+        const counter = value as Partial<WindowCounter>;
+        const expiresAt = normalizeFiniteNumber(counter.expiresAt, 0);
+        const count = normalizeFiniteNumber(counter.value, 0);
+        if (expiresAt > now && count >= 0) {
+          counters.set(key, {
+            expiresAt,
+            value: count
+          });
+        }
+      }
+    }
+
+    return {
+      cooldownUntil: normalizeOptionalFutureTimestamp(raw.cooldownUntil),
+      consecutiveFailures: normalizeNonNegativeInteger(raw.consecutiveFailures, 0),
+      currentWeight: normalizeFiniteNumber(raw.currentWeight, 0),
+      counters
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function parseStoredCacheAffinityBinding(
+  reply: RedisReply | undefined,
+  expectedKey: string
+): CacheAffinityBinding | undefined {
+  if (typeof reply !== 'string' || !reply) {
+    return undefined;
+  }
+
+  try {
+    const raw = JSON.parse(reply) as Partial<CacheAffinityBinding>;
+    if (
+      raw.key !== expectedKey ||
+      typeof raw.providerName !== 'string' ||
+      typeof raw.cacheScopeKey !== 'string'
+    ) {
+      return undefined;
+    }
+    const expiresAt = normalizeFiniteNumber(raw.expiresAt, 0);
+    if (expiresAt <= Date.now()) {
+      return undefined;
+    }
+
+    return {
+      key: raw.key,
+      providerName: raw.providerName,
+      model: typeof raw.model === 'string' ? raw.model : undefined,
+      credentialId: typeof raw.credentialId === 'string' ? raw.credentialId : undefined,
+      cacheScopeKey: raw.cacheScopeKey,
+      expiresAt,
+      lastHitAt: normalizeFiniteNumber(raw.lastHitAt, 0)
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function commandRedisScheduling(
+  storage: GatewaySchedulingRedisStorageConfig,
+  args: string[]
+): Promise<RedisReply> {
+  if (redisSchedulingCommandExecutorForTests) {
+    return redisSchedulingCommandExecutorForTests(storage, args);
+  }
+
+  return getRedisSchedulingClient(storage).command(args);
+}
+
+function getRedisSchedulingClient(storage: GatewaySchedulingRedisStorageConfig): SimpleRedisClient {
+  const cacheKey = JSON.stringify({
+    url: storage.url || 'redis://127.0.0.1:6379/0',
+    keyPrefix: storage.keyPrefix || 'next-ai:gateway:scheduling',
+    connectTimeoutMs: normalizePositiveInteger(storage.connectTimeoutMs, 1000),
+    commandTimeoutMs: normalizePositiveInteger(storage.commandTimeoutMs, 1000)
+  });
+  const existing = redisSchedulingClients.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+
+  const client = new SimpleRedisClient({
+    url: storage.url || 'redis://127.0.0.1:6379/0',
+    connectTimeoutMs: normalizePositiveInteger(storage.connectTimeoutMs, 1000),
+    commandTimeoutMs: normalizePositiveInteger(storage.commandTimeoutMs, 1000),
+    errorPrefix: 'Redis gateway scheduling'
+  });
+  redisSchedulingClients.set(cacheKey, client);
+  return client;
+}
+
+function buildRedisSchedulingStateKey(
+  storage: GatewaySchedulingRedisStorageConfig,
+  stateKey: string
+): string {
+  return `${redisSchedulingKeyPrefix(storage)}:state:${stableHash(stateKey)}`;
+}
+
+function buildRedisSchedulingCacheAffinityKey(
+  storage: GatewaySchedulingRedisStorageConfig,
+  affinityKey: string
+): string {
+  return `${redisSchedulingKeyPrefix(storage)}:cache:${stableHash(affinityKey)}`;
+}
+
+function redisSchedulingKeyPrefix(storage: GatewaySchedulingRedisStorageConfig): string {
+  return (storage.keyPrefix || 'next-ai:gateway:scheduling').replace(/:+$/, '') ||
+    'next-ai:gateway:scheduling';
+}
+
+function resolveSchedulingStateTtlMs(storage: GatewaySchedulingRedisStorageConfig): number {
+  return normalizePositiveInteger(storage.stateTtlMs, 86400000);
+}
+
+function normalizeOptionalFutureTimestamp(value: unknown): number | undefined {
+  const timestamp = normalizeFiniteNumber(value, 0);
+  return timestamp > Date.now() ? timestamp : undefined;
+}
+
+function normalizeNonNegativeInteger(value: unknown, fallback: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+
+  return Math.trunc(parsed);
+}
+
+function normalizeFiniteNumber(value: unknown, fallback: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizePositiveInteger(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return fallback;
+  }
+
+  return Math.trunc(value);
 }
 
 function estimateRequestUsage(
@@ -516,14 +874,14 @@ function updateCacheAffinity(
   providerConfig: ProviderConfig,
   model: string | undefined,
   usage: StandardUsage | undefined
-): void {
+): CacheAffinityBinding | undefined {
   if (!config.scheduling.cacheAffinity.enabled) {
-    return;
+    return undefined;
   }
 
   const providerCache = resolveProviderCacheConfig(config, providerConfig);
   if (!providerCache.enabled) {
-    return;
+    return undefined;
   }
 
   const estimated = estimateRequestUsage(request, config);
@@ -532,16 +890,16 @@ function updateCacheAffinity(
       (usage?.cache_write_tokens || 0) > 0
   );
   if (!cacheUsageObserved && estimated.totalTokens < providerCache.minPrefixTokens) {
-    return;
+    return undefined;
   }
 
   const key = buildCacheAffinityKey(config, request, model);
   if (!key) {
-    return;
+    return undefined;
   }
 
   const now = Date.now();
-  cacheAffinityBindings.set(key, {
+  const binding = {
     key,
     providerName: providerConfig.credentialSourceProviderName || providerConfig.name,
     model,
@@ -549,7 +907,9 @@ function updateCacheAffinity(
     cacheScopeKey: buildCacheScopeKey(providerConfig, undefined, model, config),
     expiresAt: now + providerCache.ttlMs,
     lastHitAt: now
-  });
+  };
+  cacheAffinityBindings.set(key, binding);
+  return binding;
 }
 
 function cacheAffinityMatches(

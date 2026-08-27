@@ -11,6 +11,7 @@ import type {
   AgentStorageConfig,
   AgentMcpServerConfig,
   AgentMcpServerTransport,
+  BillingDeliveryMode,
   BillingRate,
   BillingTraceRequestBodyMode,
   BillingTier,
@@ -25,12 +26,14 @@ import type {
   GatewayExternalEventSinkTransport,
   GatewayHealthAwareRoutingConfig,
   GatewayIdempotencyConfig,
+  GatewayIdempotencyStorageType,
   GatewayLoggingConfig,
   GatewayMetricsConfig,
   GatewayMediaConfig,
   GatewayModelListConfig,
   GatewayPolicyConfig,
   GatewayPolicyRuleConfig,
+  GatewayPluginExecutionConfig,
   GatewayPrecheckConfig,
   GatewayPrecheckScope,
   GatewayPrecheckStorageType,
@@ -39,6 +42,7 @@ import type {
   GatewayRateLimitMetric,
   GatewayRoutingConfig,
   GatewaySchedulingConfig,
+  GatewaySchedulingStorageType,
   GatewayTransparentToolExecutionConfig,
   GatewayTransparentToolUnknownPolicy,
   GatewayTrustedProxyHeader,
@@ -46,7 +50,9 @@ import type {
   GatewayPluginManifest,
   GatewayPluginProviderHookConfig,
   GatewayUpstreamCircuitBreakerConfig,
+  GatewayUpstreamCircuitBreakerStorageType,
   GatewayUpstreamConcurrencyConfig,
+  GatewayUpstreamConcurrencyStorageType,
   GatewayUpstreamRetryConfig,
   McpGatewayConfig,
   McpGatewayGuardrailsConfig,
@@ -73,6 +79,7 @@ import type {
   ProviderCredentialLimitConfig,
   ProviderExternalSourceConfig,
   ProviderHealthCheckSchedulerConfig,
+  ProviderHealthCheckStorageType,
   ProviderHealthConfig,
   ProviderHealthStatus,
   VirtualModelProfileConfig,
@@ -96,6 +103,7 @@ const defaultCodexOauthClientId = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const defaultCodexOauthScope = 'openid profile email offline_access';
 const requiredCodexOauthScopes = ['api.connectors.read', 'api.connectors.invoke'];
 const defaultBodyLimitBytes = 50 * 1024 * 1024;
+const defaultUpstreamTimeoutMs = 60_000;
 const defaultCorsAllowedHeaders = [
   'Content-Type',
   'Authorization',
@@ -140,6 +148,16 @@ interface BillingTraceJsonConfig {
   requestBodyMode?: unknown;
   requestBody?: unknown;
   includeRequestBody?: unknown;
+}
+
+interface BillingDeliveryJsonConfig {
+  mode?: unknown;
+  requirePublisher?: unknown;
+  requireDelivery?: unknown;
+  requireOutbox?: unknown;
+  requireDurableOutbox?: unknown;
+  shutdownDrainTimeoutMs?: unknown;
+  shutdownDrainTimeoutSeconds?: unknown;
 }
 
 interface ProviderJsonConfig {
@@ -290,6 +308,22 @@ interface ProviderHealthCheckSchedulerJsonConfig {
   timeoutSeconds?: unknown;
   initialDelayMs?: unknown;
   initialDelaySeconds?: unknown;
+  storage?: unknown;
+}
+
+interface ProviderHealthCheckStorageJsonConfig {
+  type?: unknown;
+  backend?: unknown;
+  url?: unknown;
+  redisUrl?: unknown;
+  keyPrefix?: unknown;
+  prefix?: unknown;
+  connectTimeoutMs?: unknown;
+  connectTimeoutSeconds?: unknown;
+  commandTimeoutMs?: unknown;
+  commandTimeoutSeconds?: unknown;
+  stateTtlMs?: unknown;
+  stateTtlSeconds?: unknown;
 }
 
 interface GatewayMetricsJsonConfig {
@@ -322,7 +356,27 @@ interface GatewayIdempotencyJsonConfig {
   ttlMs?: unknown;
   ttlSeconds?: unknown;
   maxEntries?: unknown;
+  maxResponseBytes?: unknown;
+  maxTotalBytes?: unknown;
   cacheErrorResponses?: unknown;
+  pendingWaitTimeoutMs?: unknown;
+  pendingWaitTimeoutSeconds?: unknown;
+  pollIntervalMs?: unknown;
+  pollIntervalSeconds?: unknown;
+  storage?: unknown;
+}
+
+interface GatewayIdempotencyStorageJsonConfig {
+  type?: unknown;
+  backend?: unknown;
+  url?: unknown;
+  redisUrl?: unknown;
+  keyPrefix?: unknown;
+  prefix?: unknown;
+  connectTimeoutMs?: unknown;
+  connectTimeoutSeconds?: unknown;
+  commandTimeoutMs?: unknown;
+  commandTimeoutSeconds?: unknown;
 }
 
 interface GatewayUpstreamConcurrencyJsonConfig {
@@ -330,6 +384,24 @@ interface GatewayUpstreamConcurrencyJsonConfig {
   maxInFlightPerProvider?: unknown;
   queueTimeoutMs?: unknown;
   queueTimeoutSeconds?: unknown;
+  storage?: unknown;
+}
+
+interface GatewayUpstreamConcurrencyStorageJsonConfig {
+  type?: unknown;
+  backend?: unknown;
+  url?: unknown;
+  redisUrl?: unknown;
+  keyPrefix?: unknown;
+  prefix?: unknown;
+  connectTimeoutMs?: unknown;
+  connectTimeoutSeconds?: unknown;
+  commandTimeoutMs?: unknown;
+  commandTimeoutSeconds?: unknown;
+  leaseTtlMs?: unknown;
+  leaseTtlSeconds?: unknown;
+  pollIntervalMs?: unknown;
+  pollIntervalSeconds?: unknown;
 }
 
 interface GatewayUpstreamCircuitBreakerJsonConfig {
@@ -338,6 +410,22 @@ interface GatewayUpstreamCircuitBreakerJsonConfig {
   cooldownMs?: unknown;
   cooldownSeconds?: unknown;
   failureStatusCodes?: unknown;
+  storage?: unknown;
+}
+
+interface GatewayUpstreamCircuitBreakerStorageJsonConfig {
+  type?: unknown;
+  backend?: unknown;
+  url?: unknown;
+  redisUrl?: unknown;
+  keyPrefix?: unknown;
+  prefix?: unknown;
+  connectTimeoutMs?: unknown;
+  connectTimeoutSeconds?: unknown;
+  commandTimeoutMs?: unknown;
+  commandTimeoutSeconds?: unknown;
+  stateTtlMs?: unknown;
+  stateTtlSeconds?: unknown;
 }
 
 interface GatewayUpstreamRetryJsonConfig {
@@ -619,6 +707,17 @@ interface GatewayJsonConfig {
     trace?: unknown;
     traceRequestBodyMode?: unknown;
     includeTraceRequestBody?: unknown;
+    delivery?: unknown;
+    deliveryMode?: unknown;
+    requirePublisher?: unknown;
+    requireDelivery?: unknown;
+    requireOutbox?: unknown;
+    requireDurableOutbox?: unknown;
+    requireUsage?: unknown;
+    requireRates?: unknown;
+    requireNonZeroRates?: unknown;
+    shutdownDrainTimeoutMs?: unknown;
+    shutdownDrainTimeoutSeconds?: unknown;
     rates?: {
       openai?: unknown;
       anthropic?: unknown;
@@ -637,6 +736,22 @@ interface GatewaySchedulingJsonConfig {
   cacheAffinity?: unknown;
   credentialScheduler?: unknown;
   fallback?: unknown;
+  storage?: unknown;
+}
+
+interface GatewaySchedulingStorageJsonConfig {
+  type?: unknown;
+  backend?: unknown;
+  url?: unknown;
+  redisUrl?: unknown;
+  keyPrefix?: unknown;
+  prefix?: unknown;
+  connectTimeoutMs?: unknown;
+  connectTimeoutSeconds?: unknown;
+  commandTimeoutMs?: unknown;
+  commandTimeoutSeconds?: unknown;
+  stateTtlMs?: unknown;
+  stateTtlSeconds?: unknown;
 }
 
 interface GatewayMediaJsonConfig {
@@ -786,6 +901,15 @@ interface ProviderPluginCodexOauthJsonConfig {
   authScheme?: unknown;
 }
 
+interface GatewayPluginExecutionJsonConfig {
+  timeoutMs?: unknown;
+  concurrency?: unknown;
+  maxQueueSize?: unknown;
+  failureThreshold?: unknown;
+  cooldownMs?: unknown;
+  failureMode?: unknown;
+}
+
 interface ProviderPluginJsonConfig {
   key?: unknown;
   enabled?: unknown;
@@ -798,6 +922,7 @@ interface ProviderPluginJsonConfig {
   sourceRoutes?: unknown;
   sourceRoute?: unknown;
   when?: unknown;
+  execution?: unknown;
   codexOauth?: unknown;
   deepseekThinking?: unknown;
   deepSeekThinking?: unknown;
@@ -1069,7 +1194,7 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
     upstreamTimeoutMs:
       readNonNegativeNumber(process.env.UPSTREAM_TIMEOUT_MS) ??
       readNonNegativeNumber(jsonConfig.upstreamTimeoutMs) ??
-      0,
+      defaultUpstreamTimeoutMs,
     defaultOpenAIModel:
       readString(process.env.DEFAULT_OPENAI_MODEL) ||
       readString(jsonConfig.defaultOpenAIModel) ||
@@ -1102,6 +1227,17 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
       enabled: resolveBoolean(process.env.BILLING_ENABLED, jsonConfig.billing?.enabled, true),
       currency: 'USD',
       trace: parseBillingTraceConfig(jsonConfig.billing),
+      delivery: parseBillingDeliveryConfig(jsonConfig.billing),
+      requireUsage: resolveBoolean(
+        process.env.BILLING_REQUIRE_USAGE,
+        jsonConfig.billing?.requireUsage,
+        false
+      ),
+      requireRates: resolveBoolean(
+        process.env.BILLING_REQUIRE_RATES ?? process.env.BILLING_REQUIRE_NON_ZERO_RATES,
+        jsonConfig.billing?.requireRates ?? jsonConfig.billing?.requireNonZeroRates,
+        false
+      ),
       rates: {
         openai: {
           inputPerMillionUsd: resolveNonNegativeNumber(
@@ -1627,6 +1763,9 @@ function parseGatewaySchedulingConfig(value: unknown): GatewaySchedulingConfig {
   const fallbackRaw = isPlainObject(raw?.fallback)
     ? (raw.fallback as GatewaySchedulingFallbackJsonConfig)
     : undefined;
+  const storageRaw = isPlainObject(raw?.storage)
+    ? (raw.storage as GatewaySchedulingStorageJsonConfig)
+    : undefined;
 
   return {
     enabled: resolveBoolean(process.env.GATEWAY_SCHEDULING_ENABLED, raw?.enabled, false),
@@ -1741,8 +1880,69 @@ function parseGatewaySchedulingConfig(value: unknown): GatewaySchedulingConfig {
         ],
         3000
       )
-    }
+    },
+    storage: parseGatewaySchedulingStorageConfig(storageRaw)
   };
+}
+
+function parseGatewaySchedulingStorageConfig(
+  value: GatewaySchedulingStorageJsonConfig | undefined
+): GatewaySchedulingConfig['storage'] {
+  const type = parseGatewaySchedulingStorageType(
+    readString(process.env.GATEWAY_SCHEDULING_STORAGE_TYPE) ||
+      readString(process.env.GATEWAY_SCHEDULING_STORAGE_BACKEND) ||
+      readString(value?.type) ||
+      readString(value?.backend),
+    'memory'
+  );
+  if (type === 'redis') {
+    return {
+      type,
+      url:
+        readString(process.env.GATEWAY_SCHEDULING_REDIS_URL) ||
+        readString(value?.redisUrl) ||
+        readString(value?.url) ||
+        'redis://127.0.0.1:6379/0',
+      keyPrefix:
+        readString(process.env.GATEWAY_SCHEDULING_REDIS_KEY_PREFIX) ||
+        readString(value?.keyPrefix) ||
+        readString(value?.prefix) ||
+        'next-ai:gateway:scheduling',
+      connectTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_SCHEDULING_REDIS_CONNECT_TIMEOUT_MS, value?.connectTimeoutMs],
+        [process.env.GATEWAY_SCHEDULING_REDIS_CONNECT_TIMEOUT_SECONDS, value?.connectTimeoutSeconds],
+        1000
+      ),
+      commandTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_SCHEDULING_REDIS_COMMAND_TIMEOUT_MS, value?.commandTimeoutMs],
+        [process.env.GATEWAY_SCHEDULING_REDIS_COMMAND_TIMEOUT_SECONDS, value?.commandTimeoutSeconds],
+        1000
+      ),
+      stateTtlMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_SCHEDULING_REDIS_STATE_TTL_MS, value?.stateTtlMs],
+        [process.env.GATEWAY_SCHEDULING_REDIS_STATE_TTL_SECONDS, value?.stateTtlSeconds],
+        86400000
+      )
+    };
+  }
+
+  return { type };
+}
+
+function parseGatewaySchedulingStorageType(
+  value: string | undefined,
+  fallback: GatewaySchedulingStorageType
+): GatewaySchedulingStorageType {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'memory' || normalized === 'in_memory' || normalized === 'in-memory') {
+    return 'memory';
+  }
+
+  if (normalized === 'redis') {
+    return 'redis';
+  }
+
+  return fallback;
 }
 
 function parseGatewaySchedulingFallbackMode(
@@ -1786,25 +1986,93 @@ function parseGatewayModelListConfig(value: unknown): GatewayModelListConfig {
 
 function parseProviderHealthCheckSchedulerConfig(value: unknown): ProviderHealthCheckSchedulerConfig {
   const raw = isPlainObject(value) ? (value as ProviderHealthCheckSchedulerJsonConfig) : undefined;
+  const intervalMs = resolvePrecheckWindowMs(
+    [process.env.PROVIDER_HEALTH_CHECK_INTERVAL_MS, raw?.intervalMs],
+    [process.env.PROVIDER_HEALTH_CHECK_INTERVAL_SECONDS, raw?.intervalSeconds],
+    60000
+  );
+  const timeoutMs = resolvePrecheckWindowMs(
+    [process.env.PROVIDER_HEALTH_CHECK_TIMEOUT_MS, raw?.timeoutMs],
+    [process.env.PROVIDER_HEALTH_CHECK_TIMEOUT_SECONDS, raw?.timeoutSeconds],
+    5000
+  );
+  const initialDelayMs = resolvePrecheckWindowMs(
+    [process.env.PROVIDER_HEALTH_CHECK_INITIAL_DELAY_MS, raw?.initialDelayMs],
+    [process.env.PROVIDER_HEALTH_CHECK_INITIAL_DELAY_SECONDS, raw?.initialDelaySeconds],
+    0
+  );
+  const storageRaw = isPlainObject(raw?.storage)
+    ? (raw.storage as ProviderHealthCheckStorageJsonConfig)
+    : undefined;
 
   return {
     enabled: resolveBoolean(process.env.PROVIDER_HEALTH_CHECK_ENABLED, raw?.enabled, false),
-    intervalMs: resolvePrecheckWindowMs(
-      [process.env.PROVIDER_HEALTH_CHECK_INTERVAL_MS, raw?.intervalMs],
-      [process.env.PROVIDER_HEALTH_CHECK_INTERVAL_SECONDS, raw?.intervalSeconds],
-      60000
-    ),
-    timeoutMs: resolvePrecheckWindowMs(
-      [process.env.PROVIDER_HEALTH_CHECK_TIMEOUT_MS, raw?.timeoutMs],
-      [process.env.PROVIDER_HEALTH_CHECK_TIMEOUT_SECONDS, raw?.timeoutSeconds],
-      5000
-    ),
-    initialDelayMs: resolvePrecheckWindowMs(
-      [process.env.PROVIDER_HEALTH_CHECK_INITIAL_DELAY_MS, raw?.initialDelayMs],
-      [process.env.PROVIDER_HEALTH_CHECK_INITIAL_DELAY_SECONDS, raw?.initialDelaySeconds],
-      0
-    )
+    intervalMs,
+    timeoutMs,
+    initialDelayMs,
+    storage: parseProviderHealthCheckStorageConfig(storageRaw, Math.max(300000, intervalMs * 3))
   };
+}
+
+function parseProviderHealthCheckStorageConfig(
+  value: ProviderHealthCheckStorageJsonConfig | undefined,
+  defaultStateTtlMs: number
+): ProviderHealthCheckSchedulerConfig['storage'] {
+  const type = parseProviderHealthCheckStorageType(
+    readString(process.env.PROVIDER_HEALTH_CHECK_STORAGE_TYPE) ||
+      readString(process.env.PROVIDER_HEALTH_CHECK_STORAGE_BACKEND) ||
+      readString(value?.type) ||
+      readString(value?.backend),
+    'memory'
+  );
+  if (type === 'redis') {
+    return {
+      type,
+      url:
+        readString(process.env.PROVIDER_HEALTH_CHECK_REDIS_URL) ||
+        readString(value?.redisUrl) ||
+        readString(value?.url) ||
+        'redis://127.0.0.1:6379/0',
+      keyPrefix:
+        readString(process.env.PROVIDER_HEALTH_CHECK_REDIS_KEY_PREFIX) ||
+        readString(value?.keyPrefix) ||
+        readString(value?.prefix) ||
+        'next-ai:gateway:provider-health',
+      connectTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.PROVIDER_HEALTH_CHECK_REDIS_CONNECT_TIMEOUT_MS, value?.connectTimeoutMs],
+        [process.env.PROVIDER_HEALTH_CHECK_REDIS_CONNECT_TIMEOUT_SECONDS, value?.connectTimeoutSeconds],
+        1000
+      ),
+      commandTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.PROVIDER_HEALTH_CHECK_REDIS_COMMAND_TIMEOUT_MS, value?.commandTimeoutMs],
+        [process.env.PROVIDER_HEALTH_CHECK_REDIS_COMMAND_TIMEOUT_SECONDS, value?.commandTimeoutSeconds],
+        1000
+      ),
+      stateTtlMs: resolvePrecheckWindowMs(
+        [process.env.PROVIDER_HEALTH_CHECK_REDIS_STATE_TTL_MS, value?.stateTtlMs],
+        [process.env.PROVIDER_HEALTH_CHECK_REDIS_STATE_TTL_SECONDS, value?.stateTtlSeconds],
+        defaultStateTtlMs
+      )
+    };
+  }
+
+  return { type };
+}
+
+function parseProviderHealthCheckStorageType(
+  value: string | undefined,
+  fallback: ProviderHealthCheckStorageType
+): ProviderHealthCheckStorageType {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'memory' || normalized === 'in_memory' || normalized === 'in-memory') {
+    return 'memory';
+  }
+
+  if (normalized === 'redis') {
+    return 'redis';
+  }
+
+  return fallback;
 }
 
 function parseGatewayMetricsConfig(value: unknown): GatewayMetricsConfig {
@@ -1896,6 +2164,9 @@ function parseGatewayCorsConfig(value: unknown): GatewayCorsConfig {
 
 function parseGatewayIdempotencyConfig(value: unknown): GatewayIdempotencyConfig {
   const raw = isPlainObject(value) ? (value as GatewayIdempotencyJsonConfig) : undefined;
+  const storageRaw = isPlainObject(raw?.storage)
+    ? (raw.storage as GatewayIdempotencyStorageJsonConfig)
+    : undefined;
 
   return {
     enabled: resolveBoolean(process.env.GATEWAY_IDEMPOTENCY_ENABLED, raw?.enabled, false),
@@ -1913,16 +2184,95 @@ function parseGatewayIdempotencyConfig(value: unknown): GatewayIdempotencyConfig
       10000,
       1
     ),
+    maxResponseBytes: resolveInteger(
+      [process.env.GATEWAY_IDEMPOTENCY_MAX_RESPONSE_BYTES, raw?.maxResponseBytes],
+      4 * 1024 * 1024,
+      1
+    ),
+    maxTotalBytes: resolveInteger(
+      [process.env.GATEWAY_IDEMPOTENCY_MAX_TOTAL_BYTES, raw?.maxTotalBytes],
+      256 * 1024 * 1024,
+      1
+    ),
     cacheErrorResponses: resolveBoolean(
       process.env.GATEWAY_IDEMPOTENCY_CACHE_ERROR_RESPONSES,
       raw?.cacheErrorResponses,
       false
-    )
+    ),
+    pendingWaitTimeoutMs: resolvePrecheckWindowMs(
+      [process.env.GATEWAY_IDEMPOTENCY_PENDING_WAIT_TIMEOUT_MS, raw?.pendingWaitTimeoutMs],
+      [process.env.GATEWAY_IDEMPOTENCY_PENDING_WAIT_TIMEOUT_SECONDS, raw?.pendingWaitTimeoutSeconds],
+      30000
+    ),
+    pollIntervalMs: resolvePrecheckWindowMs(
+      [process.env.GATEWAY_IDEMPOTENCY_POLL_INTERVAL_MS, raw?.pollIntervalMs],
+      [process.env.GATEWAY_IDEMPOTENCY_POLL_INTERVAL_SECONDS, raw?.pollIntervalSeconds],
+      100
+    ),
+    storage: parseGatewayIdempotencyStorageConfig(storageRaw)
   };
+}
+
+function parseGatewayIdempotencyStorageConfig(
+  value: GatewayIdempotencyStorageJsonConfig | undefined
+): GatewayIdempotencyConfig['storage'] {
+  const type = parseGatewayIdempotencyStorageType(
+    readString(process.env.GATEWAY_IDEMPOTENCY_STORAGE_TYPE) ||
+      readString(process.env.GATEWAY_IDEMPOTENCY_STORAGE_BACKEND) ||
+      readString(value?.type) ||
+      readString(value?.backend),
+    'memory'
+  );
+  if (type === 'redis') {
+    return {
+      type,
+      url:
+        readString(process.env.GATEWAY_IDEMPOTENCY_REDIS_URL) ||
+        readString(value?.redisUrl) ||
+        readString(value?.url) ||
+        'redis://127.0.0.1:6379/0',
+      keyPrefix:
+        readString(process.env.GATEWAY_IDEMPOTENCY_REDIS_KEY_PREFIX) ||
+        readString(value?.keyPrefix) ||
+        readString(value?.prefix) ||
+        'next-ai:gateway:idempotency',
+      connectTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_IDEMPOTENCY_REDIS_CONNECT_TIMEOUT_MS, value?.connectTimeoutMs],
+        [process.env.GATEWAY_IDEMPOTENCY_REDIS_CONNECT_TIMEOUT_SECONDS, value?.connectTimeoutSeconds],
+        1000
+      ),
+      commandTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_IDEMPOTENCY_REDIS_COMMAND_TIMEOUT_MS, value?.commandTimeoutMs],
+        [process.env.GATEWAY_IDEMPOTENCY_REDIS_COMMAND_TIMEOUT_SECONDS, value?.commandTimeoutSeconds],
+        1000
+      )
+    };
+  }
+
+  return { type };
+}
+
+function parseGatewayIdempotencyStorageType(
+  value: string | undefined,
+  fallback: GatewayIdempotencyStorageType
+): GatewayIdempotencyStorageType {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'memory' || normalized === 'in_memory' || normalized === 'in-memory') {
+    return 'memory';
+  }
+
+  if (normalized === 'redis') {
+    return 'redis';
+  }
+
+  return fallback;
 }
 
 function parseGatewayUpstreamConcurrencyConfig(value: unknown): GatewayUpstreamConcurrencyConfig {
   const raw = isPlainObject(value) ? (value as GatewayUpstreamConcurrencyJsonConfig) : undefined;
+  const storageRaw = isPlainObject(raw?.storage)
+    ? (raw.storage as GatewayUpstreamConcurrencyStorageJsonConfig)
+    : undefined;
 
   return {
     enabled: resolveBoolean(process.env.GATEWAY_UPSTREAM_CONCURRENCY_ENABLED, raw?.enabled, false),
@@ -1944,12 +2294,81 @@ function parseGatewayUpstreamConcurrencyConfig(value: unknown): GatewayUpstreamC
         raw?.queueTimeoutSeconds
       ],
       1000
-    )
+    ),
+    storage: parseGatewayUpstreamConcurrencyStorageConfig(storageRaw)
   };
+}
+
+function parseGatewayUpstreamConcurrencyStorageConfig(
+  value: GatewayUpstreamConcurrencyStorageJsonConfig | undefined
+): GatewayUpstreamConcurrencyConfig['storage'] {
+  const type = parseGatewayUpstreamConcurrencyStorageType(
+    readString(process.env.GATEWAY_UPSTREAM_CONCURRENCY_STORAGE_TYPE) ||
+      readString(process.env.GATEWAY_UPSTREAM_CONCURRENCY_STORAGE_BACKEND) ||
+      readString(value?.type) ||
+      readString(value?.backend),
+    'memory'
+  );
+  if (type === 'redis') {
+    return {
+      type,
+      url:
+        readString(process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_URL) ||
+        readString(value?.redisUrl) ||
+        readString(value?.url) ||
+        'redis://127.0.0.1:6379/0',
+      keyPrefix:
+        readString(process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_KEY_PREFIX) ||
+        readString(value?.keyPrefix) ||
+        readString(value?.prefix) ||
+        'next-ai:gateway:upstream-concurrency',
+      connectTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_CONNECT_TIMEOUT_MS, value?.connectTimeoutMs],
+        [process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_CONNECT_TIMEOUT_SECONDS, value?.connectTimeoutSeconds],
+        1000
+      ),
+      commandTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_COMMAND_TIMEOUT_MS, value?.commandTimeoutMs],
+        [process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_COMMAND_TIMEOUT_SECONDS, value?.commandTimeoutSeconds],
+        1000
+      ),
+      leaseTtlMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_LEASE_TTL_MS, value?.leaseTtlMs],
+        [process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_LEASE_TTL_SECONDS, value?.leaseTtlSeconds],
+        60000
+      ),
+      pollIntervalMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_POLL_INTERVAL_MS, value?.pollIntervalMs],
+        [process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_POLL_INTERVAL_SECONDS, value?.pollIntervalSeconds],
+        25
+      )
+    };
+  }
+
+  return { type };
+}
+
+function parseGatewayUpstreamConcurrencyStorageType(
+  value: string | undefined,
+  fallback: GatewayUpstreamConcurrencyStorageType
+): GatewayUpstreamConcurrencyStorageType {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'memory' || normalized === 'in_memory' || normalized === 'in-memory') {
+    return 'memory';
+  }
+
+  if (normalized === 'redis') {
+    return 'redis';
+  }
+
+  return fallback;
 }
 
 function parseGatewayUpstreamCircuitBreakerConfig(value: unknown): GatewayUpstreamCircuitBreakerConfig {
   const raw = isPlainObject(value) ? (value as GatewayUpstreamCircuitBreakerJsonConfig) : undefined;
+  const storageRaw = isPlainObject(raw?.storage)
+    ? (raw.storage as GatewayUpstreamCircuitBreakerStorageJsonConfig)
+    : undefined;
 
   return {
     enabled: resolveBoolean(process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_ENABLED, raw?.enabled, false),
@@ -1976,8 +2395,69 @@ function parseGatewayUpstreamCircuitBreakerConfig(value: unknown): GatewayUpstre
       process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_FAILURE_STATUS_CODES,
       raw?.failureStatusCodes,
       [429, 500, 502, 503, 504]
-    )
+    ),
+    storage: parseGatewayUpstreamCircuitBreakerStorageConfig(storageRaw)
   };
+}
+
+function parseGatewayUpstreamCircuitBreakerStorageConfig(
+  value: GatewayUpstreamCircuitBreakerStorageJsonConfig | undefined
+): GatewayUpstreamCircuitBreakerConfig['storage'] {
+  const type = parseGatewayUpstreamCircuitBreakerStorageType(
+    readString(process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_STORAGE_TYPE) ||
+      readString(process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_STORAGE_BACKEND) ||
+      readString(value?.type) ||
+      readString(value?.backend),
+    'memory'
+  );
+  if (type === 'redis') {
+    return {
+      type,
+      url:
+        readString(process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_URL) ||
+        readString(value?.redisUrl) ||
+        readString(value?.url) ||
+        'redis://127.0.0.1:6379/0',
+      keyPrefix:
+        readString(process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_KEY_PREFIX) ||
+        readString(value?.keyPrefix) ||
+        readString(value?.prefix) ||
+        'next-ai:gateway:upstream-circuit-breaker',
+      connectTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_CONNECT_TIMEOUT_MS, value?.connectTimeoutMs],
+        [process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_CONNECT_TIMEOUT_SECONDS, value?.connectTimeoutSeconds],
+        1000
+      ),
+      commandTimeoutMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_COMMAND_TIMEOUT_MS, value?.commandTimeoutMs],
+        [process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_COMMAND_TIMEOUT_SECONDS, value?.commandTimeoutSeconds],
+        1000
+      ),
+      stateTtlMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_STATE_TTL_MS, value?.stateTtlMs],
+        [process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_STATE_TTL_SECONDS, value?.stateTtlSeconds],
+        86400000
+      )
+    };
+  }
+
+  return { type };
+}
+
+function parseGatewayUpstreamCircuitBreakerStorageType(
+  value: string | undefined,
+  fallback: GatewayUpstreamCircuitBreakerStorageType
+): GatewayUpstreamCircuitBreakerStorageType {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'memory' || normalized === 'in_memory' || normalized === 'in-memory') {
+    return 'memory';
+  }
+
+  if (normalized === 'redis') {
+    return 'redis';
+  }
+
+  return fallback;
 }
 
 function parseGatewayUpstreamRetryConfig(value: unknown): GatewayUpstreamRetryConfig {
@@ -2628,6 +3108,76 @@ function parseBillingTraceRequestBodyMode(
 
   if (normalized === 'full' || normalized === 'body_full' || normalized === 'true' || normalized === 'on') {
     return 'full';
+  }
+
+  return fallback;
+}
+
+function parseBillingDeliveryConfig(value: unknown): GatewayConfig['billing']['delivery'] {
+  const billing = isPlainObject(value)
+    ? (value as {
+        delivery?: unknown;
+        deliveryMode?: unknown;
+        requirePublisher?: unknown;
+        requireDelivery?: unknown;
+        requireOutbox?: unknown;
+        requireDurableOutbox?: unknown;
+        shutdownDrainTimeoutMs?: unknown;
+        shutdownDrainTimeoutSeconds?: unknown;
+      })
+    : undefined;
+  const delivery = isPlainObject(billing?.delivery)
+    ? (billing.delivery as BillingDeliveryJsonConfig)
+    : undefined;
+  return {
+    mode: parseBillingDeliveryMode(
+      readString(process.env.BILLING_DELIVERY_MODE) ||
+        readString(delivery?.mode) ||
+        readString(billing?.deliveryMode),
+      'async'
+    ),
+    requirePublisher: resolveBoolean(
+      process.env.BILLING_REQUIRE_PUBLISHER ?? process.env.BILLING_REQUIRE_DELIVERY,
+      delivery?.requirePublisher ?? delivery?.requireDelivery ?? billing?.requirePublisher ?? billing?.requireDelivery,
+      false
+    ),
+    requireOutbox: resolveBoolean(
+      process.env.BILLING_REQUIRE_OUTBOX ?? process.env.BILLING_REQUIRE_DURABLE_OUTBOX,
+      delivery?.requireOutbox ?? delivery?.requireDurableOutbox ?? billing?.requireOutbox ?? billing?.requireDurableOutbox,
+      false
+    ),
+    shutdownDrainTimeoutMs: resolvePrecheckWindowMs(
+      [process.env.BILLING_SHUTDOWN_DRAIN_TIMEOUT_MS, delivery?.shutdownDrainTimeoutMs, billing?.shutdownDrainTimeoutMs],
+      [process.env.BILLING_SHUTDOWN_DRAIN_TIMEOUT_SECONDS, delivery?.shutdownDrainTimeoutSeconds, billing?.shutdownDrainTimeoutSeconds],
+      5000
+    )
+  };
+}
+
+function parseBillingDeliveryMode(
+  value: string | undefined,
+  fallback: BillingDeliveryMode
+): BillingDeliveryMode {
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === 'await' ||
+    normalized === 'sync' ||
+    normalized === 'synchronous' ||
+    normalized === 'blocking' ||
+    normalized === 'require_success' ||
+    normalized === 'require-success'
+  ) {
+    return 'await';
+  }
+
+  if (
+    normalized === 'async' ||
+    normalized === 'asynchronous' ||
+    normalized === 'fire_and_forget' ||
+    normalized === 'fire-and-forget' ||
+    normalized === 'background'
+  ) {
+    return 'async';
   }
 
   return fallback;
@@ -4110,6 +4660,7 @@ function parseProviderPluginEntry(
   const sourceAdapters = parseModelList(item.sourceAdapters ?? item.sourceAdapter);
   const sourceRoutes = parseModelList(item.sourceRoutes ?? item.sourceRoute);
   const when = parseProviderPluginCondition(item.when);
+  const execution = parseGatewayPluginExecution(item.execution);
   const key = uniqueProviderName(keyBase, usedKeys);
 
   return {
@@ -4121,12 +4672,38 @@ function parseProviderPluginEntry(
     sourceAdapters: sourceAdapters.length > 0 ? sourceAdapters : defaults?.sourceAdapters,
     sourceRoutes: sourceRoutes.length > 0 ? sourceRoutes : defaults?.sourceRoutes,
     when,
+    execution,
     codexOauth,
     deepseekThinking,
     auth,
     request,
     response
   };
+}
+
+function parseGatewayPluginExecution(value: unknown): GatewayPluginExecutionConfig | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const raw = value as GatewayPluginExecutionJsonConfig;
+  const failureModeRaw = readString(raw.failureMode)?.trim().toLowerCase();
+  const execution: GatewayPluginExecutionConfig = {
+    timeoutMs: resolveOptionalInteger(raw.timeoutMs, 1),
+    concurrency: resolveOptionalInteger(raw.concurrency, 1),
+    maxQueueSize: resolveOptionalInteger(raw.maxQueueSize, 0),
+    failureThreshold: resolveOptionalInteger(raw.failureThreshold, 1),
+    cooldownMs: resolveOptionalInteger(raw.cooldownMs, 1),
+    failureMode: failureModeRaw === 'fail_open' || failureModeRaw === 'failopen'
+      ? 'fail_open'
+      : failureModeRaw === 'fail_closed' || failureModeRaw === 'failclosed'
+        ? 'fail_closed'
+        : undefined
+  };
+
+  return Object.values(execution).some((item) => item !== undefined)
+    ? execution
+    : undefined;
 }
 
 function parseGatewayPluginMatch(value: unknown): GatewayPluginConfig['match'] | undefined {
@@ -5184,6 +5761,16 @@ function resolveInteger(values: unknown[], fallback: number, minValue: number): 
   }
 
   return fallback;
+}
+
+function resolveOptionalInteger(value: unknown, minValue: number): number | undefined {
+  const parsed = readFiniteNumber(value);
+  if (parsed === undefined) {
+    return undefined;
+  }
+
+  const normalized = Math.trunc(parsed);
+  return normalized >= minValue ? normalized : undefined;
 }
 
 function resolveBoolean(envValue: string | undefined, fileValue: unknown, fallback: boolean): boolean {

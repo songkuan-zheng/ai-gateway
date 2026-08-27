@@ -993,8 +993,17 @@ function buildOpenAINonStreamPayloadFromCollectionState(
       completedResponse.output_text = state.outputText;
     }
     const usage = isObject(completedResponse.usage) ? completedResponse.usage : undefined;
-    completedResponse.usage = usage ? { ...state.usage, ...usage } : state.usage;
-    return normalizeOpenAIResponsesCompletedResponse(completedResponse);
+    const usageReported = Boolean(usage && Object.keys(usage).length > 0) || Object.keys(state.usage).length > 0;
+    if (usageReported) {
+      completedResponse.usage = usage ? { ...state.usage, ...usage } : state.usage;
+    } else {
+      delete completedResponse.usage;
+    }
+    const normalizedResponse = normalizeOpenAIResponsesCompletedResponse(completedResponse);
+    if (!usageReported) {
+      delete normalizedResponse.usage;
+    }
+    return normalizedResponse;
   }
 
   return {
@@ -1030,7 +1039,7 @@ function buildOpenAINonStreamPayloadFromCollectionState(
         finish_reason: state.finishReason
       }
     ],
-    usage: state.usage
+    ...(Object.keys(state.usage).length > 0 ? { usage: state.usage } : {})
   };
 }
 

@@ -13,9 +13,11 @@ yarn-error.log*
 # 环境变量
 .env
 .env.local
+.env.production
 .env.*.local
 gateway.config.json
 .agent-data/
+.raw-trace-spool/
 
 # IDE
 .vscode/

@@ -155,12 +155,12 @@ runtime.providerPlugins.register(openAIMainPlugin);
 - 支持 OpenAI/xAI 媒体端点透传与转换：OpenAI 使用 `POST /v1/videos`，xAI 使用 `POST /v1/videos/generations`；根据目标 provider 的 `openai_video_generations` / `xai_video_generations` 类型自动双向映射 `seconds` ↔ `duration`、`size` ↔ `aspect_ratio + resolution`，并转换创建及轮询响应。为避免静默改变输出，跨 provider 仅转换双方能精确表达的 4/8/12 秒及 `1280x720 ↔ 16:9/720p`、`720x1280 ↔ 9:16/720p`；OpenAI 入口省略参数时会显式带入其 4 秒、`720x1280` 默认值，xAI 入口转 OpenAI 时则要求显式提供这三个公共参数，其他组合会在网关返回明确的 400。网关不会硬编码视频模型；请求未提供 `model` 时，仅在目标 provider 恰好配置一个模型时用于选路和治理推断，否则保留上游默认语义，并在模型策略需要已知模型时 fail-closed。OpenAI JSON 扩展形式的 `input_reference.image_url` 可转换为 xAI `image`；`file_id` 属于上游本地资源，不能跨供应商复用。OpenAI multipart 转 xAI 时仅接受可无损映射的 `model`、`prompt`、`seconds`、`size`，其他字段或文件会返回 400，而不是静默丢弃；这些治理字段必须使用精确的小写名称，避免治理解析与实际转发字节产生歧义。反向的 xAI `image` / `reference_images` 也无法无损构造成 OpenAI 所需的 multipart 文件上传，这些情况都会返回明确的 400。显式的 `x-target-provider` / `x-target-providers` 不会被跨供应商自动匹配覆盖。OpenAI 的 `GET /v1/videos/:id/content` 对 OpenAI 上游流式透传，对 xAI 上游重定向至完成响应中的临时 URL；转换出的 xAI `video.url` 必须使用绝对的 `media.publicBaseUrl` 指向网关 content 路由，未配置或配置为相对地址时跨协议转换会返回明确的 400，下载时仍需携带网关认证。新生成的视频 ID 使用 AES-256-GCM 加密认证路由、模型、过期时间和身份归属信息，避免向客户端暴露内部 provider、credential 和身份指纹；迁移期间仍可读取未过期的旧 `gv2` HMAC ID。启用认证后，创建视频必须有可绑定的身份，状态/内容接口也会拒绝无归属的历史签名 ID。多实例部署必须为所有实例配置相同的 `media.videoIdSigningSecret`。
 - OpenAI 已公告 Videos API、`sora-2` 和 `sora-2-pro` 将于 2026-09-24 下线且没有替代接口；该能力应视为有明确截止日期的兼容层，并提前迁移到其他 provider（[官方下线公告](https://developers.openai.com/api/docs/deprecations#2026-03-24-sora-2-video-generation-models-and-videos-api)）。
 - 图片编辑同时支持 JSON 和原始 multipart 转发，并从 multipart 的标准 `model` / `prompt` 字段提取选路及治理元数据而不重写文件字节；multipart 的实际 `model` 必须与治理模型一致。二进制请求仍执行插件的 header/query 规则；非 strict 的 body mutation 会跳过，strict body mutation 会拒绝请求。
-- 请求失败自动 fallback：按供应商顺序逐个尝试，直到成功或全部失败。图片/视频创建属于非幂等操作：请求一旦向上游发出，网关不会做传输重试，也不会因连接结果不确定或上游非 2xx 响应而换供应商重放，以避免重复任务和重复计费。
-- 主动健康检查：manager API 可触发 provider 探测，也可通过 `providerHealthCheck.enabled=true` 启用定时探测并更新运行态 health，用于 health-aware routing。
-- 运行指标导出：可通过 `metrics.enabled=true` 开启 `GET /metrics`，输出 Prometheus 文本格式的请求计数、耗时与 provider health 指标。
-- 幂等重试保护：可通过 `idempotency.enabled=true` 启用 `Idempotency-Key` 缓存，避免 `/v1*` JSON POST 的非流式成功响应在客户端重试时重复调用上游。
+- 请求失败自动 fallback：按供应商顺序逐个尝试，直到成功或全部失败；生产多实例可使用 `scheduling.storage.type=redis` 共享 best-effort 调度提示状态，例如 credential cooldown、历史窗口计数和 cache affinity。该状态不做强一致预留；严格限流、配额和预算应使用 `precheck.storage.type=redis`。图片/视频创建属于非幂等操作：请求一旦向上游发出，网关不会做传输重试，也不会因连接结果不确定或上游非 2xx 响应而换供应商重放，以避免重复任务和重复计费。
+- 主动健康检查：manager API 可触发 provider 探测，也可通过 `providerHealthCheck.enabled=true` 启用定时探测并更新运行态 health，用于 health-aware routing；生产多实例可使用 `providerHealthCheck.storage.type=redis` 共享 provider health 状态。
+- 运行指标导出：可通过 `metrics.enabled=true` 开启 `GET /metrics`，输出 Prometheus 文本格式的请求计数、耗时与 provider health 指标；这些 counter/gauge 是实例级指标，生产需要让 Prometheus 抓取所有 gateway 实例并在监控系统聚合。
+- 幂等重试保护：可通过 `idempotency.enabled=true` 启用 `Idempotency-Key` 缓存，避免 `/v1*` JSON POST 的非流式成功响应在客户端重试时重复调用上游；`maxResponseBytes` 限制单条缓存，内存模式的 `maxTotalBytes` 限制实例缓存总量，超限响应仍正常返回但不会缓存。
 - 上游并发隔离：可通过 `upstreamConcurrency.enabled=true` 限制每个 provider 的并发上游调用数，队列等待超时后返回 429，避免单个慢上游拖垮网关。
-- 上游熔断保护：可通过 `upstreamCircuitBreaker.enabled=true` 在 provider 连续连接失败或返回指定状态码后进入冷却期，冷却期内直接 fallback 或返回 503。
+- 上游熔断保护：可通过 `upstreamCircuitBreaker.enabled=true` 在 provider 连续连接失败或返回指定状态码后进入冷却期，冷却期内直接 fallback 或返回 503；生产多实例可使用 `upstreamCircuitBreaker.storage.type=redis` 共享熔断状态。
 - 上游重试策略：`upstreamRetry` 可配置连接错误重试次数、退避参数和可选 HTTP 状态码重试；默认保留现有连接错误 2 次尝试行为，HTTP 状态码重试默认关闭。
 - 普通请求透明工具执行：`transparentToolExecution.enabled=true` 时，非流式标准化请求会自动执行已声明且可由 MCP tool provider 唯一解析的工具调用，并把 tool result 追加回模型继续生成；未知工具默认回传客户端。
 - 供应商插件扩展：支持按 `provider` / `providerName` 注入鉴权逻辑、上游请求改写、上游响应改写。
@@ -213,6 +213,33 @@ docker compose up --build
 - 不挂载源码目录或上级 workspace；只挂载只读配置模板
 - `AUTH_STATIC_API_KEYS`、`MANAGER_API_KEY`、`MCP_REMOTE_KEY`、`TOOLHUB_MANAGEMENT_TOKEN`、`OPENAI_API_KEY`、`MINIMAX_API_KEY`、`ANTHROPIC_API_KEY` 必须显式提供，没有 `change-me` 默认值
 
+### 生产 Docker Compose（Gateway-only）
+
+如果不需要本地 ToolHub 编排，使用独立生产配置：
+
+```bash
+cp .env.production.example .env.production
+# 编辑 .env.production，至少替换 AUTH_STATIC_API_KEYS、MANAGER_API_KEY、OPENAI_API_KEY
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+```
+
+生产编排默认：
+- 使用 `Dockerfile` 的 `runtime` stage，容器内以非 root `node` 用户运行
+- 只发布 `127.0.0.1:3000:3000`；对外暴露时显式设置 `GATEWAY_BIND_ADDRESS=0.0.0.0`
+- 将只读的 `gateway.config.production.json` 作为首次启动种子，实际生效配置保存在 `gateway-data` volume 的 `/data/gateway/config/gateway.config.json`
+- 以 `gateway-data` volume 持久化实际配置、raw trace spool 或 filesystem agent storage；`PUT /manager/config` 的热更新因此可以原子写入并跨重启保留
+- `read_only: true`，并只给 `/tmp` 与 `/data/gateway` 提供可写空间
+- Docker 健康检查使用 `GET /ready`；`GET /health` 仅表示进程存活。未配置 provider、所有 provider 均不可用、插件不健康，或已启用且 fail-closed 的 Redis 后端（precheck、幂等、上游并发、上游熔断）不可用时，readiness 返回 503
+- 默认使用内存状态后端；Redis 不是必需依赖
+
+多实例部署或需要跨实例共享幂等、并发、熔断、调度、健康状态时，先把 `.env.production` 中对应 `*_STORAGE_TYPE` 改为 `redis`，再启动 Redis profile：
+
+```bash
+docker compose --env-file .env.production -f docker-compose.prod.yml --profile redis up -d --build
+```
+
+如果使用外部 Redis，不需要启动 profile，只需设置 `REDIS_URL=redis://...` 并开启相应 `*_STORAGE_TYPE=redis`。
+
 ### 远端工具热插拔（方案4：ToolHub 稳定入口）
 
 为避免在 `gateway` 内频繁增删 MCP 进程，建议采用：
@@ -245,7 +272,7 @@ docker compose up --build
 - 示例文件见 `gateway.config.example.json`
 - 推荐使用 `Providers` 数组配置供应商（数组顺序即默认 fallback 顺序）
 - `Providers` 单项字段：`name`、`type`、`apikey|apiKeyEnv`、`baseurl`、`models`、`openaiChatStreamUsage`、`openaiChatReasoningSplit`、`openaiChatThinkingOptions`、`extraHeaders`、`extraBody`、`billing`
-- `plugins` 是统一插件入口；可声明 `providerHooks`，也可通过 `modulePath` 加载本地模块插件注册 `targetAdapters` / `sourceAdapters` / `providerHooks` / `billingPublishers` / `billingOutboxes` / `eventPublishers` / `eventOutboxes`，并可通过 `plugins[].config` 给模块插件透传私有配置；`sourceAdapters[].routes` 会由 gateway 动态分发，详见 [Gateway Plugins](plugins.md)
+- `plugins` 是统一插件入口；可声明 `providerHooks`，也可通过 `modulePath` 加载本地模块插件注册 `targetAdapters` / `sourceAdapters` / `providerHooks` / `requestHooks` / `requestTransforms` / `routeResolvers` / `responseHooks` / `streamHooks` / `httpRoutes` / `eventHooks` / `billingPublishers` / `billingOutboxes` / `eventPublishers` / `eventOutboxes` / `deliveryStateStores`，并可通过 `plugins[].config` 给模块插件透传私有配置；`sourceAdapters[].routes` 用于 LLM 源协议动态分发，`httpRoutes` 用于普通插件 HTTP 端点，详见 [Gateway Plugins](plugins.md)
 - `providerPlugins` 仍兼容旧配置；新配置建议迁移到 `plugins[].providerHooks`
 - `type` 同时用于声明 provider 类别和上游协议，支持：
   - OpenAI：`openai`（等价 `openai_responses`）、`openai_responses`、`openai_chat_completions`、`openai_image_generations`、`openai_video_generations`
@@ -263,6 +290,7 @@ docker compose up --build
 - `plugins[].providerHooks` / `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
 - `plugins[].providerHooks` / `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
 - `plugins[].providerHooks.codexOauth` / `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`requiredScopes`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`
+- `plugins[].providerHooks.execution` 与模块插件 hook 的 `execution` 支持 `timeoutMs`、`concurrency`、`maxQueueSize`、`failureThreshold`、`cooldownMs`、`failureMode=fail_closed|fail_open`，用于限制插件执行、超时、排队和熔断行为。
 - `virtualModelProfiles[].execution.streamMode` 默认为 `buffered`；设为 `optimistic` 时，会边转发 reasoning/text，边拦截 internal tools，并在工具结果回填后继续同一个下游流。client-visible tools 与 internal tools 可以同时配置：普通工具增量会暂存到本轮结束；Anthropic 流从首个待分类 `tool_use` 起也会暂存本轮后续内容，确认归属后按原始 block 顺序回放，并仅向客户端补发 client-visible tool calls。Anthropic server tools、结果块与 citation 等无需归属判断的原生事件在排序屏障前会保持流式转发。如果模型在同一轮同时请求 client-visible 与 internal tools，gateway 会优先把 client-visible 调用交还客户端并丢弃本轮 internal 调用，不会在缺少客户端工具结果时继续内部工具循环。Anthropic `event:error` 会作为终止事件原样转发，缺少 `message_stop` 的异常断流会以错误结束，不会生成成功尾帧。该模式支持 OpenAI Chat Completions 上游转为 Anthropic Messages 或 OpenAI Responses 下游，也支持 Anthropic Messages 上游原生转发到 Anthropic Messages 下游；存在 response transform plugin 或使用其他 source/target 协议时会回退为 buffered。
 - `providerExternal` 用于通过 HTTP/WebSocket/gRPC/stdio 从外部服务动态加载 provider、plugins、providerPlugins 与 virtualModelProfiles。
 - `billing` 支持 `cacheReadPerMillionUsd` / `cacheWritePerMillionUsd` 与 `tiers`（阶梯计费）
@@ -273,12 +301,13 @@ docker compose up --build
 - `rawTrace` 用于捕获原始请求/上游链路包；gateway 只写本地 spool bundle，`rawTrace.sync` 通过 HTTP/WebSocket/gRPC/stdio 上报 manifest，支持失败重试，由外部服务负责持久化、索引和归档。
 - `auth` 用于配置客户侧鉴权（`enabled`、`mode`、`required`、`trustedCidrs`、`identityHeaders`、`signature`、`introspection`、`staticApiKeys`）。`http_introspection` 响应中的 API Key `restrictions` 支持 `ipWhitelist|allowedIps`、`allowedOrigins|allowedDomains`、`allowedModels|modelWhitelist`、`rateLimit|requestsPerMinute`、`rateLimitWindowSeconds`，gateway 会在请求前拒绝不匹配的 IP、来源、请求/路由模型，并按 API Key 执行请求数限流。
 - `precheck` 用于请求前治理（`rateLimit`、`quota`、`budget`、`estimation`）。`precheck.storage.type` 支持 `memory` 与 `redis`；生产多实例要使用 `redis` 才能让单用户/单 Key/单 IP 的限流、配额和预算在实例间共享计数。Redis 后端通过 Lua 原子检查并预留计数，Redis 不可用时请求会 fail-closed 返回 `precheck_store_unavailable`。
-- `providerHealthCheck` 用于配置定时 provider 探测（默认关闭）：`enabled`、`intervalMs|intervalSeconds`、`timeoutMs|timeoutSeconds`、`initialDelayMs|initialDelaySeconds`。
-- `metrics` 用于配置 Prometheus 指标导出（默认关闭）：`enabled`、`includeProviderHealth`；开启后可访问 `GET /metrics`。
+- `providerHealthCheck` 用于配置定时 provider 探测（默认关闭）：`enabled`、`intervalMs|intervalSeconds`、`timeoutMs|timeoutSeconds`、`initialDelayMs|initialDelaySeconds`、`storage`；`storage.type=redis` 时会共享请求路径和定时探测更新的 provider health，health-aware routing 会在排序前读取共享状态，Redis 不可用时保留本地状态并 fail-open。
+- `metrics` 用于配置 Prometheus 指标导出（默认关闭）：`enabled`、`includeProviderHealth`；开启后可访问 `GET /metrics`。多实例部署不要只抓一个负载均衡入口实例，应按实例/pod 抓取后由 Prometheus 聚合。
 - `cors` 用于配置跨域响应头（默认开启）：`enabled`、`origins|origin`、`allowedHeaders`、`allowedMethods`、`allowCredentials`、`maxAgeSeconds|maxAge`。
-- `idempotency` 用于配置幂等重试缓存（默认关闭）：`enabled`、`headerName`、`ttlMs|ttlSeconds`、`maxEntries`、`cacheErrorResponses`；默认只缓存 `/v1*` JSON POST 的非流式成功响应。
-- `upstreamConcurrency` 用于配置 provider 维度上游并发隔离（默认关闭）：`enabled`、`maxInFlightPerProvider`、`queueTimeoutMs|queueTimeoutSeconds`。
-- `upstreamCircuitBreaker` 用于配置 provider 维度上游熔断（默认关闭）：`enabled`、`failureThreshold`、`cooldownMs|cooldownSeconds`、`failureStatusCodes`。
+- `idempotency` 用于配置幂等重试缓存（默认关闭）：`enabled`、`headerName`、`ttlMs|ttlSeconds`、`maxEntries`、`maxResponseBytes`（默认 4 MiB）、`maxTotalBytes`（内存模式默认 256 MiB）、`cacheErrorResponses`、`pendingWaitTimeoutMs|pendingWaitTimeoutSeconds`、`pollIntervalMs|pollIntervalSeconds`、`storage`；等待同一 key 的首次请求超过 `pendingWaitTimeoutMs` 时返回 `409 idempotency_request_in_progress`。`storage.type=redis` 时可跨实例共享幂等缓存，单条响应限制同样生效；`maxTotalBytes` 仅限制实例内存存储。默认只缓存 `/v1*` JSON POST 的非流式成功响应。对应环境变量为 `GATEWAY_IDEMPOTENCY_MAX_RESPONSE_BYTES` 与 `GATEWAY_IDEMPOTENCY_MAX_TOTAL_BYTES`。
+- `scheduling` 用于配置多 provider / 多 credential 调度（默认关闭）：`enabled`、`cacheAffinity`、`credentialScheduler`、`fallback`、`storage`；`storage.type=redis` 时共享 best-effort 调度提示状态，包括 credential cooldown、历史窗口计数、cache affinity 与轮询权重，Redis 不可用时退回实例本地状态。它不提供强一致 quota/reservation 语义；需要严格多实例限制时使用 `precheck.storage.type=redis`。
+- `upstreamConcurrency` 用于配置 provider 维度上游并发隔离（默认关闭）：`enabled`、`maxInFlightPerProvider`、`queueTimeoutMs|queueTimeoutSeconds`、`storage`；`storage.type=redis` 时使用 Redis lease 计数实现跨实例并发上限。
+- `upstreamCircuitBreaker` 用于配置 provider 维度上游熔断（默认关闭）：`enabled`、`failureThreshold`、`cooldownMs|cooldownSeconds`、`failureStatusCodes`、`storage`；`storage.type=redis` 时使用 Redis 共享 provider 熔断状态，Redis 不可用时检查 fail-closed 返回 503，记录成功/失败为 best-effort。
 - `upstreamRetry` 用于配置上游传输重试：`enabled`、`maxAttempts`、`baseDelayMs|baseDelaySeconds`、`maxDelayMs|maxDelaySeconds`、`backoffMultiplier`、`jitterMs|jitterSeconds`、`retryStatusCodes`。
 - `media` 用于配置媒体公开地址和加密认证视频 ID：`publicBaseUrl`、`videoIdSigningSecret`、`videoIdTtlMs|videoIdTtlSeconds`。`publicBaseUrl` 必须是无 query、无 fragment 的绝对 HTTP(S) URL。`videoIdSigningSecret` 的名称为兼容现有配置而保留，当前同时作为视频 ID 的加密认证密钥材料；未配置时使用进程级临时密钥，进程重启后旧 ID 会失效。生产环境和多实例必须共享足够强度的固定密钥。启用网关鉴权后，视频创建必须解析出身份，状态/内容接口只接受带匹配归属信息的网关视频 ID，不接受无归属签名 ID 或裸上游 ID。不要从请求 `Host` 推导公开地址。
 - provider 的 `billing.default` / `billing.byModel` 可配置 `videoPerSecondUsd` 作为视频每秒兜底价格，并可通过 `videoPerSecondUsdBySize` 按分辨率覆盖（例如 `{"720x1280":0.3,"1024x1792":0.5}`）；预算检查、计费响应头和事件均以 provider `extraBody` 与 request plugin 处理后的最终模型、时长和分辨率为准。xAI 响应中的 `usage.cost_in_usd_ticks` 会按完整的 10 位小数精度作为实际费用（`10^10` ticks = 1 USD）写入计费响应头和事件。
@@ -360,7 +389,7 @@ docker compose up --build
 - `MCP_GATEWAY_OAUTH_REFRESH_TOKEN_TTL_SEC`：refresh token 有效期秒数（默认 `2592000`）
 - `DEFAULT_TARGET_PROVIDER`：默认目标 provider（`openai|anthropic|gemini`）
 - `DEFAULT_TARGET_PROVIDERS`：默认目标 provider 列表（逗号分隔，如 `openai,anthropic,gemini`）
-- `UPSTREAM_TIMEOUT_MS`：模型上游请求超时毫秒；未配置或设为 `0` 时禁用网关侧固定超时，负数或无效值会被忽略并回退到配置文件值/默认值 `0`
+- `UPSTREAM_TIMEOUT_MS`：模型上游请求超时毫秒；默认 `60000`，显式设为 `0` 时禁用普通 HTTP 上游请求的网关侧固定超时，负数或无效值会被忽略并回退到配置文件值/默认值。Responses WebSocket 上游握手始终有界：使用正的配置值（最长 5 分钟），为 `0` 或无效时使用 60 秒
 - `CCR_UPSTREAM_PROXY_URL`：模型上游请求代理地址；优先级高于标准 proxy 环境变量，仍会遵循 `no_proxy` / `NO_PROXY`
 - `http_proxy` / `HTTP_PROXY`、`https_proxy` / `HTTPS_PROXY`、`all_proxy` / `ALL_PROXY`、`no_proxy` / `NO_PROXY`：模型上游请求的标准代理配置；小写变量优先于大写变量，`all_proxy` 作为 HTTP/HTTPS 代理回退值
 - `GATEWAY_TRUSTED_PROXY_CIDRS`：可信反向代理来源网段（逗号分隔）；用于解析 usage/billing 上报事件中的 `clientIp`
@@ -501,6 +530,11 @@ docker compose up --build
 - `BILLING_WEBHOOK_REQUIRE_ACK` / `BILLING_WEBHOOK_WEBSOCKET_REQUIRE_ACK`：WebSocket transport 是否等待接收端 ACK 消息，默认 `false`
 - `BILLING_WEBHOOK_API_KEY_HEADER` / `BILLING_WEBHOOK_API_KEY`：可选，用于给 webhook 请求增加共享密钥头。
 - `BILLING_WEBHOOK_AUTHORIZATION`：可选，用于给 webhook 请求增加 `Authorization` 头。
+- `BILLING_DELIVERY_MODE`：计费事件投递模式，`async`（默认）为后台投递，`await` 会在非流式响应返回前等待投递结果。开启任一强制投递选项时会自动按 `await` 执行，不能被 `async` 绕过。
+- `BILLING_REQUIRE_PUBLISHER` / `BILLING_REQUIRE_OUTBOX`：启动和热更新时强制要求至少存在对应的计费投递能力；`BILLING_REQUIRE_OUTBOX=true` 时，每个成功响应都必须由插件 outbox 自身确认写入，其他 webhook/publisher 的成功不会掩盖 outbox 失败。该模式适合账务必须先进入持久 outbox 的生产部署，并会拒绝无法事后确认计费的实时流式响应。
+- `BILLING_REQUIRE_USAGE`：开启后，成功响应无法解析 usage 时会失败，避免静默漏计费。
+- `BILLING_REQUIRE_RATES`：开启后，有 token/video 用量但本地费率计算为 0 时会失败；provider 已上报实际 cost 的响应不受本地费率限制。
+- `BILLING_SHUTDOWN_DRAIN_TIMEOUT_MS`：服务关闭或重新初始化计费发布器时等待后台计费投递完成的时间，默认 `5000`。
 
 ### Agent 事件队列兼容项
 
@@ -548,6 +582,7 @@ docker compose up --build
 ## 路由
 
 - `GET /health`
+- `GET /ready`：readiness 探针；未配置 provider、所有 provider 均不可用、插件不健康，或已启用且 fail-closed 的 Redis 后端不可用时返回 503；响应中的 `dependencies` 不包含 Redis URL 或凭据
 - `GET /metrics`（需 `metrics.enabled=true`）
 - `GET /`
 - `GET /v1/models`：模型列表接口，默认返回 OpenAI 格式；携带 `anthropic-version`/`anthropic-beta` 或 `?format=anthropic` 时返回 Anthropic 格式。
@@ -747,7 +782,7 @@ curl -s http://localhost:3000/agent/sessions/demo/events?limit=20
 
 ### 计费 Webhook 事件（下游集成）
 
-- 请求成功且计费开启时，网关会异步通过 `billingWebhook` 配置的 HTTP/WebSocket/gRPC/stdio transport 投递计费事件；投递失败不会影响主请求返回。
+- 请求成功且计费开启时，网关会通过 `billingWebhook` 或插件 `billingOutboxes` / `billingPublishers` 投递计费事件；默认 `billing.delivery.mode=async` 不阻塞主请求，设置为 `await` 后非流式响应会在返回前等待投递结果。非严格模式下，WebSocket `/v1/responses` 会在上游 `response.completed` 携带 usage 时发布计费事件；启用 `requireUsage`、`requireRates`、`delivery.mode=await`、`requirePublisher` 或 `requireOutbox` 任一严格计费约束时，网关会在升级前以 HTTP 400 拒绝 Responses WebSocket，避免在计费确认前泄露输出。
 - 事件结构示例：
 
 ```json

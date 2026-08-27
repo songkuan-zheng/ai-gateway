@@ -1,8 +1,42 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseGatewayConfigFromRaw } from './config';
 
+const productionConfigEnvOverrides = [
+  'HOST',
+  'PORT',
+  'DEFAULT_TARGET_PROVIDER',
+  'DEFAULT_TARGET_PROVIDERS',
+  'DEFAULT_OPENAI_MODEL',
+  'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
+  'AUTH_ENABLED',
+  'AUTH_REQUIRED',
+  'RAW_TRACE_MODE',
+  'RAW_TRACE_ENABLED',
+  'RAW_TRACE_SPOOL_DIR',
+  'RAW_TRACE_MAX_PART_BYTES',
+  'RAW_TRACE_UPLOADER_CONCURRENCY',
+  'RAW_TRACE_UPLOAD_MAX_ATTEMPTS',
+  'RAW_TRACE_UPLOAD_BASE_DELAY_MS',
+  'RAW_TRACE_SYNC_ENABLED',
+  'RAW_TRACE_SYNC_API_KEY_HEADER',
+  'RAW_TRACE_SYNC_API_KEY',
+  'RAW_TRACE_SYNC_AUTHORIZATION',
+  'GATEWAY_SYNC_API_KEY',
+  'BILLING_ENABLED'
+] as const;
+
+function clearProductionConfigEnvOverrides(): void {
+  for (const name of productionConfigEnvOverrides) {
+    delete process.env[name];
+  }
+}
+
 describe('Gateway config providerPlugins', () => {
   afterEach(() => {
+    clearProductionConfigEnvOverrides();
     delete process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE;
     delete process.env.MCP_GATEWAY_WS_ENDPOINT;
     delete process.env.PRECHECK_STORAGE_TYPE;
@@ -23,6 +57,16 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.PROVIDER_HEALTH_CHECK_TIMEOUT_SECONDS;
     delete process.env.PROVIDER_HEALTH_CHECK_INITIAL_DELAY_MS;
     delete process.env.PROVIDER_HEALTH_CHECK_INITIAL_DELAY_SECONDS;
+    delete process.env.PROVIDER_HEALTH_CHECK_STORAGE_TYPE;
+    delete process.env.PROVIDER_HEALTH_CHECK_STORAGE_BACKEND;
+    delete process.env.PROVIDER_HEALTH_CHECK_REDIS_URL;
+    delete process.env.PROVIDER_HEALTH_CHECK_REDIS_KEY_PREFIX;
+    delete process.env.PROVIDER_HEALTH_CHECK_REDIS_CONNECT_TIMEOUT_MS;
+    delete process.env.PROVIDER_HEALTH_CHECK_REDIS_CONNECT_TIMEOUT_SECONDS;
+    delete process.env.PROVIDER_HEALTH_CHECK_REDIS_COMMAND_TIMEOUT_MS;
+    delete process.env.PROVIDER_HEALTH_CHECK_REDIS_COMMAND_TIMEOUT_SECONDS;
+    delete process.env.PROVIDER_HEALTH_CHECK_REDIS_STATE_TTL_MS;
+    delete process.env.PROVIDER_HEALTH_CHECK_REDIS_STATE_TTL_SECONDS;
     delete process.env.GATEWAY_METRICS_ENABLED;
     delete process.env.GATEWAY_METRICS_INCLUDE_PROVIDER_HEALTH;
     delete process.env.GATEWAY_LOG_ENABLED;
@@ -41,7 +85,21 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_IDEMPOTENCY_TTL_MS;
     delete process.env.GATEWAY_IDEMPOTENCY_TTL_SECONDS;
     delete process.env.GATEWAY_IDEMPOTENCY_MAX_ENTRIES;
+    delete process.env.GATEWAY_IDEMPOTENCY_MAX_RESPONSE_BYTES;
+    delete process.env.GATEWAY_IDEMPOTENCY_MAX_TOTAL_BYTES;
     delete process.env.GATEWAY_IDEMPOTENCY_CACHE_ERROR_RESPONSES;
+    delete process.env.GATEWAY_IDEMPOTENCY_PENDING_WAIT_TIMEOUT_MS;
+    delete process.env.GATEWAY_IDEMPOTENCY_PENDING_WAIT_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_IDEMPOTENCY_POLL_INTERVAL_MS;
+    delete process.env.GATEWAY_IDEMPOTENCY_POLL_INTERVAL_SECONDS;
+    delete process.env.GATEWAY_IDEMPOTENCY_STORAGE_TYPE;
+    delete process.env.GATEWAY_IDEMPOTENCY_STORAGE_BACKEND;
+    delete process.env.GATEWAY_IDEMPOTENCY_REDIS_URL;
+    delete process.env.GATEWAY_IDEMPOTENCY_REDIS_KEY_PREFIX;
+    delete process.env.GATEWAY_IDEMPOTENCY_REDIS_CONNECT_TIMEOUT_MS;
+    delete process.env.GATEWAY_IDEMPOTENCY_REDIS_CONNECT_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_IDEMPOTENCY_REDIS_COMMAND_TIMEOUT_MS;
+    delete process.env.GATEWAY_IDEMPOTENCY_REDIS_COMMAND_TIMEOUT_SECONDS;
     delete process.env.GATEWAY_PUBLIC_BASE_URL;
     delete process.env.GATEWAY_VIDEO_ID_SIGNING_SECRET;
     delete process.env.GATEWAY_VIDEO_ID_TTL_MS;
@@ -51,11 +109,33 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_UPSTREAM_MAX_IN_FLIGHT_PER_PROVIDER;
     delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_QUEUE_TIMEOUT_MS;
     delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_QUEUE_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_STORAGE_TYPE;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_STORAGE_BACKEND;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_URL;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_KEY_PREFIX;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_CONNECT_TIMEOUT_MS;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_CONNECT_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_COMMAND_TIMEOUT_MS;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_COMMAND_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_LEASE_TTL_MS;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_LEASE_TTL_SECONDS;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_POLL_INTERVAL_MS;
+    delete process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_POLL_INTERVAL_SECONDS;
     delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_ENABLED;
     delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
     delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_COOLDOWN_MS;
     delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_COOLDOWN_SECONDS;
     delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_FAILURE_STATUS_CODES;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_STORAGE_TYPE;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_STORAGE_BACKEND;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_URL;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_KEY_PREFIX;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_CONNECT_TIMEOUT_MS;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_CONNECT_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_COMMAND_TIMEOUT_MS;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_COMMAND_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_STATE_TTL_MS;
+    delete process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_STATE_TTL_SECONDS;
     delete process.env.GATEWAY_UPSTREAM_RETRY_ENABLED;
     delete process.env.GATEWAY_UPSTREAM_RETRY_MAX_ATTEMPTS;
     delete process.env.GATEWAY_UPSTREAM_RETRY_BASE_DELAY_MS;
@@ -91,6 +171,16 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_SCHEDULING_FALLBACK_PRESERVE_CACHE;
     delete process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_CACHE_WAIT_MS;
     delete process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_CACHE_WAIT_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_STORAGE_TYPE;
+    delete process.env.GATEWAY_SCHEDULING_STORAGE_BACKEND;
+    delete process.env.GATEWAY_SCHEDULING_REDIS_URL;
+    delete process.env.GATEWAY_SCHEDULING_REDIS_KEY_PREFIX;
+    delete process.env.GATEWAY_SCHEDULING_REDIS_CONNECT_TIMEOUT_MS;
+    delete process.env.GATEWAY_SCHEDULING_REDIS_CONNECT_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_REDIS_COMMAND_TIMEOUT_MS;
+    delete process.env.GATEWAY_SCHEDULING_REDIS_COMMAND_TIMEOUT_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_REDIS_STATE_TTL_MS;
+    delete process.env.GATEWAY_SCHEDULING_REDIS_STATE_TTL_SECONDS;
     delete process.env.GATEWAY_TRUSTED_PROXY_CIDRS;
     delete process.env.TRUSTED_PROXY_CIDRS;
     delete process.env.GATEWAY_TRUSTED_PROXY_HEADER;
@@ -158,6 +248,16 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.BILLING_TRACE_REQUEST_BODY_MODE;
     delete process.env.BILLING_TRACE_REQUEST_BODY;
     delete process.env.BILLING_TRACE_INCLUDE_REQUEST_BODY;
+    delete process.env.BILLING_DELIVERY_MODE;
+    delete process.env.BILLING_REQUIRE_PUBLISHER;
+    delete process.env.BILLING_REQUIRE_DELIVERY;
+    delete process.env.BILLING_REQUIRE_OUTBOX;
+    delete process.env.BILLING_REQUIRE_DURABLE_OUTBOX;
+    delete process.env.BILLING_REQUIRE_USAGE;
+    delete process.env.BILLING_REQUIRE_RATES;
+    delete process.env.BILLING_REQUIRE_NON_ZERO_RATES;
+    delete process.env.BILLING_SHUTDOWN_DRAIN_TIMEOUT_MS;
+    delete process.env.BILLING_SHUTDOWN_DRAIN_TIMEOUT_SECONDS;
     delete process.env.RAW_TRACE_SYNC_TRANSPORT;
     delete process.env.RAW_TRACE_SYNC_ENDPOINT;
     delete process.env.RAW_TRACE_SYNC_URL;
@@ -186,6 +286,52 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.PROVIDER_EXTERNAL_STDIO_ARGS;
     delete process.env.PROVIDER_EXTERNAL_STDIO_CWD;
     delete process.env.UPSTREAM_TIMEOUT_MS;
+  });
+
+  it('parses the production Docker gateway config', () => {
+    clearProductionConfigEnvOverrides();
+
+    const raw = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'gateway.config.production.json'), 'utf8')
+    ) as unknown;
+    const config = parseGatewayConfigFromRaw(raw);
+
+    expect(config.host).toBe('0.0.0.0');
+    expect(config.port).toBe(3000);
+    expect(config.defaultTargetProvider).toBe('openai');
+    expect(config.defaultOpenAIModel).toBe('gpt-4.1-mini');
+    expect(config.openaiBaseUrl).toBe('https://api.openai.com/v1');
+    expect(config.providers).toHaveLength(1);
+    expect(config.providers[0]).toMatchObject({
+      name: 'openai-main',
+      type: 'openai_responses',
+      apiKeyEnv: 'OPENAI_API_KEY',
+      models: ['gpt-4.1-mini']
+    });
+    expect(config.auth).toMatchObject({
+      enabled: true,
+      mode: 'static_api_key',
+      required: true,
+      staticApiKeys: {
+        keys: [],
+        keyEnv: 'AUTH_STATIC_API_KEYS',
+        keyHeader: 'authorization',
+        keyBearerOnly: true
+      }
+    });
+    expect(config.rawTrace).toMatchObject({
+      enabled: false,
+      spoolDir: '/data/gateway/raw-trace'
+    });
+    expect(config.upstreamConcurrency).toMatchObject({
+      enabled: true,
+      maxInFlightPerProvider: 100,
+      storage: {
+        type: 'memory'
+      }
+    });
+    expect(config.idempotency.storage).toEqual({ type: 'memory' });
+    expect(config.providerHealthCheck.storage).toEqual({ type: 'memory' });
   });
 
   it('parses trusted reverse proxy settings from config and env', () => {
@@ -218,12 +364,16 @@ describe('Gateway config providerPlugins', () => {
     ).toThrow(/trustedProxyHeader must be one of/);
   });
 
-  it('does not allow negative upstream timeout values', () => {
-    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: -1 }).upstreamTimeoutMs).toBe(0);
+  it('falls back to a bounded upstream timeout for invalid values and allows explicit zero', () => {
+    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: -1 }).upstreamTimeoutMs).toBe(60000);
+    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: 0 }).upstreamTimeoutMs).toBe(0);
 
     process.env.UPSTREAM_TIMEOUT_MS = '-5';
-    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: -1 }).upstreamTimeoutMs).toBe(0);
+    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: -1 }).upstreamTimeoutMs).toBe(60000);
     expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: 5000 }).upstreamTimeoutMs).toBe(5000);
+
+    process.env.UPSTREAM_TIMEOUT_MS = '0';
+    expect(parseGatewayConfigFromRaw({ upstreamTimeoutMs: 5000 }).upstreamTimeoutMs).toBe(0);
   });
 
   it('defaults billing trace request body capture to disabled', () => {
@@ -274,6 +424,37 @@ describe('Gateway config providerPlugins', () => {
       }
     });
     expect(fromEnv.billing.trace?.requestBodyMode).toBe('disabled');
+  });
+
+  it('parses billing delivery strictness and env overrides', () => {
+    process.env.BILLING_DELIVERY_MODE = 'await';
+    process.env.BILLING_REQUIRE_PUBLISHER = 'true';
+    process.env.BILLING_REQUIRE_OUTBOX = 'true';
+    process.env.BILLING_REQUIRE_USAGE = 'true';
+    process.env.BILLING_REQUIRE_RATES = 'true';
+    process.env.BILLING_SHUTDOWN_DRAIN_TIMEOUT_MS = '2500';
+
+    const config = parseGatewayConfigFromRaw({
+      billing: {
+        delivery: {
+          mode: 'async',
+          requirePublisher: false,
+          requireOutbox: false,
+          shutdownDrainTimeoutMs: 100
+        },
+        requireUsage: false,
+        requireRates: false
+      }
+    });
+
+    expect(config.billing.delivery).toEqual({
+      mode: 'await',
+      requirePublisher: true,
+      requireOutbox: true,
+      shutdownDrainTimeoutMs: 2500
+    });
+    expect(config.billing.requireUsage).toBe(true);
+    expect(config.billing.requireRates).toBe(true);
   });
 
   it('resolves provider api keys from apiKeyEnv', () => {
@@ -480,6 +661,9 @@ describe('Gateway config providerPlugins', () => {
         crossProviderStatusCodes: [401, 403, 404, 429, 500, 502, 503, 504],
         preserveCache: 'prefer',
         maxCacheWaitMs: 3000
+      },
+      storage: {
+        type: 'memory'
       }
     });
   });
@@ -514,6 +698,14 @@ describe('Gateway config providerPlugins', () => {
           crossProviderStatusCodes: [401, 429],
           preserveCache: 'strict',
           maxCacheWaitSeconds: 1
+        },
+        storage: {
+          type: 'redis',
+          url: 'redis://redis.example:6379/7',
+          keyPrefix: 'test:scheduling',
+          connectTimeoutMs: 150,
+          commandTimeoutMs: 200,
+          stateTtlMs: 300000
         }
       },
       providers: [
@@ -577,6 +769,14 @@ describe('Gateway config providerPlugins', () => {
         crossProviderStatusCodes: [401, 429],
         preserveCache: 'strict',
         maxCacheWaitMs: 1000
+      },
+      storage: {
+        type: 'redis',
+        url: 'redis://redis.example:6379/7',
+        keyPrefix: 'test:scheduling',
+        connectTimeoutMs: 150,
+        commandTimeoutMs: 200,
+        stateTtlMs: 300000
       }
     });
     expect(config.providers[0]?.cache).toEqual({
@@ -1530,7 +1730,10 @@ describe('Gateway config providerPlugins', () => {
       enabled: true,
       intervalMs: 45000,
       timeoutMs: 2500,
-      initialDelayMs: 3000
+      initialDelayMs: 3000,
+      storage: {
+        type: 'memory'
+      }
     });
     expect(config.precheck.rateLimit).toMatchObject({
       enabled: true,
@@ -1639,13 +1842,22 @@ describe('Gateway config providerPlugins', () => {
     process.env.PROVIDER_HEALTH_CHECK_INTERVAL_MS = '30000';
     process.env.PROVIDER_HEALTH_CHECK_TIMEOUT_MS = '1200';
     process.env.PROVIDER_HEALTH_CHECK_INITIAL_DELAY_MS = '500';
+    process.env.PROVIDER_HEALTH_CHECK_STORAGE_TYPE = 'redis';
+    process.env.PROVIDER_HEALTH_CHECK_REDIS_URL = 'redis://redis.example:6379/6';
+    process.env.PROVIDER_HEALTH_CHECK_REDIS_KEY_PREFIX = 'env:provider-health';
+    process.env.PROVIDER_HEALTH_CHECK_REDIS_CONNECT_TIMEOUT_MS = '150';
+    process.env.PROVIDER_HEALTH_CHECK_REDIS_COMMAND_TIMEOUT_MS = '200';
+    process.env.PROVIDER_HEALTH_CHECK_REDIS_STATE_TTL_MS = '300000';
 
     const config = parseGatewayConfigFromRaw({
       providerHealthCheck: {
         enabled: false,
         intervalMs: 60000,
         timeoutMs: 5000,
-        initialDelayMs: 0
+        initialDelayMs: 0,
+        storage: {
+          type: 'memory'
+        }
       }
     });
 
@@ -1653,7 +1865,15 @@ describe('Gateway config providerPlugins', () => {
       enabled: true,
       intervalMs: 30000,
       timeoutMs: 1200,
-      initialDelayMs: 500
+      initialDelayMs: 500,
+      storage: {
+        type: 'redis',
+        url: 'redis://redis.example:6379/6',
+        keyPrefix: 'env:provider-health',
+        connectTimeoutMs: 150,
+        commandTimeoutMs: 200,
+        stateTtlMs: 300000
+      }
     });
   });
 
@@ -1707,7 +1927,16 @@ describe('Gateway config providerPlugins', () => {
     process.env.GATEWAY_IDEMPOTENCY_HEADER = 'X-Request-Idempotency-Key';
     process.env.GATEWAY_IDEMPOTENCY_TTL_MS = '120000';
     process.env.GATEWAY_IDEMPOTENCY_MAX_ENTRIES = '25';
+    process.env.GATEWAY_IDEMPOTENCY_MAX_RESPONSE_BYTES = '4096';
+    process.env.GATEWAY_IDEMPOTENCY_MAX_TOTAL_BYTES = '65536';
     process.env.GATEWAY_IDEMPOTENCY_CACHE_ERROR_RESPONSES = 'true';
+    process.env.GATEWAY_IDEMPOTENCY_PENDING_WAIT_TIMEOUT_MS = '1500';
+    process.env.GATEWAY_IDEMPOTENCY_POLL_INTERVAL_MS = '25';
+    process.env.GATEWAY_IDEMPOTENCY_STORAGE_TYPE = 'redis';
+    process.env.GATEWAY_IDEMPOTENCY_REDIS_URL = 'redis://redis.example:6379/3';
+    process.env.GATEWAY_IDEMPOTENCY_REDIS_KEY_PREFIX = 'env:idem';
+    process.env.GATEWAY_IDEMPOTENCY_REDIS_CONNECT_TIMEOUT_MS = '250';
+    process.env.GATEWAY_IDEMPOTENCY_REDIS_COMMAND_TIMEOUT_MS = '350';
 
     const config = parseGatewayConfigFromRaw({
       idempotency: {
@@ -1715,7 +1944,14 @@ describe('Gateway config providerPlugins', () => {
         headerName: 'idempotency-key',
         ttlMs: 1000,
         maxEntries: 10,
-        cacheErrorResponses: false
+        maxResponseBytes: 1024,
+        maxTotalBytes: 8192,
+        cacheErrorResponses: false,
+        pendingWaitTimeoutMs: 100,
+        pollIntervalMs: 10,
+        storage: {
+          type: 'memory'
+        }
       }
     });
 
@@ -1724,7 +1960,18 @@ describe('Gateway config providerPlugins', () => {
       headerName: 'X-Request-Idempotency-Key',
       ttlMs: 120000,
       maxEntries: 25,
-      cacheErrorResponses: true
+      maxResponseBytes: 4096,
+      maxTotalBytes: 65536,
+      cacheErrorResponses: true,
+      pendingWaitTimeoutMs: 1500,
+      pollIntervalMs: 25,
+      storage: {
+        type: 'redis',
+        url: 'redis://redis.example:6379/3',
+        keyPrefix: 'env:idem',
+        connectTimeoutMs: 250,
+        commandTimeoutMs: 350
+      }
     });
   });
 
@@ -1792,19 +2039,38 @@ describe('Gateway config providerPlugins', () => {
     process.env.GATEWAY_UPSTREAM_CONCURRENCY_ENABLED = 'true';
     process.env.GATEWAY_UPSTREAM_MAX_IN_FLIGHT_PER_PROVIDER = '3';
     process.env.GATEWAY_UPSTREAM_CONCURRENCY_QUEUE_TIMEOUT_MS = '250';
+    process.env.GATEWAY_UPSTREAM_CONCURRENCY_STORAGE_TYPE = 'redis';
+    process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_URL = 'redis://redis.example:6379/4';
+    process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_KEY_PREFIX = 'env:upstream';
+    process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_CONNECT_TIMEOUT_MS = '150';
+    process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_COMMAND_TIMEOUT_MS = '200';
+    process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_LEASE_TTL_MS = '30000';
+    process.env.GATEWAY_UPSTREAM_CONCURRENCY_REDIS_POLL_INTERVAL_MS = '15';
 
     const config = parseGatewayConfigFromRaw({
       upstreamConcurrency: {
         enabled: false,
         maxInFlightPerProvider: 10,
-        queueTimeoutMs: 1000
+        queueTimeoutMs: 1000,
+        storage: {
+          type: 'memory'
+        }
       }
     });
 
     expect(config.upstreamConcurrency).toEqual({
       enabled: true,
       maxInFlightPerProvider: 3,
-      queueTimeoutMs: 250
+      queueTimeoutMs: 250,
+      storage: {
+        type: 'redis',
+        url: 'redis://redis.example:6379/4',
+        keyPrefix: 'env:upstream',
+        connectTimeoutMs: 150,
+        commandTimeoutMs: 200,
+        leaseTtlMs: 30000,
+        pollIntervalMs: 15
+      }
     });
   });
 
@@ -1813,13 +2079,22 @@ describe('Gateway config providerPlugins', () => {
     process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_FAILURE_THRESHOLD = '2';
     process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_COOLDOWN_MS = '5000';
     process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_FAILURE_STATUS_CODES = '500,503,504';
+    process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_STORAGE_TYPE = 'redis';
+    process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_URL = 'redis://redis.example:6379/5';
+    process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_KEY_PREFIX = 'env:circuit';
+    process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_CONNECT_TIMEOUT_MS = '150';
+    process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_COMMAND_TIMEOUT_MS = '200';
+    process.env.GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_STATE_TTL_MS = '30000';
 
     const config = parseGatewayConfigFromRaw({
       upstreamCircuitBreaker: {
         enabled: false,
         failureThreshold: 5,
         cooldownMs: 30000,
-        failureStatusCodes: [429, 500]
+        failureStatusCodes: [429, 500],
+        storage: {
+          type: 'memory'
+        }
       }
     });
 
@@ -1827,7 +2102,15 @@ describe('Gateway config providerPlugins', () => {
       enabled: true,
       failureThreshold: 2,
       cooldownMs: 5000,
-      failureStatusCodes: [500, 503, 504]
+      failureStatusCodes: [500, 503, 504],
+      storage: {
+        type: 'redis',
+        url: 'redis://redis.example:6379/5',
+        keyPrefix: 'env:circuit',
+        connectTimeoutMs: 150,
+        commandTimeoutMs: 200,
+        stateTtlMs: 30000
+      }
     });
   });
 

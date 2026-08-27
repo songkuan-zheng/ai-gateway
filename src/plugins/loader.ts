@@ -5,8 +5,12 @@ import type {
   GatewayConfig,
   GatewayPluginConfig,
   GatewayPluginEventHook,
+  GatewayPluginHttpRoute,
   GatewayPluginManifest,
   GatewayPluginRequestHook,
+  GatewayPluginRequestTransform,
+  GatewayPluginResponseHook,
+  GatewayPluginRouteResolver,
   GatewayPluginStreamHook,
   ProviderConfig,
   ProviderPlugin,
@@ -18,11 +22,13 @@ import type { GatewayRuntime, VirtualModelProfileRegistry } from '../gateway/run
 import { resolveTargetAdapterKeys } from '../adapters/registry';
 import {
   closeGatewayPluginExtensions,
+  configureGatewayPluginDeliveryStateStores,
   GatewayPluginExtensionRegistry,
   initializeGatewayPluginExtensions,
   type GatewayPluginEventPublisher,
   type GatewayPluginExtension,
-  type GatewayPluginOutbox
+  type GatewayPluginOutbox,
+  type GatewayPluginDeliveryStateStore
 } from './events';
 
 export interface GatewayPluginLoaderLogger {
@@ -42,7 +48,11 @@ export interface GatewayPluginModuleResult {
   providerHooks?: ProviderPlugin[];
   providerPlugins?: ProviderPlugin[];
   requestHooks?: GatewayPluginRequestHook[];
+  requestTransforms?: GatewayPluginRequestTransform[];
+  routeResolvers?: GatewayPluginRouteResolver[];
+  responseHooks?: GatewayPluginResponseHook[];
   streamHooks?: GatewayPluginStreamHook[];
+  httpRoutes?: GatewayPluginHttpRoute[];
   billingEventHooks?: GatewayPluginEventHook[];
   eventHooks?: GatewayPluginEventHook[];
   agentEventHooks?: GatewayPluginEventHook[];
@@ -53,6 +63,7 @@ export interface GatewayPluginModuleResult {
   eventOutboxes?: GatewayPluginOutbox[];
   agentEventPublishers?: GatewayPluginEventPublisher[];
   agentEventOutboxes?: GatewayPluginOutbox[];
+  deliveryStateStores?: GatewayPluginDeliveryStateStore[];
 }
 
 type GatewayPluginFactory = (
@@ -84,7 +95,11 @@ interface RegisteredModulePluginState {
   targetAdapters: RegistrySnapshot<TargetAdapter>[];
   providerPlugins: RegistrySnapshot<ProviderPlugin>[];
   requestHooks: RegistrySnapshot<GatewayPluginRequestHook>[];
+  requestTransforms: RegistrySnapshot<GatewayPluginRequestTransform>[];
+  routeResolvers: RegistrySnapshot<GatewayPluginRouteResolver>[];
+  responseHooks: RegistrySnapshot<GatewayPluginResponseHook>[];
   streamHooks: RegistrySnapshot<GatewayPluginStreamHook>[];
+  httpRoutes: RegistrySnapshot<GatewayPluginHttpRoute>[];
   billingEventHooks: RegistrySnapshot<GatewayPluginEventHook>[];
   agentEventHooks: RegistrySnapshot<GatewayPluginEventHook>[];
   virtualModelProfiles: RegistrySnapshot<VirtualModelProfileConfig>[];
@@ -92,6 +107,7 @@ interface RegisteredModulePluginState {
   billingOutboxes: RegistrySnapshot<GatewayPluginOutbox>[];
   agentEventPublishers: RegistrySnapshot<GatewayPluginEventPublisher>[];
   agentEventOutboxes: RegistrySnapshot<GatewayPluginOutbox>[];
+  deliveryStateStores: RegistrySnapshot<GatewayPluginDeliveryStateStore>[];
 }
 
 interface LoadedGatewayPluginModule {
@@ -99,15 +115,32 @@ interface LoadedGatewayPluginModule {
   result: GatewayPluginModuleResult;
 }
 
+export interface GatewayPluginModulePreview {
+  billingPublishers: GatewayPluginEventPublisher[];
+  billingOutboxes: GatewayPluginOutbox[];
+}
+
+export interface GatewayPluginModuleSyncOptions {
+  beforeSwap?: (preview: GatewayPluginModulePreview) => void | Promise<void>;
+}
+
 const registeredModulePluginState = new WeakMap<GatewayRuntime, RegisteredModulePluginState>();
 
 export async function syncGatewayPluginModulesFromConfig(
   runtime: GatewayRuntime,
   config: GatewayConfig,
-  logger?: GatewayPluginLoaderLogger
+  logger?: GatewayPluginLoaderLogger,
+  options: GatewayPluginModuleSyncOptions = {}
 ): Promise<void> {
   const loadedModules: LoadedGatewayPluginModule[] = [];
   const initializedModuleExtensions: GatewayPluginExtension[] = [];
+  const activeExtensions = new Set<GatewayPluginExtension>([
+    ...runtime.billingPublishers.list(),
+    ...runtime.billingOutboxes.list(),
+    ...runtime.agentEventPublishers.list(),
+    ...runtime.agentEventOutboxes.list(),
+    ...runtime.deliveryStateStores.list()
+  ]);
   try {
     for (const plugin of config.plugins || []) {
       if (!plugin.enabled || !plugin.modulePath) {
@@ -123,12 +156,18 @@ export async function syncGatewayPluginModulesFromConfig(
         result
       });
     }
+    await options.beforeSwap?.({
+      billingPublishers: loadedModules.flatMap(({ result }) => result.billingPublishers || []),
+      billingOutboxes: loadedModules.flatMap(({ result }) => result.billingOutboxes || [])
+    });
   } catch (error) {
-    await closeGatewayPluginExtensions(initializedModuleExtensions);
+    await closeGatewayPluginExtensions(
+      initializedModuleExtensions.filter((extension) => !activeExtensions.has(extension))
+    );
     throw error;
   }
 
-  await unregisterPreviousModulePlugins(runtime, config);
+  await unregisterPreviousModulePlugins(runtime, config, new Set(initializedModuleExtensions));
 
   const registered: RegisteredModulePluginState = {
     providers: [],
@@ -136,14 +175,19 @@ export async function syncGatewayPluginModulesFromConfig(
     targetAdapters: [],
     providerPlugins: [],
     requestHooks: [],
+    requestTransforms: [],
+    routeResolvers: [],
+    responseHooks: [],
     streamHooks: [],
+    httpRoutes: [],
     billingEventHooks: [],
     agentEventHooks: [],
     virtualModelProfiles: [],
     billingPublishers: [],
     billingOutboxes: [],
     agentEventPublishers: [],
-    agentEventOutboxes: []
+    agentEventOutboxes: [],
+    deliveryStateStores: []
   };
 
   for (const { plugin, result: moduleResult } of loadedModules) {
@@ -172,9 +216,25 @@ export async function syncGatewayPluginModulesFromConfig(
       registered.requestHooks.push(captureComponentSnapshot(runtime.requestHooks, requestHook));
       runtime.requestHooks.register(requestHook, { overwrite: true });
     }
+    for (const requestTransform of moduleResult.requestTransforms || []) {
+      registered.requestTransforms.push(captureComponentSnapshot(runtime.requestTransforms, requestTransform));
+      runtime.requestTransforms.register(requestTransform, { overwrite: true });
+    }
+    for (const routeResolver of moduleResult.routeResolvers || []) {
+      registered.routeResolvers.push(captureComponentSnapshot(runtime.routeResolvers, routeResolver));
+      runtime.routeResolvers.register(routeResolver, { overwrite: true });
+    }
+    for (const responseHook of moduleResult.responseHooks || []) {
+      registered.responseHooks.push(captureComponentSnapshot(runtime.responseHooks, responseHook));
+      runtime.responseHooks.register(responseHook, { overwrite: true });
+    }
     for (const streamHook of moduleResult.streamHooks || []) {
       registered.streamHooks.push(captureComponentSnapshot(runtime.streamHooks, streamHook));
       runtime.streamHooks.register(streamHook, { overwrite: true });
+    }
+    for (const httpRoute of moduleResult.httpRoutes || []) {
+      registered.httpRoutes.push(captureComponentSnapshot(runtime.httpRoutes, httpRoute));
+      runtime.httpRoutes.register(httpRoute, { overwrite: true });
     }
     for (const billingHook of moduleResult.billingEventHooks || []) {
       registered.billingEventHooks.push(captureComponentSnapshot(runtime.billingEventHooks, billingHook));
@@ -221,6 +281,12 @@ export async function syncGatewayPluginModulesFromConfig(
       );
       runtime.agentEventOutboxes.register(eventOutbox, { overwrite: true });
     }
+    for (const stateStore of moduleResult.deliveryStateStores || []) {
+      registered.deliveryStateStores.push(
+        captureExtensionSnapshot(runtime.deliveryStateStores, stateStore)
+      );
+      runtime.deliveryStateStores.register(stateStore, { overwrite: true });
+    }
 
     logger?.info?.(
       {
@@ -231,7 +297,11 @@ export async function syncGatewayPluginModulesFromConfig(
         providerHooks: (moduleResult.providerHooks?.length || 0) + (moduleResult.providerPlugins?.length || 0),
         providers: moduleResult.providers?.length || 0,
         requestHooks: moduleResult.requestHooks?.length || 0,
+        requestTransforms: moduleResult.requestTransforms?.length || 0,
+        routeResolvers: moduleResult.routeResolvers?.length || 0,
+        responseHooks: moduleResult.responseHooks?.length || 0,
         streamHooks: moduleResult.streamHooks?.length || 0,
+        httpRoutes: moduleResult.httpRoutes?.length || 0,
         billingEventHooks: moduleResult.billingEventHooks?.length || 0,
         agentEventHooks: (moduleResult.eventHooks?.length || 0) + (moduleResult.agentEventHooks?.length || 0),
         virtualModelProfiles: moduleResult.virtualModelProfiles?.length || 0,
@@ -242,28 +312,39 @@ export async function syncGatewayPluginModulesFromConfig(
           (moduleResult.agentEventPublishers?.length || 0),
         eventOutboxes:
           (moduleResult.eventOutboxes?.length || 0) +
-          (moduleResult.agentEventOutboxes?.length || 0)
+          (moduleResult.agentEventOutboxes?.length || 0),
+        deliveryStateStores: moduleResult.deliveryStateStores?.length || 0
       },
       'Loaded gateway plugin module.'
     );
   }
 
   registeredModulePluginState.set(runtime, registered);
+  configureGatewayPluginDeliveryStateStores(runtime.deliveryStateStores.list());
 }
 
-async function unregisterPreviousModulePlugins(runtime: GatewayRuntime, config: GatewayConfig): Promise<void> {
+async function unregisterPreviousModulePlugins(
+  runtime: GatewayRuntime,
+  config: GatewayConfig,
+  retainedExtensions: ReadonlySet<GatewayPluginExtension>
+): Promise<void> {
   const previous = registeredModulePluginState.get(runtime);
   if (!previous) {
     return;
   }
 
-  await restoreExtensionSnapshots(runtime.agentEventOutboxes, previous.agentEventOutboxes);
-  await restoreExtensionSnapshots(runtime.agentEventPublishers, previous.agentEventPublishers);
-  await restoreExtensionSnapshots(runtime.billingOutboxes, previous.billingOutboxes);
-  await restoreExtensionSnapshots(runtime.billingPublishers, previous.billingPublishers);
+  await restoreExtensionSnapshots(runtime.agentEventOutboxes, previous.agentEventOutboxes, retainedExtensions);
+  await restoreExtensionSnapshots(runtime.agentEventPublishers, previous.agentEventPublishers, retainedExtensions);
+  await restoreExtensionSnapshots(runtime.deliveryStateStores, previous.deliveryStateStores, retainedExtensions);
+  await restoreExtensionSnapshots(runtime.billingOutboxes, previous.billingOutboxes, retainedExtensions);
+  await restoreExtensionSnapshots(runtime.billingPublishers, previous.billingPublishers, retainedExtensions);
   restoreComponentSnapshots(runtime.agentEventHooks, previous.agentEventHooks);
   restoreComponentSnapshots(runtime.billingEventHooks, previous.billingEventHooks);
+  restoreComponentSnapshots(runtime.httpRoutes, previous.httpRoutes);
   restoreComponentSnapshots(runtime.streamHooks, previous.streamHooks);
+  restoreComponentSnapshots(runtime.responseHooks, previous.responseHooks);
+  restoreComponentSnapshots(runtime.routeResolvers, previous.routeResolvers);
+  restoreComponentSnapshots(runtime.requestTransforms, previous.requestTransforms);
   restoreComponentSnapshots(runtime.requestHooks, previous.requestHooks);
   restoreProviderPluginSnapshots(runtime, previous.providerPlugins);
   restoreVirtualModelProfileSnapshots(runtime.virtualModelProfiles, previous.virtualModelProfiles);
@@ -367,7 +448,8 @@ function collectGatewayPluginModuleExtensions(result: GatewayPluginModuleResult)
     ...(result.eventPublishers || []),
     ...(result.eventOutboxes || []),
     ...(result.agentEventPublishers || []),
-    ...(result.agentEventOutboxes || [])
+    ...(result.agentEventOutboxes || []),
+    ...(result.deliveryStateStores || [])
   ];
 }
 
@@ -468,11 +550,12 @@ function restoreVirtualModelProfileSnapshots(
 
 async function restoreExtensionSnapshots<T extends GatewayPluginExtension>(
   registry: GatewayPluginExtensionRegistry<T>,
-  snapshots: RegistrySnapshot<T>[]
+  snapshots: RegistrySnapshot<T>[],
+  retainedExtensions: ReadonlySet<GatewayPluginExtension>
 ): Promise<void> {
   for (const snapshot of [...snapshots].reverse()) {
     const current = registry.get(snapshot.key);
-    if (current && current !== snapshot.previous) {
+    if (current && current !== snapshot.previous && !retainedExtensions.has(current)) {
       await closeGatewayPluginExtensions([current]);
     }
 
@@ -564,7 +647,11 @@ function normalizeGatewayPluginModuleResult(
     providerHooks: normalizeArray<ProviderPlugin>(result.providerHooks),
     providerPlugins: normalizeArray<ProviderPlugin>(result.providerPlugins),
     requestHooks: normalizeArray<GatewayPluginRequestHook>(result.requestHooks),
+    requestTransforms: normalizeArray<GatewayPluginRequestTransform>(result.requestTransforms),
+    routeResolvers: normalizeArray<GatewayPluginRouteResolver>(result.routeResolvers),
+    responseHooks: normalizeArray<GatewayPluginResponseHook>(result.responseHooks),
     streamHooks: normalizeArray<GatewayPluginStreamHook>(result.streamHooks),
+    httpRoutes: normalizeArray<GatewayPluginHttpRoute>(result.httpRoutes),
     billingEventHooks: normalizeArray<GatewayPluginEventHook>(result.billingEventHooks),
     eventHooks: normalizeArray<GatewayPluginEventHook>(result.eventHooks),
     agentEventHooks: normalizeArray<GatewayPluginEventHook>(result.agentEventHooks),
@@ -574,7 +661,8 @@ function normalizeGatewayPluginModuleResult(
     eventPublishers: normalizeArray<GatewayPluginEventPublisher>(result.eventPublishers),
     eventOutboxes: normalizeArray<GatewayPluginOutbox>(result.eventOutboxes),
     agentEventPublishers: normalizeArray<GatewayPluginEventPublisher>(result.agentEventPublishers),
-    agentEventOutboxes: normalizeArray<GatewayPluginOutbox>(result.agentEventOutboxes)
+    agentEventOutboxes: normalizeArray<GatewayPluginOutbox>(result.agentEventOutboxes),
+    deliveryStateStores: normalizeArray<GatewayPluginDeliveryStateStore>(result.deliveryStateStores)
   };
 }
 
@@ -618,7 +706,11 @@ function validateGatewayPluginModuleResult(
   validateUniqueKeys(plugin, 'providerHooks', result.providerHooks);
   validateUniqueKeys(plugin, 'providerPlugins', result.providerPlugins);
   validateUniqueKeys(plugin, 'requestHooks', result.requestHooks);
+  validateUniqueKeys(plugin, 'requestTransforms', result.requestTransforms);
+  validateUniqueKeys(plugin, 'routeResolvers', result.routeResolvers);
+  validateUniqueKeys(plugin, 'responseHooks', result.responseHooks);
   validateUniqueKeys(plugin, 'streamHooks', result.streamHooks);
+  validateUniqueKeys(plugin, 'httpRoutes', result.httpRoutes);
   validateUniqueKeys(plugin, 'billingEventHooks', result.billingEventHooks);
   validateUniqueKeys(plugin, 'eventHooks', result.eventHooks);
   validateUniqueKeys(plugin, 'agentEventHooks', result.agentEventHooks);
@@ -629,6 +721,7 @@ function validateGatewayPluginModuleResult(
   validateUniqueKeys(plugin, 'eventOutboxes', result.eventOutboxes);
   validateUniqueKeys(plugin, 'agentEventPublishers', result.agentEventPublishers);
   validateUniqueKeys(plugin, 'agentEventOutboxes', result.agentEventOutboxes);
+  validateUniqueKeys(plugin, 'deliveryStateStores', result.deliveryStateStores);
 
   for (const provider of result.providers || []) {
     if (!isNonEmptyString(provider.name) || !isNonEmptyString(provider.type)) {
@@ -696,8 +789,13 @@ function validateGatewayPluginModuleResult(
   validateEventExtensions(plugin, 'eventOutboxes', result.eventOutboxes, 'append');
   validateEventExtensions(plugin, 'agentEventPublishers', result.agentEventPublishers, 'publish');
   validateEventExtensions(plugin, 'agentEventOutboxes', result.agentEventOutboxes, 'append');
+  validateDeliveryStateStores(plugin, result.deliveryStateStores);
   validateRequestHooks(plugin, result.requestHooks);
+  validateRequestTransforms(plugin, result.requestTransforms);
+  validateRouteResolvers(plugin, result.routeResolvers);
+  validateResponseHooks(plugin, result.responseHooks);
   validateStreamHooks(plugin, result.streamHooks);
+  validateHttpRoutes(plugin, result.httpRoutes);
   validateEventHooks(plugin, 'billingEventHooks', result.billingEventHooks);
   validateEventHooks(plugin, 'eventHooks', result.eventHooks);
   validateEventHooks(plugin, 'agentEventHooks', result.agentEventHooks);
@@ -748,6 +846,51 @@ function validateRequestHooks(
   }
 }
 
+function validateRequestTransforms(
+  plugin: GatewayPluginConfig,
+  transforms: GatewayPluginRequestTransform[] | undefined
+): void {
+  for (const transform of transforms || []) {
+    if (!isNonEmptyString(transform.key)) {
+      throw new Error(`Gateway plugin "${plugin.key}" requestTransforms[] must include key.`);
+    }
+    if (transform.stage !== undefined && transform.stage !== 'beforeRouting' && transform.stage !== 'beforeUpstream') {
+      throw new Error(`Gateway plugin "${plugin.key}" request transform "${transform.key}" has invalid stage.`);
+    }
+    if (typeof transform.transform !== 'function') {
+      throw new Error(`Gateway plugin "${plugin.key}" request transform "${transform.key}" must include transform().`);
+    }
+  }
+}
+
+function validateRouteResolvers(
+  plugin: GatewayPluginConfig,
+  resolvers: GatewayPluginRouteResolver[] | undefined
+): void {
+  for (const resolver of resolvers || []) {
+    if (!isNonEmptyString(resolver.key)) {
+      throw new Error(`Gateway plugin "${plugin.key}" routeResolvers[] must include key.`);
+    }
+    if (typeof resolver.resolve !== 'function') {
+      throw new Error(`Gateway plugin "${plugin.key}" route resolver "${resolver.key}" must include resolve().`);
+    }
+  }
+}
+
+function validateResponseHooks(
+  plugin: GatewayPluginConfig,
+  hooks: GatewayPluginResponseHook[] | undefined
+): void {
+  for (const hook of hooks || []) {
+    if (!isNonEmptyString(hook.key)) {
+      throw new Error(`Gateway plugin "${plugin.key}" responseHooks[] must include key.`);
+    }
+    if (typeof hook.transformResponse !== 'function') {
+      throw new Error(`Gateway plugin "${plugin.key}" response hook "${hook.key}" must include transformResponse().`);
+    }
+  }
+}
+
 function validateStreamHooks(
   plugin: GatewayPluginConfig,
   hooks: GatewayPluginStreamHook[] | undefined
@@ -758,6 +901,32 @@ function validateStreamHooks(
     }
     if (typeof hook.transformResponse !== 'function') {
       throw new Error(`Gateway plugin "${plugin.key}" stream hook "${hook.key}" must include transformResponse().`);
+    }
+  }
+}
+
+function validateHttpRoutes(
+  plugin: GatewayPluginConfig,
+  routes: GatewayPluginHttpRoute[] | undefined
+): void {
+  for (const route of routes || []) {
+    if (!isNonEmptyString(route.key)) {
+      throw new Error(`Gateway plugin "${plugin.key}" httpRoutes[] must include key.`);
+    }
+    if (!isNonEmptyString(route.path) || !route.path.trim().startsWith('/')) {
+      throw new Error(`Gateway plugin "${plugin.key}" HTTP route "${route.key}" must include an absolute path.`);
+    }
+    if (route.method !== undefined && normalizeHttpRouteMethod(route.method) === undefined) {
+      throw new Error(`Gateway plugin "${plugin.key}" HTTP route "${route.key}" has invalid method.`);
+    }
+    if (route.auth !== undefined && route.auth !== 'gateway' && route.auth !== 'none') {
+      throw new Error(`Gateway plugin "${plugin.key}" HTTP route "${route.key}" has invalid auth mode.`);
+    }
+    if (route.priority !== undefined && route.priority !== 'pre' && route.priority !== 'fallback') {
+      throw new Error(`Gateway plugin "${plugin.key}" HTTP route "${route.key}" has invalid priority.`);
+    }
+    if (typeof route.handler !== 'function') {
+      throw new Error(`Gateway plugin "${plugin.key}" HTTP route "${route.key}" must include handler().`);
     }
   }
 }
@@ -773,6 +942,46 @@ function validateEventHooks(
     }
     if (typeof hook.transform !== 'function') {
       throw new Error(`Gateway plugin "${plugin.key}" ${section} "${hook.key}" must include transform().`);
+    }
+  }
+}
+
+function validateDeliveryStateStores(
+  plugin: GatewayPluginConfig,
+  stores: GatewayPluginDeliveryStateStore[] | undefined
+): void {
+  for (const store of stores || []) {
+    if (!isNonEmptyString(store.key)) {
+      throw new Error(`Gateway plugin "${plugin.key}" deliveryStateStores[] must include key.`);
+    }
+    const dedupeMethods = [
+      typeof store.claimDelivery === 'function',
+      typeof store.releaseDeliveryClaim === 'function'
+    ];
+    const deadLetterMethods = [
+      typeof store.writeDeadLetter === 'function',
+      typeof store.listDeadLetters === 'function',
+      typeof store.clearDeadLetters === 'function'
+    ];
+    const hasAnyDedupeMethod = dedupeMethods.some(Boolean);
+    const hasAllDedupeMethods = dedupeMethods.every(Boolean);
+    const hasAnyDeadLetterMethod = deadLetterMethods.some(Boolean);
+    const hasAllDeadLetterMethods = deadLetterMethods.every(Boolean);
+
+    if (!hasAnyDedupeMethod && !hasAnyDeadLetterMethod) {
+      throw new Error(
+        `Gateway plugin "${plugin.key}" delivery state store "${store.key}" must include dedupe or dead-letter state methods.`
+      );
+    }
+    if (hasAnyDedupeMethod && !hasAllDedupeMethods) {
+      throw new Error(
+        `Gateway plugin "${plugin.key}" delivery state store "${store.key}" must implement both claimDelivery() and releaseDeliveryClaim() for atomic dedupe state.`
+      );
+    }
+    if (hasAnyDeadLetterMethod && !hasAllDeadLetterMethods) {
+      throw new Error(
+        `Gateway plugin "${plugin.key}" delivery state store "${store.key}" must implement writeDeadLetter(), listDeadLetters(), and clearDeadLetters() for dead-letter state.`
+      );
     }
   }
 }
@@ -806,6 +1015,24 @@ function collectGatewayPluginResultCapabilities(result: GatewayPluginModuleResul
     }
   }
   return capabilities;
+}
+
+function normalizeHttpRouteMethod(value: unknown): string | undefined {
+  const normalized = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  if (
+    normalized === 'GET' ||
+    normalized === 'POST' ||
+    normalized === 'PUT' ||
+    normalized === 'PATCH' ||
+    normalized === 'DELETE' ||
+    normalized === 'HEAD' ||
+    normalized === 'OPTIONS' ||
+    normalized === 'ALL'
+  ) {
+    return normalized;
+  }
+
+  return undefined;
 }
 
 function isNonEmptyString(value: unknown): value is string {

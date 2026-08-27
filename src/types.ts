@@ -1,4 +1,4 @@
-import type { FastifyRequest } from 'fastify';
+import type { FastifyReply, FastifyRequest } from 'fastify';
 
 export type BuiltinProvider = 'openai' | 'anthropic' | 'gemini';
 export type Provider = BuiltinProvider | (string & {});
@@ -39,6 +39,15 @@ export type BillingTraceRequestBodyMode = 'disabled' | 'sanitized' | 'full';
 
 export interface BillingTraceConfig {
   requestBodyMode: BillingTraceRequestBodyMode;
+}
+
+export type BillingDeliveryMode = 'async' | 'await';
+
+export interface BillingDeliveryConfig {
+  mode: BillingDeliveryMode;
+  requirePublisher: boolean;
+  requireOutbox: boolean;
+  shutdownDrainTimeoutMs: number;
 }
 
 export interface ModelScopedHeadersConfig {
@@ -195,6 +204,9 @@ export interface BillingConfig {
   currency: 'USD';
   rates: Record<Provider, BillingRate>;
   trace?: BillingTraceConfig;
+  delivery: BillingDeliveryConfig;
+  requireUsage: boolean;
+  requireRates: boolean;
 }
 
 export interface BillingQueueConfig {
@@ -488,7 +500,27 @@ export interface GatewaySchedulingConfig {
   cacheAffinity: GatewaySchedulingCacheAffinityConfig;
   credentialScheduler: GatewaySchedulingCredentialSchedulerConfig;
   fallback: GatewaySchedulingFallbackConfig;
+  storage: GatewaySchedulingStorageConfig;
 }
+
+export type GatewaySchedulingStorageType = 'memory' | 'redis';
+
+export interface GatewaySchedulingMemoryStorageConfig {
+  type: 'memory';
+}
+
+export interface GatewaySchedulingRedisStorageConfig {
+  type: 'redis';
+  url: string;
+  keyPrefix: string;
+  connectTimeoutMs: number;
+  commandTimeoutMs: number;
+  stateTtlMs: number;
+}
+
+export type GatewaySchedulingStorageConfig =
+  | GatewaySchedulingMemoryStorageConfig
+  | GatewaySchedulingRedisStorageConfig;
 
 export interface GatewayModelListConfig {
   bareModelIds: boolean;
@@ -499,7 +531,27 @@ export interface ProviderHealthCheckSchedulerConfig {
   intervalMs: number;
   timeoutMs: number;
   initialDelayMs: number;
+  storage: ProviderHealthCheckStorageConfig;
 }
+
+export type ProviderHealthCheckStorageType = 'memory' | 'redis';
+
+export interface ProviderHealthCheckMemoryStorageConfig {
+  type: 'memory';
+}
+
+export interface ProviderHealthCheckRedisStorageConfig {
+  type: 'redis';
+  url: string;
+  keyPrefix: string;
+  connectTimeoutMs: number;
+  commandTimeoutMs: number;
+  stateTtlMs: number;
+}
+
+export type ProviderHealthCheckStorageConfig =
+  | ProviderHealthCheckMemoryStorageConfig
+  | ProviderHealthCheckRedisStorageConfig;
 
 export interface GatewayMetricsConfig {
   enabled: boolean;
@@ -528,8 +580,31 @@ export interface GatewayIdempotencyConfig {
   headerName: string;
   ttlMs: number;
   maxEntries: number;
+  maxResponseBytes: number;
+  maxTotalBytes: number;
   cacheErrorResponses: boolean;
+  pendingWaitTimeoutMs: number;
+  pollIntervalMs: number;
+  storage: GatewayIdempotencyStorageConfig;
 }
+
+export type GatewayIdempotencyStorageType = 'memory' | 'redis';
+
+export interface GatewayIdempotencyMemoryStorageConfig {
+  type: 'memory';
+}
+
+export interface GatewayIdempotencyRedisStorageConfig {
+  type: 'redis';
+  url: string;
+  keyPrefix: string;
+  connectTimeoutMs: number;
+  commandTimeoutMs: number;
+}
+
+export type GatewayIdempotencyStorageConfig =
+  | GatewayIdempotencyMemoryStorageConfig
+  | GatewayIdempotencyRedisStorageConfig;
 
 export interface GatewayMediaConfig {
   publicBaseUrl?: string;
@@ -541,14 +616,55 @@ export interface GatewayUpstreamConcurrencyConfig {
   enabled: boolean;
   maxInFlightPerProvider: number;
   queueTimeoutMs: number;
+  storage: GatewayUpstreamConcurrencyStorageConfig;
 }
+
+export type GatewayUpstreamConcurrencyStorageType = 'memory' | 'redis';
+
+export interface GatewayUpstreamConcurrencyMemoryStorageConfig {
+  type: 'memory';
+}
+
+export interface GatewayUpstreamConcurrencyRedisStorageConfig {
+  type: 'redis';
+  url: string;
+  keyPrefix: string;
+  connectTimeoutMs: number;
+  commandTimeoutMs: number;
+  leaseTtlMs: number;
+  pollIntervalMs: number;
+}
+
+export type GatewayUpstreamConcurrencyStorageConfig =
+  | GatewayUpstreamConcurrencyMemoryStorageConfig
+  | GatewayUpstreamConcurrencyRedisStorageConfig;
 
 export interface GatewayUpstreamCircuitBreakerConfig {
   enabled: boolean;
   failureThreshold: number;
   cooldownMs: number;
   failureStatusCodes: number[];
+  storage: GatewayUpstreamCircuitBreakerStorageConfig;
 }
+
+export type GatewayUpstreamCircuitBreakerStorageType = 'memory' | 'redis';
+
+export interface GatewayUpstreamCircuitBreakerMemoryStorageConfig {
+  type: 'memory';
+}
+
+export interface GatewayUpstreamCircuitBreakerRedisStorageConfig {
+  type: 'redis';
+  url: string;
+  keyPrefix: string;
+  connectTimeoutMs: number;
+  commandTimeoutMs: number;
+  stateTtlMs: number;
+}
+
+export type GatewayUpstreamCircuitBreakerStorageConfig =
+  | GatewayUpstreamCircuitBreakerMemoryStorageConfig
+  | GatewayUpstreamCircuitBreakerRedisStorageConfig;
 
 export interface GatewayUpstreamRetryConfig {
   enabled: boolean;
@@ -1176,6 +1292,17 @@ export interface ProviderPluginConditionConfig {
   not?: ProviderPluginConditionConfig;
 }
 
+export type GatewayPluginExecutionFailureMode = 'fail_closed' | 'fail_open';
+
+export interface GatewayPluginExecutionConfig {
+  timeoutMs?: number;
+  concurrency?: number;
+  maxQueueSize?: number;
+  failureThreshold?: number;
+  cooldownMs?: number;
+  failureMode?: GatewayPluginExecutionFailureMode;
+}
+
 export interface ProviderPluginMutationConfig {
   strict: boolean;
   headers: Record<string, ProviderPluginValue>;
@@ -1224,6 +1351,7 @@ export interface ProviderPluginConfig {
   sourceAdapters?: string[];
   sourceRoutes?: string[];
   when?: ProviderPluginConditionConfig;
+  execution?: GatewayPluginExecutionConfig;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
   auth?: ProviderPluginMutationConfig;
@@ -1248,6 +1376,7 @@ export interface GatewayPluginProviderHookConfig {
   sourceAdapters?: string[];
   sourceRoutes?: string[];
   when?: ProviderPluginConditionConfig;
+  execution?: GatewayPluginExecutionConfig;
   codexOauth?: ProviderPluginCodexOAuthConfig;
   deepseekThinking?: ProviderPluginDeepSeekThinkingConfig;
   auth?: ProviderPluginMutationConfig;
@@ -1286,6 +1415,7 @@ export interface ProviderPlugin {
   sourceAdapters?: string[];
   sourceRoutes?: string[];
   when?: ProviderPluginConditionConfig;
+  execution?: GatewayPluginExecutionConfig;
   authenticate?(input: ProviderPluginRequestInput): Result<UpstreamRequest> | Promise<Result<UpstreamRequest>>;
   transformRequest?(input: ProviderPluginRequestInput): Result<UpstreamRequest> | Promise<Result<UpstreamRequest>>;
   transformResponse?(input: ProviderPluginResponseInput): Result<unknown> | Promise<Result<unknown>>;
@@ -1310,6 +1440,22 @@ export interface GatewayPluginMatchable {
   sourceRoutes?: string[];
 }
 
+export type GatewayPluginRequestTransformStage = 'beforeRouting' | 'beforeUpstream';
+
+export interface GatewayPluginRequestHeaderMutations {
+  set?: Record<string, string | number | boolean | null | undefined>;
+  remove?: string[];
+}
+
+export interface GatewayPluginRequestTransformValue {
+  requestBody?: unknown;
+  standardRequest?: StandardRequest;
+  model?: string | null;
+  source?: GatewaySourceContext;
+  metadata?: Record<string, string | null | undefined>;
+  headers?: GatewayPluginRequestHeaderMutations | Record<string, string | number | boolean | null | undefined>;
+}
+
 export interface GatewayPluginRequestHookInput {
   request: FastifyRequest;
   config: GatewayConfig;
@@ -1324,6 +1470,49 @@ export interface GatewayPluginRequestHookInput {
   standardRequest?: StandardRequest;
 }
 
+export interface GatewayPluginRequestTransformInput extends GatewayPluginRequestHookInput {
+  stage: GatewayPluginRequestTransformStage;
+}
+
+export interface GatewayPluginRequestTransform extends GatewayPluginMatchable {
+  key: string;
+  stage?: GatewayPluginRequestTransformStage;
+  execution?: GatewayPluginExecutionConfig;
+  transform(
+    input: GatewayPluginRequestTransformInput
+  ):
+    | GatewayPluginHookResult<GatewayPluginRequestTransformValue | void>
+    | GatewayPluginRequestTransformValue
+    | void
+    | Promise<GatewayPluginHookResult<GatewayPluginRequestTransformValue | void> | GatewayPluginRequestTransformValue | void>;
+}
+
+export interface GatewayPluginTargetRoute {
+  provider?: Provider;
+  providerName?: string;
+  providerConfig?: ProviderConfig;
+}
+
+export interface GatewayPluginRouteResolution extends GatewayPluginRequestTransformValue {
+  targetProvider?: Provider;
+  targetProviderName?: string;
+  targetProviderConfig?: ProviderConfig;
+  targetProviders?: GatewayPluginTargetRoute[];
+  reason?: string;
+}
+
+export interface GatewayPluginRouteResolver extends GatewayPluginMatchable {
+  key: string;
+  execution?: GatewayPluginExecutionConfig;
+  resolve(
+    input: GatewayPluginRequestHookInput
+  ):
+    | GatewayPluginHookResult<GatewayPluginRouteResolution | void>
+    | GatewayPluginRouteResolution
+    | void
+    | Promise<GatewayPluginHookResult<GatewayPluginRouteResolution | void> | GatewayPluginRouteResolution | void>;
+}
+
 export interface GatewayPluginPrecheckDecision {
   allow: false;
   statusCode?: number;
@@ -1334,6 +1523,7 @@ export interface GatewayPluginPrecheckDecision {
 
 export interface GatewayPluginRequestHook extends GatewayPluginMatchable {
   key: string;
+  execution?: GatewayPluginExecutionConfig;
   beforeAuth?(input: GatewayPluginRequestHookInput): GatewayPluginHookResult | Promise<GatewayPluginHookResult>;
   beforeRouting?(input: GatewayPluginRequestHookInput): GatewayPluginHookResult | Promise<GatewayPluginHookResult>;
   beforePrecheck?(
@@ -1352,9 +1542,65 @@ export interface GatewayPluginStreamHookInput extends ProviderPluginContext {
 
 export interface GatewayPluginStreamHook extends GatewayPluginMatchable {
   key: string;
+  execution?: GatewayPluginExecutionConfig;
   transformResponse?(
     input: GatewayPluginStreamHookInput
   ): GatewayPluginHookResult<Response> | Response | Promise<GatewayPluginHookResult<Response> | Response>;
+}
+
+export interface GatewayPluginResponseTransformValue {
+  responsePayload?: unknown;
+  statusCode?: number;
+  headers?: Record<string, string | number | boolean | null | undefined>;
+  removeHeaders?: string[];
+}
+
+export interface GatewayPluginResponseHookInput extends ProviderPluginContext {
+  upstreamRequest?: UpstreamRequest;
+  upstreamResponse?: Response;
+  upstreamPayload?: unknown;
+  standardRequest?: StandardRequest;
+  standardResponse?: StandardResponse;
+  responsePayload: unknown;
+  statusCode: number;
+  responseHeaders: Record<string, string>;
+}
+
+export interface GatewayPluginResponseHook extends GatewayPluginMatchable {
+  key: string;
+  execution?: GatewayPluginExecutionConfig;
+  transformResponse(
+    input: GatewayPluginResponseHookInput
+  ):
+    | GatewayPluginHookResult<GatewayPluginResponseTransformValue | void>
+    | GatewayPluginResponseTransformValue
+    | void
+    | Promise<GatewayPluginHookResult<GatewayPluginResponseTransformValue | void> | GatewayPluginResponseTransformValue | void>;
+}
+
+export type GatewayPluginHttpRouteMethod =
+  | SourceAdapterRouteMethod
+  | 'HEAD'
+  | 'OPTIONS'
+  | 'ALL';
+
+export interface GatewayPluginHttpRouteInput {
+  request: FastifyRequest;
+  reply: FastifyReply;
+  config: GatewayConfig;
+  route: GatewayPluginHttpRoute;
+  runtime?: unknown;
+}
+
+export interface GatewayPluginHttpRoute {
+  key: string;
+  method?: GatewayPluginHttpRouteMethod;
+  path: string;
+  priority?: 'pre' | 'fallback';
+  auth?: 'gateway' | 'none';
+  metadata?: Record<string, string>;
+  execution?: GatewayPluginExecutionConfig;
+  handler(input: GatewayPluginHttpRouteInput): unknown | Promise<unknown>;
 }
 
 export interface GatewayPluginEventHookInput<TEvent = unknown> {
@@ -1364,6 +1610,7 @@ export interface GatewayPluginEventHookInput<TEvent = unknown> {
 
 export interface GatewayPluginEventHook<TEvent = unknown> {
   key: string;
+  execution?: GatewayPluginExecutionConfig;
   transform?(
     input: GatewayPluginEventHookInput<TEvent>
   ): GatewayPluginHookResult<TEvent | false | void> | TEvent | false | void | Promise<GatewayPluginHookResult<TEvent | false | void> | TEvent | false | void>;

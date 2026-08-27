@@ -60,6 +60,17 @@ export interface GatewayPluginDeadLetter<TEvent = unknown> {
   event: TEvent;
 }
 
+export interface GatewayPluginDeliveryStateStore extends GatewayPluginExtension {
+  claimDelivery?(idempotencyKey: string, ttlMs: number): boolean | Promise<boolean>;
+  releaseDeliveryClaim?(idempotencyKey: string): void | Promise<void>;
+  writeDeadLetter?(
+    entry: GatewayPluginDeadLetter,
+    options: GatewayPluginDeadLetterOptions
+  ): void | Promise<void>;
+  listDeadLetters?(extensionKey?: string): GatewayPluginDeadLetter[] | Promise<GatewayPluginDeadLetter[]>;
+  clearDeadLetters?(extensionKey?: string): number | Promise<number>;
+}
+
 export interface GatewayPluginExtension {
   key: string;
   delivery?: GatewayPluginDeliveryOptions;
@@ -91,7 +102,26 @@ const initializedExtensions = new WeakSet<GatewayPluginExtension>();
 const deliveryLimiters = new WeakMap<GatewayPluginExtension, GatewayPluginDeliveryLimiter>();
 const deliveredEventKeys = new Map<string, number>();
 const deadLettersByExtension = new Map<string, GatewayPluginDeadLetter[]>();
+let deliveryStateStores: GatewayPluginDeliveryStateStore[] = [];
 const defaultDeadLetterMaxEntries = 1000;
+const memoryDeliveryStateStore: GatewayPluginDeliveryStateStore = {
+  key: 'memory',
+  claimDelivery(idempotencyKey, ttlMs) {
+    return claimGatewayPluginEventInMemory(idempotencyKey, ttlMs);
+  },
+  releaseDeliveryClaim(idempotencyKey) {
+    deliveredEventKeys.delete(idempotencyKey);
+  },
+  writeDeadLetter(entry, options) {
+    writeGatewayPluginDeadLetterInMemory(entry, options);
+  },
+  listDeadLetters(extensionKey) {
+    return listGatewayPluginDeadLettersInMemory(extensionKey);
+  },
+  clearDeadLetters(extensionKey) {
+    return clearGatewayPluginDeadLettersInMemory(extensionKey);
+  }
+};
 
 export class GatewayPluginExtensionRegistry<T extends GatewayPluginExtension> {
   private readonly extensions = new Map<string, T>();
@@ -204,21 +234,33 @@ export async function executeGatewayPluginEventDelivery<TEvent>(
   const options = normalizeDeliveryOptions(extension.delivery);
   const eventId = readGatewayPluginEventId(event);
   const idempotencyKey = eventId ? `${extension.key}:${eventId}` : undefined;
-  if (idempotencyKey && options.dedupe && hasDeliveredGatewayPluginEvent(idempotencyKey, options.dedupeTtlMs)) {
-    recordGatewayPluginDelivery({
-      extensionKey: extension.key,
-      transport: readGatewayPluginExtensionTransport(extension),
-      outcome: 'not_delivered'
-    });
-    return false;
-  }
+  let deliveryClaimed = false;
 
   try {
+    if (idempotencyKey && options.dedupe) {
+      deliveryClaimed = await claimGatewayPluginEvent(idempotencyKey, options.dedupeTtlMs);
+      if (!deliveryClaimed) {
+        recordGatewayPluginDelivery({
+          extensionKey: extension.key,
+          transport: readGatewayPluginExtensionTransport(extension),
+          outcome: 'not_delivered'
+        });
+        return false;
+      }
+    }
+
     const delivered = await runWithGatewayPluginDeliveryLimiter(extension, options, () =>
-      runGatewayPluginDeliveryWithRetry(extension, eventId, idempotencyKey, operation, options)
+      createGatewayPluginDeliveryWithRetryExecution(
+        extension,
+        eventId,
+        idempotencyKey,
+        operation,
+        options
+      )
     );
-    if (delivered && idempotencyKey && options.dedupe) {
-      rememberDeliveredGatewayPluginEvent(idempotencyKey, options.dedupeTtlMs);
+    if (!delivered && deliveryClaimed && idempotencyKey) {
+      await releaseGatewayPluginEventClaim(idempotencyKey);
+      deliveryClaimed = false;
     }
     recordGatewayPluginDelivery({
       extensionKey: extension.key,
@@ -227,6 +269,14 @@ export async function executeGatewayPluginEventDelivery<TEvent>(
     });
     return delivered;
   } catch (error) {
+    if (
+      deliveryClaimed &&
+      idempotencyKey &&
+      !isGatewayPluginDeliveryTimeoutError(error)
+    ) {
+      await releaseGatewayPluginEventClaim(idempotencyKey);
+      deliveryClaimed = false;
+    }
     recordGatewayPluginDelivery({
       extensionKey: extension.key,
       transport: readGatewayPluginExtensionTransport(extension),
@@ -243,27 +293,22 @@ export async function executeGatewayPluginEventDelivery<TEvent>(
   }
 }
 
-export function listGatewayPluginDeadLetters(extensionKey?: string): GatewayPluginDeadLetter[] {
-  if (extensionKey) {
-    return [...(deadLettersByExtension.get(extensionKey) || [])];
-  }
-
-  return Array.from(deadLettersByExtension.values()).flatMap((entries) => entries);
+export function configureGatewayPluginDeliveryStateStores(
+  stores: GatewayPluginDeliveryStateStore[] = []
+): void {
+  deliveryStateStores = stores;
 }
 
-export function clearGatewayPluginDeadLetters(extensionKey?: string): number {
-  if (extensionKey) {
-    const count = deadLettersByExtension.get(extensionKey)?.length || 0;
-    deadLettersByExtension.delete(extensionKey);
-    return count;
-  }
+export async function listGatewayPluginDeadLetters(
+  extensionKey?: string
+): Promise<GatewayPluginDeadLetter[]> {
+  return await resolveGatewayPluginDeadLetterStateStore()
+    .listDeadLetters?.(extensionKey) || [];
+}
 
-  let count = 0;
-  for (const entries of deadLettersByExtension.values()) {
-    count += entries.length;
-  }
-  deadLettersByExtension.clear();
-  return count;
+export async function clearGatewayPluginDeadLetters(extensionKey?: string): Promise<number> {
+  return await resolveGatewayPluginDeadLetterStateStore()
+    .clearDeadLetters?.(extensionKey) || 0;
 }
 
 async function closeGatewayPluginExtension(extension: GatewayPluginExtension): Promise<void> {
@@ -369,26 +414,30 @@ function normalizeDeadLetterOptions(
   };
 }
 
-function hasDeliveredGatewayPluginEvent(key: string, ttlMs: number): boolean {
-  const expiresAt = deliveredEventKeys.get(key);
-  if (!expiresAt) {
-    return false;
-  }
-  if (expiresAt <= Date.now()) {
-    deliveredEventKeys.delete(key);
-    return false;
-  }
-  return true;
+async function claimGatewayPluginEvent(key: string, ttlMs: number): Promise<boolean> {
+  return Boolean(await resolveGatewayPluginDedupeStateStore().claimDelivery?.(key, ttlMs));
 }
 
-function rememberDeliveredGatewayPluginEvent(key: string, ttlMs: number): void {
+async function releaseGatewayPluginEventClaim(key: string): Promise<void> {
+  await resolveGatewayPluginDedupeStateStore().releaseDeliveryClaim?.(key);
+}
+
+function claimGatewayPluginEventInMemory(key: string, ttlMs: number): boolean {
   const now = Date.now();
+  const expiresAt = deliveredEventKeys.get(key);
+  if (expiresAt && expiresAt > now) {
+    return false;
+  }
+  if (expiresAt) {
+    deliveredEventKeys.delete(key);
+  }
   deliveredEventKeys.set(key, now + ttlMs);
   for (const [eventKey, expiresAt] of deliveredEventKeys) {
     if (expiresAt <= now) {
       deliveredEventKeys.delete(eventKey);
     }
   }
+  return true;
 }
 
 function shouldDeadLetterGatewayPluginDelivery(
@@ -416,29 +465,91 @@ async function writeGatewayPluginDeadLetter<TEvent>(
   };
 
   if (options.deadLetter.enabled) {
-    const entries = deadLettersByExtension.get(extension.key) || [];
-    entries.push(entry);
-    const maxEntries = options.deadLetter.maxEntries || defaultDeadLetterMaxEntries;
-    if (entries.length > maxEntries) {
-      entries.splice(0, entries.length - maxEntries);
-    }
-    deadLettersByExtension.set(extension.key, entries);
+    await resolveGatewayPluginDeadLetterStateStore()
+      .writeDeadLetter?.(entry, options.deadLetter);
   }
 
   await extension.deadLetter?.(entry);
 }
 
-async function runGatewayPluginDeliveryWithRetry(
+function resolveGatewayPluginDedupeStateStore(): GatewayPluginDeliveryStateStore {
+  return deliveryStateStores.find(hasGatewayPluginDedupeStateStoreMethods) ||
+    memoryDeliveryStateStore;
+}
+
+function resolveGatewayPluginDeadLetterStateStore(): GatewayPluginDeliveryStateStore {
+  return deliveryStateStores.find(hasGatewayPluginDeadLetterStateStoreMethods) ||
+    memoryDeliveryStateStore;
+}
+
+function hasGatewayPluginDedupeStateStoreMethods(store: GatewayPluginDeliveryStateStore): boolean {
+  return (
+    typeof store.claimDelivery === 'function' &&
+    typeof store.releaseDeliveryClaim === 'function'
+  );
+}
+
+function hasGatewayPluginDeadLetterStateStoreMethods(store: GatewayPluginDeliveryStateStore): boolean {
+  return (
+    typeof store.writeDeadLetter === 'function' &&
+    typeof store.listDeadLetters === 'function' &&
+    typeof store.clearDeadLetters === 'function'
+  );
+}
+
+function listGatewayPluginDeadLettersInMemory(extensionKey?: string): GatewayPluginDeadLetter[] {
+  if (extensionKey) {
+    return [...(deadLettersByExtension.get(extensionKey) || [])];
+  }
+
+  return Array.from(deadLettersByExtension.values()).flatMap((entries) => entries);
+}
+
+function clearGatewayPluginDeadLettersInMemory(extensionKey?: string): number {
+  if (extensionKey) {
+    const count = deadLettersByExtension.get(extensionKey)?.length || 0;
+    deadLettersByExtension.delete(extensionKey);
+    return count;
+  }
+
+  let count = 0;
+  for (const entries of deadLettersByExtension.values()) {
+    count += entries.length;
+  }
+  deadLettersByExtension.clear();
+  return count;
+}
+
+function writeGatewayPluginDeadLetterInMemory(
+  entry: GatewayPluginDeadLetter,
+  options: GatewayPluginDeadLetterOptions
+): void {
+  const entries = deadLettersByExtension.get(entry.extensionKey) || [];
+  entries.push(entry);
+  const maxEntries = options.maxEntries || defaultDeadLetterMaxEntries;
+  if (entries.length > maxEntries) {
+    entries.splice(0, entries.length - maxEntries);
+  }
+  deadLettersByExtension.set(entry.extensionKey, entries);
+}
+
+interface GatewayPluginDeliveryExecution<T> {
+  result: Promise<T>;
+  completion: Promise<void>;
+}
+
+function createGatewayPluginDeliveryWithRetryExecution(
   extension: GatewayPluginExtension,
   eventId: string | undefined,
   idempotencyKey: string | undefined,
   operation: (context: GatewayPluginDeliveryContext) => boolean | void | Promise<boolean | void>,
   options: NormalizedDeliveryOptions
-): Promise<boolean> {
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= options.maxAttempts; attempt += 1) {
-    try {
-      const result = await runGatewayPluginDeliveryAttempt(
+): GatewayPluginDeliveryExecution<boolean> {
+  let currentAttemptCompletion = Promise.resolve();
+  const result = (async (): Promise<boolean> => {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= options.maxAttempts; attempt += 1) {
+      const execution = createGatewayPluginDeliveryAttemptExecution(
         extension,
         eventId,
         idempotencyKey,
@@ -446,27 +557,39 @@ async function runGatewayPluginDeliveryWithRetry(
         options,
         attempt
       );
-      return result !== false;
-    } catch (error) {
-      lastError = error;
-      if (attempt >= options.maxAttempts) {
-        break;
+      currentAttemptCompletion = execution.completion;
+      try {
+        const attemptResult = await execution.result;
+        return attemptResult !== false;
+      } catch (error) {
+        lastError = error;
+        if (isGatewayPluginDeliveryTimeoutError(error) || attempt >= options.maxAttempts) {
+          break;
+        }
+        await sleep(resolveGatewayPluginRetryDelayMs(attempt, options));
       }
-      await sleep(resolveGatewayPluginRetryDelayMs(attempt, options));
     }
-  }
 
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  })();
+  const completion = result.then(
+    () => currentAttemptCompletion,
+    () => currentAttemptCompletion
+  ).then(
+    () => undefined,
+    () => undefined
+  );
+  return { result, completion };
 }
 
-async function runGatewayPluginDeliveryAttempt(
+function createGatewayPluginDeliveryAttemptExecution(
   extension: GatewayPluginExtension,
   eventId: string | undefined,
   idempotencyKey: string | undefined,
   operation: (context: GatewayPluginDeliveryContext) => boolean | void | Promise<boolean | void>,
   options: NormalizedDeliveryOptions,
   attempt: number
-): Promise<boolean | void> {
+): GatewayPluginDeliveryExecution<boolean | void> {
   const abortController = new AbortController();
   const deliveryContext: GatewayPluginDeliveryContext = {
     signal: abortController.signal,
@@ -476,13 +599,16 @@ async function runGatewayPluginDeliveryAttempt(
     idempotencyKey
   };
   const promise = Promise.resolve().then(() => operation(deliveryContext));
+  const completion = promise.then(
+    () => undefined,
+    () => undefined
+  );
   if (!options.timeoutMs) {
-    return promise;
+    return { result: promise, completion };
   }
 
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
+  let timeout: ReturnType<typeof setTimeout>;
+  const result = Promise.race([
       promise,
       new Promise<never>((_resolve, reject) => {
         timeout = setTimeout(() => {
@@ -490,12 +616,10 @@ async function runGatewayPluginDeliveryAttempt(
           reject(new GatewayPluginDeliveryTimeoutError(`Gateway plugin delivery timed out: ${extension.key}`));
         }, options.timeoutMs);
       })
-    ]);
-  } finally {
-    if (timeout) {
+    ]).finally(() => {
       clearTimeout(timeout);
-    }
-  }
+    });
+  return { result, completion };
 }
 
 function resolveGatewayPluginRetryDelayMs(
@@ -509,10 +633,10 @@ function resolveGatewayPluginRetryDelayMs(
 function runWithGatewayPluginDeliveryLimiter<T>(
   extension: GatewayPluginExtension,
   options: NormalizedDeliveryOptions,
-  task: () => Promise<T>
+  task: () => GatewayPluginDeliveryExecution<T>
 ): Promise<T> {
   if (!options.concurrency) {
-    return task();
+    return task().result;
   }
 
   let limiter = deliveryLimiters.get(extension);
@@ -541,7 +665,7 @@ class GatewayPluginDeliveryLimiter {
     this.drain();
   }
 
-  run<T>(task: () => Promise<T>): Promise<T> {
+  run<T>(task: () => GatewayPluginDeliveryExecution<T>): Promise<T> {
     if (this.active < this.concurrency) {
       return this.start(task);
     }
@@ -557,12 +681,14 @@ class GatewayPluginDeliveryLimiter {
     });
   }
 
-  private start<T>(task: () => Promise<T>): Promise<T> {
+  private start<T>(task: () => GatewayPluginDeliveryExecution<T>): Promise<T> {
     this.active += 1;
-    return task().finally(() => {
+    const execution = task();
+    void execution.completion.finally(() => {
       this.active -= 1;
       this.drain();
     });
+    return execution.result;
   }
 
   private drain(): void {

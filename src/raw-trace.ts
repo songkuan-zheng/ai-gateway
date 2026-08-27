@@ -35,6 +35,9 @@ export interface RawTraceCaptureInput {
   requestId: string;
   method: string;
   url: string;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
   identity?: GatewayRequestIdentity;
   clientContext?: GatewayRequestClientContext;
   target?: {
@@ -74,6 +77,9 @@ interface RawTraceSyncManifest {
   status: 'uploaded';
   uploadAttempts: number;
   uploadedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
   failedReason?: string;
   target?: {
     provider?: Provider;
@@ -331,6 +337,9 @@ class RawTraceManager {
       status: 'uploaded',
       uploadAttempts: attempt,
       uploadedAt,
+      startedAt: sanitizeOptionalString(input.startedAt),
+      completedAt: sanitizeOptionalString(input.completedAt),
+      durationMs: sanitizeOptionalNumber(input.durationMs),
       target: input.target,
       route: {
         method: input.method,
@@ -432,6 +441,16 @@ function sanitizeOptionalString(value: unknown): string | undefined {
 
   const trimmed = value.trim();
   return trimmed || undefined;
+}
+
+function sanitizeOptionalNumber(value: unknown): number | undefined {
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value)
+        : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : undefined;
 }
 
 function sanitizePathToken(value: string): string {

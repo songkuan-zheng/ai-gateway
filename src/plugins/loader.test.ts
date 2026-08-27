@@ -121,6 +121,7 @@ describe('syncGatewayPluginModulesFromConfig', () => {
       expect(runtime.billingOutboxes.get('billing-outbox')?.transport).toBe('postgres');
       expect(runtime.agentEventPublishers.get('agent-event-kafka')?.transport).toBe('kafka');
       expect(runtime.agentEventOutboxes.get('agent-event-outbox')?.transport).toBe('postgres');
+      expect(runtime.deliveryStateStores.get('delivery-state')).toBeDefined();
       expect(globalState.__gatewayPluginExtensionInitialized).toEqual([
         'billing-outbox:gateway-events'
       ]);
@@ -130,15 +131,93 @@ describe('syncGatewayPluginModulesFromConfig', () => {
       expect(runtime.billingOutboxes.get('billing-outbox')).toBeUndefined();
       expect(runtime.agentEventPublishers.get('agent-event-kafka')).toBeUndefined();
       expect(runtime.agentEventOutboxes.get('agent-event-outbox')).toBeUndefined();
+      expect(runtime.deliveryStateStores.get('delivery-state')).toBeUndefined();
       expect(globalState.__gatewayPluginExtensionClosed?.sort()).toEqual([
         'agent-event-kafka',
         'agent-event-outbox',
         'billing-kafka',
-        'billing-outbox'
+        'billing-outbox',
+        'delivery-state'
       ]);
     } finally {
       delete globalState.__gatewayPluginExtensionClosed;
       delete globalState.__gatewayPluginExtensionInitialized;
+      await rm(pluginDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an unchanged object-exported delivery state store open across reloads', async () => {
+    const pluginDir = await mkdtemp(join(tmpdir(), 'gateway-plugin-loader-'));
+    const modulePath = join(pluginDir, 'object-state-store.mjs');
+    await writeFile(
+      modulePath,
+      `
+const state = globalThis.__gatewayObjectStateStoreLifecycle ||= { initialized: 0, closed: 0 };
+let closed = false;
+const store = {
+  key: 'object-state-store',
+  init() {
+    closed = false;
+    state.initialized += 1;
+  },
+  claimDelivery() {
+    if (closed) throw new Error('state store is closed');
+    return true;
+  },
+  releaseDeliveryClaim() {
+    if (closed) throw new Error('state store is closed');
+  },
+  close() {
+    closed = true;
+    state.closed += 1;
+  }
+};
+export default { deliveryStateStores: [store] };
+`,
+      'utf8'
+    );
+    const lifecycle = globalThis as typeof globalThis & {
+      __gatewayObjectStateStoreLifecycle?: { initialized: number; closed: number };
+    };
+    const readLifecycle = () =>
+      (globalThis as typeof lifecycle).__gatewayObjectStateStoreLifecycle;
+    delete lifecycle.__gatewayObjectStateStoreLifecycle;
+    const runtime = createGatewayRuntime();
+    const config = parseGatewayConfigFromRaw({
+      plugins: [{ key: 'object-state-store', modulePath }]
+    });
+
+    try {
+      await syncGatewayPluginModulesFromConfig(runtime, config);
+      await syncGatewayPluginModulesFromConfig(runtime, config);
+
+      const store = runtime.deliveryStateStores.get('object-state-store');
+      await expect(Promise.resolve(store?.claimDelivery?.('event-1', 1000))).resolves.toBe(true);
+      expect(readLifecycle()).toEqual({
+        initialized: 1,
+        closed: 0
+      });
+
+      await expect(
+        syncGatewayPluginModulesFromConfig(runtime, config, undefined, {
+          beforeSwap: () => {
+            throw new Error('candidate rejected');
+          }
+        })
+      ).rejects.toThrow('candidate rejected');
+      await expect(Promise.resolve(store?.claimDelivery?.('event-2', 1000))).resolves.toBe(true);
+      expect(readLifecycle()).toEqual({
+        initialized: 1,
+        closed: 0
+      });
+
+      await syncGatewayPluginModulesFromConfig(
+        runtime,
+        parseGatewayConfigFromRaw({ plugins: [] })
+      );
+      expect(readLifecycle()?.closed).toBe(1);
+    } finally {
+      delete lifecycle.__gatewayObjectStateStoreLifecycle;
       await rm(pluginDir, { recursive: true, force: true });
     }
   });
@@ -164,15 +243,24 @@ describe('syncGatewayPluginModulesFromConfig', () => {
         'acme_messages'
       );
       expect(runtime.requestHooks.get('tenant-guard')).toBeDefined();
+      expect(runtime.requestTransforms.get('tenant-transform')).toBeDefined();
+      expect(runtime.routeResolvers.get('tenant-router')).toBeDefined();
+      expect(runtime.responseHooks.get('tenant-response')).toBeDefined();
       expect(runtime.streamHooks.get('stream-header')).toBeDefined();
+      expect(runtime.httpRoutes.get('tenant-status')).toBeDefined();
       expect(runtime.billingEventHooks.get('billing-enrich')).toBeDefined();
       expect(runtime.agentEventHooks.get('agent-enrich')).toBeDefined();
 
-      config.plugins[0].enabled = false;
+      expect(config.plugins).toBeDefined();
+      config.plugins![0]!.enabled = false;
       await syncGatewayPluginModulesFromConfig(runtime, config);
       expect(config.providers.find((provider) => provider.name === 'acme-main')).toBeUndefined();
       expect(runtime.requestHooks.get('tenant-guard')).toBeUndefined();
+      expect(runtime.requestTransforms.get('tenant-transform')).toBeUndefined();
+      expect(runtime.routeResolvers.get('tenant-router')).toBeUndefined();
+      expect(runtime.responseHooks.get('tenant-response')).toBeUndefined();
       expect(runtime.streamHooks.get('stream-header')).toBeUndefined();
+      expect(runtime.httpRoutes.get('tenant-status')).toBeUndefined();
       expect(runtime.billingEventHooks.get('billing-enrich')).toBeUndefined();
       expect(runtime.agentEventHooks.get('agent-enrich')).toBeUndefined();
     } finally {
@@ -233,6 +321,47 @@ export function createGatewayPlugin() {
         /billingPublishers\[\] must include key/
       );
       expect(readAdapterMarker(runtime.targetAdapters.getByKey('acme_messages'))).toBe('valid-module');
+    } finally {
+      await rm(pluginDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects incomplete delivery state store method groups', async () => {
+    const pluginDir = await mkdtemp(join(tmpdir(), 'gateway-plugin-loader-'));
+    const modulePath = join(pluginDir, 'partial-delivery-state.mjs');
+    await writeFile(
+      modulePath,
+      `
+export function createGatewayPlugin() {
+  return {
+    deliveryStateStores: [
+      {
+        key: 'partial-state',
+        claimDelivery() {
+          return true;
+        }
+      }
+    ]
+  };
+}
+`,
+      'utf8'
+    );
+
+    const runtime = createGatewayRuntime();
+    const config = parseGatewayConfigFromRaw({
+      plugins: [
+        {
+          key: 'partial-delivery-state',
+          modulePath
+        }
+      ]
+    });
+
+    try {
+      await expect(syncGatewayPluginModulesFromConfig(runtime, config)).rejects.toThrow(
+        /must implement both claimDelivery\(\) and releaseDeliveryClaim\(\)/
+      );
     } finally {
       await rm(pluginDir, { recursive: true, force: true });
     }
@@ -483,6 +612,20 @@ export function createGatewayPlugin({ plugin }) {
           recordClose('agent-event-outbox');
         }
       }
+    ],
+    deliveryStateStores: [
+      {
+        key: 'delivery-state',
+        claimDelivery() {
+          return true;
+        },
+        releaseDeliveryClaim() {
+          return undefined;
+        },
+        close() {
+          recordClose('delivery-state');
+        }
+      }
     ]
   };
 }
@@ -531,11 +674,48 @@ export function createGatewayPlugin() {
         }
       }
     ],
+    requestTransforms: [
+      {
+        key: 'tenant-transform',
+        transform() {
+          return;
+        }
+      }
+    ],
+    routeResolvers: [
+      {
+        key: 'tenant-router',
+        resolve() {
+          return;
+        }
+      }
+    ],
+    responseHooks: [
+      {
+        key: 'tenant-response',
+        transformResponse() {
+          return;
+        }
+      }
+    ],
     streamHooks: [
       {
         key: 'stream-header',
         transformResponse({ upstreamResponse }) {
           return upstreamResponse;
+        }
+      }
+    ],
+    httpRoutes: [
+      {
+        key: 'tenant-status',
+        method: 'GET',
+        path: '/tenant/status',
+        auth: 'none',
+        handler() {
+          return {
+            ok: true
+          };
         }
       }
     ],

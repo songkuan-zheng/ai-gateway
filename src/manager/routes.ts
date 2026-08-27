@@ -69,15 +69,30 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
       return sendProviderManagementDisabled(reply);
     }
 
-    if (options.beforeApplyConfig) {
-      await options.beforeApplyConfig(next);
-    }
-
     const before = cloneJsonObject(options.config as unknown as Record<string, unknown>);
-    writeJsonFile(path, bodyForApply);
-    applyGatewayConfigInPlace(options.config, next);
-    if (options.onConfigReload) {
-      await options.onConfigReload(options.config);
+    const previousConfig = cloneJsonValue(options.config);
+    let reloadAttempted = false;
+    try {
+      if (options.beforeApplyConfig) {
+        await options.beforeApplyConfig(next);
+      }
+      if (options.onConfigReload) {
+        reloadAttempted = true;
+        await options.onConfigReload(next);
+      }
+      writeJsonFile(path, bodyForApply);
+      applyGatewayConfigInPlace(options.config, next);
+    } catch (error) {
+      if (reloadAttempted && options.onConfigReload) {
+        try {
+          await options.onConfigReload(previousConfig);
+        } catch (rollbackError) {
+          throw new Error(
+            `${formatManagerError(error)} Runtime rollback also failed: ${formatManagerError(rollbackError)}`
+          );
+        }
+      }
+      throw error;
     }
 
     return {
@@ -183,6 +198,31 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
               sourceAdapters: hook.sourceAdapters,
               sourceRoutes: hook.sourceRoutes
             })),
+            requestTransforms: options.runtime.requestTransforms.list().map((transform) => ({
+              key: transform.key,
+              stage: transform.stage,
+              provider: transform.provider,
+              providerName: transform.providerName,
+              models: transform.models,
+              sourceAdapters: transform.sourceAdapters,
+              sourceRoutes: transform.sourceRoutes
+            })),
+            routeResolvers: options.runtime.routeResolvers.list().map((resolver) => ({
+              key: resolver.key,
+              provider: resolver.provider,
+              providerName: resolver.providerName,
+              models: resolver.models,
+              sourceAdapters: resolver.sourceAdapters,
+              sourceRoutes: resolver.sourceRoutes
+            })),
+            responseHooks: options.runtime.responseHooks.list().map((hook) => ({
+              key: hook.key,
+              provider: hook.provider,
+              providerName: hook.providerName,
+              models: hook.models,
+              sourceAdapters: hook.sourceAdapters,
+              sourceRoutes: hook.sourceRoutes
+            })),
             streamHooks: options.runtime.streamHooks.list().map((hook) => ({
               key: hook.key,
               provider: hook.provider,
@@ -190,6 +230,13 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
               models: hook.models,
               sourceAdapters: hook.sourceAdapters,
               sourceRoutes: hook.sourceRoutes
+            })),
+            httpRoutes: options.runtime.httpRoutes.list().map((route) => ({
+              key: route.key,
+              method: route.method || 'ALL',
+              path: route.path,
+              priority: route.priority || 'fallback',
+              auth: route.auth || 'gateway'
             })),
             billingEventHooks: options.runtime.billingEventHooks.list().map((hook) => ({
               key: hook.key
@@ -206,7 +253,8 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
             billingPublishers: options.runtime.billingPublishers.list().map(formatPluginExtensionSummary),
             billingOutboxes: options.runtime.billingOutboxes.list().map(formatPluginExtensionSummary),
             agentEventPublishers: options.runtime.agentEventPublishers.list().map(formatPluginExtensionSummary),
-            agentEventOutboxes: options.runtime.agentEventOutboxes.list().map(formatPluginExtensionSummary)
+            agentEventOutboxes: options.runtime.agentEventOutboxes.list().map(formatPluginExtensionSummary),
+            deliveryStateStores: options.runtime.deliveryStateStores.list().map(formatPluginExtensionSummary)
           }
         : undefined
     };
@@ -256,9 +304,14 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
               providerTypes: adapter.providerTypes || []
             })),
             requestHooks: options.runtime.requestHooks.list().map((hook) => hook.key),
+            requestTransforms: options.runtime.requestTransforms.list().map((transform) => transform.key),
+            routeResolvers: options.runtime.routeResolvers.list().map((resolver) => resolver.key),
+            responseHooks: options.runtime.responseHooks.list().map((hook) => hook.key),
             streamHooks: options.runtime.streamHooks.list().map((hook) => hook.key),
+            httpRoutes: options.runtime.httpRoutes.list().map((route) => route.key),
             billingEventHooks: options.runtime.billingEventHooks.list().map((hook) => hook.key),
-            agentEventHooks: options.runtime.agentEventHooks.list().map((hook) => hook.key)
+            agentEventHooks: options.runtime.agentEventHooks.list().map((hook) => hook.key),
+            deliveryStateStores: options.runtime.deliveryStateStores.list().map((store) => store.key)
           }
         : undefined
     };
@@ -366,14 +419,14 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
   );
 
   fastify.get('/manager/plugins/dead-letters', { preHandler }, async () => ({
-    deadLetters: listGatewayPluginDeadLetters()
+    deadLetters: await listGatewayPluginDeadLetters()
   }));
 
   fastify.delete<{ Params: ManagerPluginParams }>(
     '/manager/plugins/:key/dead-letters',
     { preHandler },
     async (request) => ({
-      cleared: clearGatewayPluginDeadLetters(request.params.key)
+      cleared: await clearGatewayPluginDeadLetters(request.params.key)
     })
   );
 
@@ -464,30 +517,7 @@ export function registerManagerRoutes(fastify: FastifyInstance, options: Manager
 
     try {
       const bodyForApply = preserveRedactedSecrets(body, readGatewayConfigFile(path));
-      const next = parseGatewayConfigFromRaw(bodyForApply);
-      if (containsProviderPayload(bodyForApply) && isProviderExternalSourceEnabled(next)) {
-        return sendProviderManagementDisabled(reply);
-      }
-
-      if (options.beforeApplyConfig) {
-        await options.beforeApplyConfig(next);
-      }
-
-      const before = cloneJsonObject(options.config as unknown as Record<string, unknown>);
-      writeJsonFile(path, bodyForApply);
-      applyGatewayConfigInPlace(options.config, next);
-      if (options.onConfigReload) {
-        await options.onConfigReload(options.config);
-      }
-
-      const warnings = collectReloadWarnings(before, options.config, bodyForApply);
-
-      return {
-        ok: true,
-        path,
-        reloadedAt: new Date().toISOString(),
-        warnings
-      };
+      return await applyConfigUpdate(request, reply, bodyForApply);
     } catch (error) {
       request.log.warn(
         {
@@ -1067,6 +1097,10 @@ function cloneJsonValue<T>(value: T): T {
   }
 
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function formatManagerError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function readStringValue(value: unknown): string | undefined {

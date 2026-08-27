@@ -33,7 +33,7 @@ export async function checkProviderHealth(
   const startedAt = Date.now();
 
   if (!requestResult.ok) {
-    recordProviderHealthFailure(providerConfig, 0);
+    recordProviderHealthFailure(providerConfig, 0, new Date(), config.providerHealthCheck?.storage);
     return {
       provider,
       providerName: providerConfig.name,
@@ -56,7 +56,7 @@ export async function checkProviderHealth(
       signal: controller.signal
     });
     const latencyMs = Date.now() - startedAt;
-    recordProviderHealthResponse(providerConfig, response.status, latencyMs);
+    recordProviderHealthResponse(providerConfig, response.status, latencyMs, new Date(), config.providerHealthCheck?.storage);
 
     return {
       provider,
@@ -70,7 +70,7 @@ export async function checkProviderHealth(
     };
   } catch (error) {
     const latencyMs = Date.now() - startedAt;
-    recordProviderHealthFailure(providerConfig, latencyMs);
+    recordProviderHealthFailure(providerConfig, latencyMs, new Date(), config.providerHealthCheck?.storage);
     return {
       provider,
       providerName: providerConfig.name,

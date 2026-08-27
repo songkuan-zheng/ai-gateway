@@ -6,6 +6,8 @@ import type {
 } from 'fastify';
 import type {
   GatewayConfig,
+  GatewayPluginHttpRoute,
+  GatewayPluginHttpRouteMethod,
   ProviderConfig,
   SourceAdapter,
   SourceAdapterRoute,
@@ -30,6 +32,8 @@ import { createGatewayIdempotencyPreHandler } from './idempotency';
 import { listGatewayVirtualModelProfiles, type GatewayRuntime } from './runtime';
 import { decodeGatewayVideoId } from './video-compat';
 import { executeGatewayPluginRequestHookStage } from '../plugins/hooks';
+import { runGatewayPluginProtectedOperation } from '../plugins/execution';
+import { recordGatewayPluginHookExecution } from './metrics';
 
 type ModelListFormat = 'openai' | 'anthropic';
 
@@ -73,15 +77,35 @@ export function registerGatewayRoutes(
   config: GatewayConfig,
   runtime: GatewayRuntime
 ) {
+  ensureFormBodyParser(fastify);
   const gatewayAuthPreHandler = createGatewayAuthPreHandler(config.auth);
   const gatewayPluginPreAuthHandler = createGatewayPluginPreAuthHandler(config, runtime);
   const gatewayVideoModelPreHandler = createGatewayVideoModelPreHandler(config);
   const gatewayIdempotencyPreHandler = createGatewayIdempotencyPreHandler(config);
+  const gatewayDeferredIdempotencyPreHandler = createGatewayIdempotencyPreHandler(config, {
+    defer: true
+  });
   const gatewayWritePreHandlers = [
     gatewayPluginPreAuthHandler,
     gatewayAuthPreHandler,
     gatewayIdempotencyPreHandler
   ];
+  const gatewayModelWritePreHandlers = [
+    gatewayPluginPreAuthHandler,
+    gatewayAuthPreHandler,
+    gatewayDeferredIdempotencyPreHandler
+  ];
+
+  fastify.addHook('preHandler', async (request, reply) => {
+    const httpRoute = resolvePluginHttpRoute(runtime, request.method, request.url, 'pre');
+    if (!httpRoute) {
+      return;
+    }
+    await handlePluginHttpRoute(httpRoute, request, reply, config, runtime, [
+      gatewayPluginPreAuthHandler,
+      gatewayAuthPreHandler
+    ]);
+  });
 
   fastify.get<{ Querystring: ModelListQuery }>(
     '/v1/models',
@@ -114,7 +138,7 @@ export function registerGatewayRoutes(
     }
   );
 
-  fastify.post('/v1/chat/completions', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+  fastify.post('/v1/chat/completions', { preHandler: gatewayModelWritePreHandlers }, async (request, reply) => {
     return handleGatewayRequest(
       request,
       reply,
@@ -126,7 +150,7 @@ export function registerGatewayRoutes(
     );
   });
 
-  fastify.post('/v1/responses', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+  fastify.post('/v1/responses', { preHandler: gatewayModelWritePreHandlers }, async (request, reply) => {
     return handleGatewayRequest(
       request,
       reply,
@@ -181,7 +205,7 @@ export function registerGatewayRoutes(
     }
   );
 
-  fastify.post('/v1/messages', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+  fastify.post('/v1/messages', { preHandler: gatewayModelWritePreHandlers }, async (request, reply) => {
     return handleGatewayRequest(
       request,
       reply,
@@ -195,13 +219,13 @@ export function registerGatewayRoutes(
 
   fastify.post<{ Params: { '*': string } }>(
     '/v1beta/models/*',
-    { preHandler: gatewayWritePreHandlers },
+    { preHandler: gatewayModelWritePreHandlers },
     async (request, reply) => {
       return handleGeminiRequest(request, reply, 'v1beta', config, runtime);
     }
   );
 
-  fastify.post('/v1beta/interactions', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+  fastify.post('/v1beta/interactions', { preHandler: gatewayModelWritePreHandlers }, async (request, reply) => {
     return handleGatewayRequest(
       request,
       reply,
@@ -218,13 +242,13 @@ export function registerGatewayRoutes(
 
   fastify.post<{ Params: { '*': string } }>(
     '/v1/models/*',
-    { preHandler: gatewayWritePreHandlers },
+    { preHandler: gatewayModelWritePreHandlers },
     async (request, reply) => {
       return handleGeminiRequest(request, reply, 'v1', config, runtime);
     }
   );
 
-  fastify.post('/v1/interactions', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+  fastify.post('/v1/interactions', { preHandler: gatewayModelWritePreHandlers }, async (request, reply) => {
     return handleGatewayRequest(
       request,
       reply,
@@ -240,6 +264,14 @@ export function registerGatewayRoutes(
   });
 
   fastify.all<{ Params: { '*': string } }>('/*', async (request, reply) => {
+    const httpRoute = resolvePluginHttpRoute(runtime, request.method, request.url, 'fallback');
+    if (httpRoute) {
+      return handlePluginHttpRoute(httpRoute, request, reply, config, runtime, [
+        gatewayPluginPreAuthHandler,
+        gatewayAuthPreHandler
+      ]);
+    }
+
     const match = resolvePluginSourceAdapterRoute(runtime, request.method, request.url);
     if (!match) {
       return reply.code(404).send({
@@ -249,7 +281,7 @@ export function registerGatewayRoutes(
       });
     }
 
-    const canContinue = await runGatewayRoutePreHandlers(gatewayWritePreHandlers, request, reply);
+    const canContinue = await runGatewayRoutePreHandlers(gatewayModelWritePreHandlers, request, reply);
     if (!canContinue) {
       return reply;
     }
@@ -269,6 +301,154 @@ export function registerGatewayRoutes(
       runtime
     );
   });
+}
+
+function ensureFormBodyParser(fastify: FastifyInstance): void {
+  if (fastify.hasContentTypeParser('application/x-www-form-urlencoded')) {
+    return;
+  }
+
+  fastify.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string' },
+    (_request, body, done) => {
+      done(null, parseFormBody(body));
+    }
+  );
+}
+
+function parseFormBody(body: string | Buffer): Record<string, string | string[]> {
+  const params = new URLSearchParams(Buffer.isBuffer(body) ? body.toString('utf8') : body);
+  const parsed: Record<string, string | string[]> = {};
+  for (const [key, value] of params.entries()) {
+    const existing = parsed[key];
+    if (existing === undefined) {
+      parsed[key] = value;
+      continue;
+    }
+
+    if (Array.isArray(existing)) {
+      existing.push(value);
+      continue;
+    }
+
+    parsed[key] = [existing, value];
+  }
+  return parsed;
+}
+
+async function handlePluginHttpRoute(
+  route: GatewayPluginHttpRoute,
+  request: FastifyRequest,
+  reply: FastifyReply,
+  config: GatewayConfig,
+  runtime: GatewayRuntime,
+  authPreHandlers: preHandlerHookHandler[]
+) {
+  if (route.auth !== 'none') {
+    const canContinue = await runGatewayRoutePreHandlers(authPreHandlers, request, reply);
+    if (!canContinue) {
+      return reply;
+    }
+  }
+
+  const startedAt = process.hrtime.bigint();
+  const executionResult = await runGatewayPluginProtectedOperation({
+    pluginKey: route.key,
+    kind: 'http_route',
+    hook: `${normalizeHttpRouteMethod(route.method || 'ALL') || 'ALL'} ${route.path}`,
+    execution: route.execution,
+    operation: () => route.handler({
+      request,
+      reply,
+      config,
+      route,
+      runtime
+    })
+  });
+  if (!executionResult.ok) {
+    recordGatewayPluginHookExecution({
+      pluginKey: route.key,
+      kind: 'http_route',
+      hook: 'handler',
+      outcome: executionResult.reason,
+      durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+    });
+    request.log.warn(
+      {
+        pluginKey: route.key,
+        route: route.path,
+        details: executionResult.error
+      },
+      'Gateway plugin HTTP route failed.'
+    );
+    return reply.code(500).send({
+      error: {
+        message: `Gateway plugin "${route.key}" HTTP route failed: ${executionResult.error}`
+      }
+    });
+  }
+
+  if ('skipped' in executionResult) {
+    recordGatewayPluginHookExecution({
+      pluginKey: route.key,
+      kind: 'http_route',
+      hook: 'handler',
+      outcome: executionResult.reason,
+      durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+    });
+    return reply.code(503).send({
+      error: {
+        message: `Gateway plugin "${route.key}" HTTP route is temporarily unavailable.`
+      }
+    });
+  }
+
+  recordGatewayPluginHookExecution({
+    pluginKey: route.key,
+    kind: 'http_route',
+    hook: 'handler',
+    outcome: 'success',
+    durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+  });
+  if (reply.sent || executionResult.value === undefined) {
+    return reply;
+  }
+
+  return reply.send(executionResult.value);
+}
+
+function resolvePluginHttpRoute(
+  runtime: Pick<GatewayRuntime, 'httpRoutes'>,
+  method: string,
+  rawUrl: string,
+  priority: 'pre' | 'fallback'
+): GatewayPluginHttpRoute | undefined {
+  const requestMethod = normalizeHttpRouteMethod(method);
+  if (!requestMethod) {
+    return undefined;
+  }
+
+  const requestPath = normalizeRequestPath(rawUrl);
+  for (const route of runtime.httpRoutes.list()) {
+    const routePriority = route.priority || 'fallback';
+    if (routePriority !== priority) {
+      continue;
+    }
+    const routePath = normalizeSourceAdapterRoutePath(route.path);
+    if (!routePath) {
+      continue;
+    }
+    const routeMethod = normalizeHttpRouteMethod(route.method || 'ALL');
+    if (routeMethod !== 'ALL' && routeMethod !== requestMethod) {
+      continue;
+    }
+    if (doesSourceAdapterRouteMatchPath(routePath, requestPath)) {
+      return route;
+    }
+  }
+
+  return undefined;
 }
 
 function resolvePluginSourceAdapterRoute(
@@ -392,6 +572,24 @@ function normalizeSourceAdapterRouteMethod(method: string | undefined): SourceAd
   return undefined;
 }
 
+function normalizeHttpRouteMethod(method: string | undefined): GatewayPluginHttpRouteMethod | undefined {
+  const normalized = method?.trim().toUpperCase();
+  if (
+    normalized === 'GET' ||
+    normalized === 'POST' ||
+    normalized === 'PUT' ||
+    normalized === 'PATCH' ||
+    normalized === 'DELETE' ||
+    normalized === 'HEAD' ||
+    normalized === 'OPTIONS' ||
+    normalized === 'ALL'
+  ) {
+    return normalized;
+  }
+
+  return undefined;
+}
+
 function doesSourceAdapterRouteMatchPath(routePath: string, requestPath: string): boolean {
   if (routePath.endsWith('/*')) {
     const prefix = routePath.slice(0, -1);
@@ -405,7 +603,7 @@ function createGatewayPluginPreAuthHandler(
   config: GatewayConfig,
   runtime: GatewayRuntime
 ): preHandlerHookHandler {
-  return async function gatewayPluginPreAuthHandler(request, reply): Promise<void> {
+  return async function gatewayPluginPreAuthHandler(request, reply) {
     const result = await executeGatewayPluginRequestHookStage(
       runtime.requestHooks.list(),
       'beforeAuth',
@@ -423,7 +621,7 @@ function createGatewayPluginPreAuthHandler(
       return;
     }
 
-    reply.code(result.status || 403).send({
+    return reply.code(result.status || 403).send({
       error: {
         message: `Gateway plugin "${result.pluginKey}" beforeAuth failed: ${result.error}`,
         details: result.details

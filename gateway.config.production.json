@@ -1,0 +1,125 @@
+{
+  "host": "0.0.0.0",
+  "port": 3000,
+  "defaultTargetProvider": "openai",
+  "providers": [
+    {
+      "name": "openai-main",
+      "type": "openai_responses",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "baseurl": "https://api.openai.com/v1",
+      "models": ["gpt-4.1-mini"],
+      "health": {
+        "status": "unknown",
+        "available": true,
+        "priority": 1
+      }
+    }
+  ],
+  "auth": {
+    "enabled": true,
+    "mode": "static_api_key",
+    "required": true,
+    "staticApiKeys": {
+      "keysEnv": "AUTH_STATIC_API_KEYS",
+      "keyHeader": "authorization",
+      "keyBearerOnly": true
+    }
+  },
+  "logging": {
+    "enabled": true,
+    "level": "warn"
+  },
+  "metrics": {
+    "enabled": true,
+    "includeProviderHealth": true
+  },
+  "healthAwareRouting": {
+    "enabled": true,
+    "skipUnavailable": true,
+    "preferHealthy": true
+  },
+  "providerHealthCheck": {
+    "enabled": true,
+    "intervalMs": 60000,
+    "timeoutMs": 5000,
+    "initialDelayMs": 10000,
+    "storage": {
+      "type": "memory"
+    }
+  },
+  "idempotency": {
+    "enabled": true,
+    "ttlMs": 86400000,
+    "maxEntries": 10000,
+    "maxResponseBytes": 4194304,
+    "maxTotalBytes": 134217728,
+    "cacheErrorResponses": false,
+    "pendingWaitTimeoutMs": 30000,
+    "pollIntervalMs": 100,
+    "storage": {
+      "type": "memory"
+    }
+  },
+  "upstreamConcurrency": {
+    "enabled": true,
+    "maxInFlightPerProvider": 100,
+    "queueTimeoutMs": 1000,
+    "storage": {
+      "type": "memory"
+    }
+  },
+  "upstreamCircuitBreaker": {
+    "enabled": true,
+    "failureThreshold": 5,
+    "cooldownMs": 30000,
+    "failureStatusCodes": [429, 500, 502, 503, 504],
+    "storage": {
+      "type": "memory"
+    }
+  },
+  "upstreamRetry": {
+    "enabled": true,
+    "maxAttempts": 2,
+    "baseDelayMs": 200,
+    "maxDelayMs": 2000
+  },
+  "scheduling": {
+    "enabled": false,
+    "storage": {
+      "type": "memory"
+    }
+  },
+  "precheck": {
+    "enabled": false,
+    "storage": {
+      "type": "memory"
+    }
+  },
+  "billing": {
+    "enabled": false,
+    "delivery": {
+      "mode": "async",
+      "requirePublisher": false,
+      "requireOutbox": false,
+      "shutdownDrainTimeoutMs": 5000
+    },
+    "requireUsage": false,
+    "requireRates": false
+  },
+  "rawTrace": {
+    "enabled": false,
+    "spoolDir": "/data/gateway/raw-trace"
+  },
+  "agent": {
+    "storage": {
+      "type": "memory"
+    }
+  },
+  "mcpGateway": {
+    "enabled": false,
+    "websocket": {
+      "enabled": false
+    }
+  }
+}

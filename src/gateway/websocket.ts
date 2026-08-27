@@ -1,23 +1,29 @@
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import type { Socket } from 'node:net';
 import { URL } from 'node:url';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
+import { calculateUsageBilling, publishBillingEvent } from '../billing';
 import {
   buildOpenAIHeaders,
   normalizeOpenAIResponsesCompletedEventPayload
 } from '../adapters/builtins/common';
 import type {
+  BillingRate,
   GatewayConfig,
+  GatewayPluginRouteResolution,
+  GatewayPluginTargetRoute,
   GatewaySourceContext,
   HeaderBag,
   Provider,
   ProviderConfig,
   ProviderPlugin,
+  StandardUsage,
   UpstreamRequest
 } from '../types';
 import { err, ok, type Result } from '../types';
-import { findDefaultProviderConfig, parseProvider, providerFromProviderType } from '../utils';
+import { parseProvider } from '../utils';
 import { authenticateGatewayRequest, evaluateApiKeyModelRestriction } from './auth';
 import {
   parseGatewayCodexWsSourceAdapterKey,
@@ -25,8 +31,29 @@ import {
   type GatewayCodexWsSourceAdapterKey
 } from './codex-websocket-conversion';
 import { evaluateGatewayPrecheck } from './precheck';
+import { recordGatewayPluginHookExecution } from './metrics';
 import type { GatewayRuntime } from './runtime';
+import { resolveGatewayClientIp } from './client-ip';
 import { shouldRunProviderPlugin } from '../provider/plugins';
+import {
+  applyGatewayPluginRequestTransforms,
+  executeGatewayPluginRequestHookStage,
+  resolveGatewayPluginRoute
+} from '../plugins/hooks';
+import { runGatewayPluginProtectedOperation } from '../plugins/execution';
+import {
+  shouldBlockLiveStreamingForStrictBilling,
+  strictBillingLiveStreamingUnsupportedMessage
+} from './strict-billing';
+import { applyHealthAwareRouting } from './health-routing';
+import { recordProviderHealthFailure, recordProviderHealthResponse } from './provider-health';
+import { applyGatewayScheduling, recordGatewaySchedulingResponse } from './scheduler';
+import {
+  checkProviderCircuitBreaker,
+  recordProviderCircuitBreakerFailure,
+  recordProviderCircuitBreakerResponse
+} from './upstream-circuit-breaker';
+import { acquireProviderConcurrencySlot } from './upstream-concurrency';
 
 interface GatewaySocketContext {
   headers: IncomingHttpHeaders;
@@ -34,6 +61,19 @@ interface GatewaySocketContext {
   request: FastifyRequest;
   sourceAdapterHint?: GatewayCodexWsSourceAdapterKey;
   targetProviderConfig?: ProviderConfig;
+  billingModel?: string;
+}
+
+interface ResponsesWebSocketTargetRoute {
+  provider: Provider;
+  providerConfig?: ProviderConfig;
+}
+
+interface ResponsesWebSocketUpstreamTarget {
+  provider: Provider;
+  baseUrl: string;
+  apiKey?: string;
+  providerConfig?: ProviderConfig;
 }
 
 const blockedForwardHeaderSet = new Set([
@@ -62,7 +102,7 @@ type WebSocketPayload = RawData | string;
 export function registerGatewayResponsesWebSocketRoute(
   fastify: FastifyInstance,
   config: GatewayConfig,
-  runtime?: Pick<GatewayRuntime, 'providerPlugins'>
+  runtime?: Pick<GatewayRuntime, 'providerPlugins' | 'requestHooks' | 'requestTransforms' | 'routeResolvers'>
 ): void {
   const maxPayload = resolveGatewayWebSocketMaxPayloadBytes(config);
   const websocketServer = new WebSocketServer({ noServer: true, maxPayload });
@@ -83,15 +123,33 @@ export function registerGatewayResponsesWebSocketRoute(
     head: Buffer,
     requestUrl: URL
   ): Promise<void> {
+    const pluginCompatibleRequest = createWebSocketPluginCompatibleRequest(request, requestUrl, fastify);
+    const beforeAuthResult = await executeGatewayPluginRequestHookStage(
+      runtime?.requestHooks?.list() || [],
+      'beforeAuth',
+      {
+        request: pluginCompatibleRequest,
+        config,
+        route: {
+          method: request.method || 'GET',
+          url: request.url || requestUrl.pathname,
+          route: 'WS /v1/responses'
+        }
+      }
+    );
+    if (!beforeAuthResult.ok) {
+      rejectUpgrade(
+        socket,
+        beforeAuthResult.status || 403,
+        `Gateway plugin "${beforeAuthResult.pluginKey}" beforeAuth failed: ${beforeAuthResult.error}`
+      );
+      return;
+    }
+
     let authResult;
     try {
       authResult = await authenticateGatewayRequest(
-        {
-          headers: request.headers,
-          method: request.method || 'GET',
-          url: request.url || requestUrl.pathname,
-          ip: request.socket.remoteAddress || ''
-        } as FastifyRequest,
+        pluginCompatibleRequest,
         config.auth
       );
     } catch (error) {
@@ -110,8 +168,12 @@ export function registerGatewayResponsesWebSocketRoute(
       return;
     }
 
+    if (shouldBlockLiveStreamingForStrictBilling(config)) {
+      rejectUpgrade(socket, 400, strictBillingLiveStreamingUnsupportedMessage);
+      return;
+    }
+
     websocketServer.handleUpgrade(request, socket, head, (ws) => {
-      const pluginCompatibleRequest = createWebSocketPluginCompatibleRequest(request, requestUrl, fastify);
       pluginCompatibleRequest.gatewayIdentity = authResult.ok ? authResult.identity : undefined;
       pluginCompatibleRequest.gatewayApiKeyRestrictions = authResult.ok
         ? authResult.apiKeyRestrictions
@@ -138,9 +200,186 @@ export function registerGatewayResponsesWebSocketRoute(
     }
 
     let upstreamSocket: WebSocket | undefined;
+    let releaseConcurrency: (() => void) | undefined;
+    let concurrencyReleased = false;
+    const initializationAbortController = new AbortController();
+    const releaseInitializationConcurrency = (): void => {
+      if (concurrencyReleased || !releaseConcurrency) {
+        return;
+      }
+      concurrencyReleased = true;
+      releaseConcurrency();
+    };
+    const initializationCancelled = (): boolean => (
+      initializationAbortController.signal.aborted ||
+      downstreamSocket.readyState === WebSocket.CLOSING ||
+      downstreamSocket.readyState === WebSocket.CLOSED
+    );
+    const onDownstreamClosedDuringInitialization = (): void => {
+      initializationAbortController.abort(
+        new Error('Downstream websocket closed while the upstream relay was initializing.')
+      );
+      releaseInitializationConcurrency();
+      if (
+        upstreamSocket &&
+        (upstreamSocket.readyState === WebSocket.CONNECTING || upstreamSocket.readyState === WebSocket.OPEN)
+      ) {
+        upstreamSocket.terminate();
+      }
+    };
+    downstreamSocket.once('close', onDownstreamClosedDuringInitialization);
+
     try {
-      const upstreamTarget = resolveResponsesWebSocketTarget(config, context);
+      let sourceAdapterKey = context.sourceAdapterHint || 'openai_responses';
+      const beforeRoutingTransformResult = await applyGatewayPluginRequestTransforms(
+        runtime?.requestTransforms?.list() || [],
+        {
+          stage: 'beforeRouting',
+          request: context.request,
+          config,
+          route: {
+            method: context.request.method,
+            url: context.request.url,
+            route: 'WS /v1/responses',
+            sourceAdapterKey,
+            sourceRoute: 'websocket'
+          },
+          source: {
+            adapterKey: sourceAdapterKey,
+            metadata: {
+              sourceRoute: 'websocket'
+            }
+          },
+          sourceProvider: 'openai',
+          sourceAdapterKey,
+          targetProvider: 'openai'
+        }
+      );
+      if (initializationCancelled()) {
+        return;
+      }
+      if (!beforeRoutingTransformResult.ok) {
+        downstreamSocket.close(
+          1008,
+          `Gateway plugin "${beforeRoutingTransformResult.pluginKey}" beforeRouting request transform failed: ${beforeRoutingTransformResult.error}`
+        );
+        return;
+      }
+      if (beforeRoutingTransformResult.value.source?.adapterKey) {
+        const transformedSourceAdapterKey = parseGatewayCodexWsSourceAdapterKey(
+          beforeRoutingTransformResult.value.source.adapterKey
+        );
+        if (!transformedSourceAdapterKey) {
+          downstreamSocket.close(
+            1008,
+            'Gateway plugin request transform selected an unsupported websocket source adapter.'
+          );
+          return;
+        }
+        sourceAdapterKey = transformedSourceAdapterKey;
+        context.sourceAdapterHint = transformedSourceAdapterKey;
+      }
+      const routeResolutionResult = await resolveGatewayPluginRoute(
+        runtime?.routeResolvers?.list() || [],
+        {
+          request: context.request,
+          config,
+          route: {
+            method: context.request.method,
+            url: context.request.url,
+            route: 'WS /v1/responses',
+            sourceAdapterKey,
+            sourceRoute: 'websocket'
+          },
+          source: {
+            adapterKey: sourceAdapterKey,
+            metadata: {
+              sourceRoute: 'websocket'
+            }
+          },
+          sourceProvider: 'openai',
+          sourceAdapterKey,
+          targetProvider: 'openai'
+        }
+      );
+      if (initializationCancelled()) {
+        return;
+      }
+      if (!routeResolutionResult.ok) {
+        downstreamSocket.close(
+          1008,
+          `Gateway plugin "${routeResolutionResult.pluginKey}" route resolver failed: ${routeResolutionResult.error}`
+        );
+        return;
+      }
+      const targetRoutesResult = resolveResponsesWebSocketTargetRoutes(
+        config,
+        context,
+        routeResolutionResult.value
+      );
+      if (!targetRoutesResult.ok) {
+        downstreamSocket.close(1008, targetRoutesResult.error);
+        return;
+      }
+      const scheduledTargetRoutes = await applyGatewayScheduling(targetRoutesResult.value, {
+        config,
+        request: context.request
+      });
+      if (initializationCancelled()) {
+        return;
+      }
+      const targetRoutes = await applyHealthAwareRouting(scheduledTargetRoutes, config);
+      if (initializationCancelled()) {
+        return;
+      }
+      const selectedTargetRoute = targetRoutes[0];
+      if (!selectedTargetRoute) {
+        downstreamSocket.close(1013, 'No compatible /v1/responses websocket upstream provider is available.');
+        return;
+      }
+      const upstreamTargetResult = resolveResponsesWebSocketTarget(config, selectedTargetRoute);
+      if (!upstreamTargetResult.ok) {
+        downstreamSocket.close(1008, upstreamTargetResult.error);
+        return;
+      }
+      const upstreamTarget = upstreamTargetResult.value;
       context.targetProviderConfig = upstreamTarget.providerConfig;
+      const beforeRoutingResult = await executeGatewayPluginRequestHookStage(
+        runtime?.requestHooks?.list() || [],
+        'beforeRouting',
+        {
+          request: context.request,
+          config,
+          route: {
+            method: context.request.method,
+            url: context.request.url,
+            route: 'WS /v1/responses',
+            sourceAdapterKey,
+            sourceRoute: 'websocket'
+          },
+          source: {
+            adapterKey: sourceAdapterKey,
+            metadata: {
+              sourceRoute: 'websocket'
+            }
+          },
+          sourceProvider: 'openai',
+          sourceAdapterKey,
+          targetProvider: 'openai',
+          targetProviderConfig: upstreamTarget.providerConfig
+        }
+      );
+      if (initializationCancelled()) {
+        return;
+      }
+      if (!beforeRoutingResult.ok) {
+        downstreamSocket.close(
+          1008,
+          `Gateway plugin "${beforeRoutingResult.pluginKey}" beforeRouting failed: ${beforeRoutingResult.error}`
+        );
+        return;
+      }
+
       const upstreamUrl = buildResponsesUpstreamUrl(upstreamTarget.baseUrl, context.requestUrl);
       const upstreamHeaders = buildUpstreamHeaders(context.headers, {
         openaiApiKey: upstreamTarget.apiKey,
@@ -151,10 +390,10 @@ export function registerGatewayResponsesWebSocketRoute(
         request: context.request,
         config,
         source: {
-          adapterKey: context.sourceAdapterHint || 'openai_responses'
+          adapterKey: sourceAdapterKey
         },
         sourceProvider: 'openai',
-        sourceAdapterKey: context.sourceAdapterHint || 'openai_responses',
+        sourceAdapterKey,
         targetProvider: 'openai',
         targetProviderConfig: upstreamTarget.providerConfig,
         model: undefined,
@@ -171,6 +410,9 @@ export function registerGatewayResponsesWebSocketRoute(
           body: {}
         }
       );
+      if (initializationCancelled()) {
+        return;
+      }
       if (!upstreamRequestResult.ok) {
         fastify.log.warn(
           {
@@ -183,17 +425,85 @@ export function registerGatewayResponsesWebSocketRoute(
         return;
       }
 
+      const circuit = await checkProviderCircuitBreaker(
+        config,
+        upstreamTarget.provider,
+        upstreamTarget.providerConfig
+      );
+      if (initializationCancelled()) {
+        return;
+      }
+      if (!circuit.ok) {
+        recordGatewaySchedulingResponse({
+          config,
+          request: context.request,
+          providerConfig: upstreamTarget.providerConfig,
+          error: true
+        });
+        downstreamSocket.close(1013, circuit.message);
+        return;
+      }
+
+      const slot = await acquireProviderConcurrencySlot(
+        config,
+        upstreamTarget.provider,
+        upstreamTarget.providerConfig,
+        initializationAbortController.signal
+      );
+      if (initializationCancelled()) {
+        if (slot.ok) {
+          releaseConcurrency = slot.release;
+          releaseInitializationConcurrency();
+        }
+        return;
+      }
+      if (!slot.ok) {
+        recordGatewaySchedulingResponse({
+          config,
+          request: context.request,
+          providerConfig: upstreamTarget.providerConfig,
+          error: true
+        });
+        downstreamSocket.close(1013, slot.message);
+        return;
+      }
+      releaseConcurrency = slot.release;
+
       const normalizedWebSocketUrl = normalizeUrlForWebSocket(upstreamRequestResult.value.url);
       upstreamSocket = new WebSocket(normalizedWebSocketUrl, {
         headers: upstreamRequestResult.value.headers,
-        maxPayload: resolveGatewayWebSocketMaxPayloadBytes(config)
+        maxPayload: resolveGatewayWebSocketMaxPayloadBytes(config),
+        handshakeTimeout: resolveGatewayWebSocketHandshakeTimeoutMs(config)
       });
+      if (initializationCancelled()) {
+        upstreamSocket.terminate();
+        releaseInitializationConcurrency();
+        return;
+      }
+      recordResponsesWebSocketUpstreamConnection(upstreamSocket, upstreamTarget, context, config);
+      downstreamSocket.off('close', onDownstreamClosedDuringInitialization);
+      bindSocketRelay(
+        downstreamSocket,
+        upstreamSocket,
+        fastify,
+        context,
+        config,
+        runtime,
+        releaseInitializationConcurrency
+      );
     } catch (error) {
-      downstreamSocket.close(1011, `Failed to init upstream websocket: ${toErrorMessage(error)}`);
+      releaseInitializationConcurrency();
+      if (
+        upstreamSocket &&
+        (upstreamSocket.readyState === WebSocket.CONNECTING || upstreamSocket.readyState === WebSocket.OPEN)
+      ) {
+        upstreamSocket.terminate();
+      }
+      if (!initializationCancelled()) {
+        downstreamSocket.close(1011, `Failed to init upstream websocket: ${toErrorMessage(error)}`);
+      }
       return;
     }
-
-    bindSocketRelay(downstreamSocket, upstreamSocket, fastify, context, config);
   }
 
   fastify.server.on('upgrade', onUpgrade);
@@ -213,7 +523,9 @@ function bindSocketRelay(
   upstreamSocket: WebSocket,
   fastify: FastifyInstance,
   context: GatewaySocketContext,
-  config: GatewayConfig
+  config: GatewayConfig,
+  runtime?: Pick<GatewayRuntime, 'requestHooks'>,
+  releaseResources: () => void = noop
 ): void {
   const pendingDownstreamMessages: Array<{
     payload: WebSocketPayload;
@@ -225,12 +537,22 @@ function bindSocketRelay(
   let pendingUpstreamToDownstreamSends = 0;
   let upstreamCloseForceTimer: NodeJS.Timeout | undefined;
   let downstreamMessageQueue = Promise.resolve();
+  let upstreamMessageQueue = Promise.resolve();
   let upstreamClosePending:
     | {
         code: number;
         reason: Buffer | string;
       }
     | undefined;
+  let resourcesReleased = false;
+
+  const releaseRelayResources = (): void => {
+    if (resourcesReleased) {
+      return;
+    }
+    resourcesReleased = true;
+    releaseResources();
+  };
 
   const closePeer = (peer: WebSocket, code: number, reason: Buffer | string): void => {
     const normalizedCode = normalizeCloseCode(code);
@@ -307,7 +629,8 @@ function bindSocketRelay(
       context,
       downstreamSocket,
       fastify,
-      config
+      config,
+      runtime
     );
     if (!messageForUpstream) {
       return;
@@ -346,27 +669,100 @@ function bindSocketRelay(
 
     const messageForDownstream = buildMessageForDownstream(raw, isBinary);
     pendingUpstreamToDownstreamSends += 1;
-    downstreamSocket.send(messageForDownstream.payload, { binary: messageForDownstream.binary }, (error) => {
-      pendingUpstreamToDownstreamSends = Math.max(0, pendingUpstreamToDownstreamSends - 1);
-      if (error) {
-        closePeer(upstreamSocket, 1011, 'Downstream send failed.');
-      }
-
-      flushUpstreamCloseToDownstream();
-    });
+    const relayMessage = () => relayUpstreamMessageToDownstream(messageForDownstream);
+    const processing = shouldBlockLiveStreamingForStrictBilling(config)
+      ? (upstreamMessageQueue = upstreamMessageQueue.then(relayMessage, relayMessage))
+      : relayMessage();
+    void processing
+      .catch((error) => {
+        fastify.log.warn(
+          {
+            requestId: context.request.id,
+            details: toErrorMessage(error)
+          },
+          'Gateway responses websocket upstream message relay failed.'
+        );
+        closePeer(upstreamSocket, 1011, 'Gateway websocket message relay failed.');
+        closePeer(downstreamSocket, 1011, 'Gateway websocket message relay failed.');
+      })
+      .finally(() => {
+        pendingUpstreamToDownstreamSends = Math.max(0, pendingUpstreamToDownstreamSends - 1);
+        flushUpstreamCloseToDownstream();
+      });
   });
+
+  async function relayUpstreamMessageToDownstream(message: {
+    payload: WebSocketPayload;
+    binary: boolean;
+  }): Promise<void> {
+    const strictBilling = shouldBlockLiveStreamingForStrictBilling(config);
+    const processBilling = () => publishWebSocketBillingEventFromDownstreamPayload(
+      message.payload,
+      message.binary,
+      context,
+      config,
+      fastify
+    );
+
+    if (strictBilling) {
+      try {
+        await processBilling();
+      } catch (billingError) {
+        logWebSocketBillingError(billingError);
+        closePeer(upstreamSocket, 1011, 'Gateway websocket billing enforcement failed.');
+        closePeer(downstreamSocket, 1011, 'Gateway websocket billing enforcement failed.');
+        return;
+      }
+    }
+
+    if (downstreamSocket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    const sent = await new Promise<boolean>((resolve) => {
+      downstreamSocket.send(message.payload, { binary: message.binary }, (error) => {
+        if (error) {
+          closePeer(upstreamSocket, 1011, 'Downstream send failed.');
+          resolve(false);
+          return;
+        }
+        resolve(true);
+      });
+    });
+    if (!sent || strictBilling) {
+      return;
+    }
+
+    void processBilling().catch(logWebSocketBillingError);
+  }
+
+  function logWebSocketBillingError(billingError: unknown): void {
+    fastify.log.warn(
+      {
+        requestId: context.request.id,
+        details: billingError instanceof Error ? billingError.message : String(billingError)
+      },
+      'Failed to process websocket billing event.'
+    );
+  }
 
   downstreamSocket.on('close', (code, reason) => {
     if (upstreamCloseForceTimer) {
       clearTimeout(upstreamCloseForceTimer);
       upstreamCloseForceTimer = undefined;
     }
+    releaseRelayResources();
     closePeer(upstreamSocket, code, reason);
   });
 
   upstreamSocket.on('close', (code, reason) => {
+    releaseRelayResources();
     upstreamClosePending = { code, reason };
-    if (pendingUpstreamToDownstreamSends > 0 && !upstreamCloseForceTimer) {
+    if (
+      pendingUpstreamToDownstreamSends > 0 &&
+      !shouldBlockLiveStreamingForStrictBilling(config) &&
+      !upstreamCloseForceTimer
+    ) {
       upstreamCloseForceTimer = setTimeout(() => {
         upstreamCloseForceTimer = undefined;
         if (!upstreamClosePending) {
@@ -387,6 +783,7 @@ function bindSocketRelay(
   });
 
   downstreamSocket.on('error', (error) => {
+    releaseRelayResources();
     fastify.log.warn(
       {
         details: toErrorMessage(error)
@@ -397,6 +794,7 @@ function bindSocketRelay(
   });
 
   upstreamSocket.on('error', (error) => {
+    releaseRelayResources();
     fastify.log.warn(
       {
         details: toErrorMessage(error)
@@ -428,6 +826,163 @@ function buildMessageForDownstream(
   };
 }
 
+async function publishWebSocketBillingEventFromDownstreamPayload(
+  payload: WebSocketPayload,
+  isBinary: boolean,
+  context: GatewaySocketContext,
+  config: GatewayConfig,
+  fastify: FastifyInstance
+): Promise<void> {
+  if (!config.billing?.enabled || isBinary || typeof payload !== 'string') {
+    return;
+  }
+
+  const billingSnapshot = extractWebSocketCompletedBillingSnapshot(payload);
+  if (!billingSnapshot) {
+    if (config.billing.requireUsage && isWebSocketCompletedResponsePayload(payload)) {
+      throw new Error('Billing usage is required but could not be parsed for websocket response.');
+    }
+    return;
+  }
+
+  const targetProvider = 'openai';
+  const model = billingSnapshot.model || context.billingModel;
+  const billing = calculateUsageBilling(
+    targetProvider,
+    billingSnapshot.usage,
+    config.billing,
+    resolveWebSocketBillingRate(config, targetProvider, model, context.targetProviderConfig)
+  );
+  if (config.billing.requireRates && hasBillableWebSocketUsage(billingSnapshot.usage) && billing.cost.total <= 0) {
+    throw new Error(
+      `Billing rates are required but produced zero cost for websocket provider ${targetProvider}${model ? ` model ${model}` : ''}.`
+    );
+  }
+  const event = {
+    eventId: randomUUID(),
+    emittedAt: new Date().toISOString(),
+    requestId: context.request.id,
+    clientIp: resolveGatewayClientIp(context.request, config),
+    route: {
+      method: 'WS',
+      url: sanitizeRequestUrlForEvent(context.request.url || context.requestUrl)
+    },
+    source: {
+      provider: 'openai' as Provider,
+      adapterKey: context.sourceAdapterHint || 'openai_responses'
+    },
+    target: {
+      provider: targetProvider as Provider,
+      providerName: context.targetProviderConfig?.name,
+      model
+    },
+    fallback: {
+      used: false,
+      attempts: 0
+    },
+    identity: context.request.gatewayIdentity,
+    outcome: {
+      status: 'success' as const,
+      statusCode: 200
+    },
+    billing
+  };
+
+  const delivered = await publishBillingEvent(event).catch((error) => {
+    fastify.log.warn(
+      {
+        requestId: context.request.id,
+        provider: targetProvider,
+        details: error instanceof Error ? error.message : String(error)
+      },
+      'Failed to deliver websocket billing event.'
+    );
+    throw error;
+  });
+  if (!delivered && (config.billing.delivery?.requirePublisher || config.billing.delivery?.requireOutbox)) {
+    throw new Error('WebSocket billing event was not delivered to any configured billing publisher or outbox.');
+  }
+}
+
+function extractWebSocketCompletedBillingSnapshot(
+  payload: string
+): { usage: StandardUsage; model?: string } | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || parsed.type !== 'response.completed' || !isRecord(parsed.response)) {
+    return undefined;
+  }
+
+  const usage = parseWebSocketUsage(parsed.response.usage);
+  if (!usage) {
+    return undefined;
+  }
+
+  return {
+    usage,
+    model: readStringField(parsed.response.model)
+  };
+}
+
+function isWebSocketCompletedResponsePayload(payload: string): boolean {
+  try {
+    const parsed = JSON.parse(payload) as unknown;
+    return isRecord(parsed) && parsed.type === 'response.completed';
+  } catch {
+    return false;
+  }
+}
+
+function parseWebSocketUsage(value: unknown): StandardUsage | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const inputTokens = readNumberField(value.input_tokens) ?? readNumberField(value.prompt_tokens);
+  const outputTokens = readNumberField(value.output_tokens) ?? readNumberField(value.completion_tokens);
+  const totalTokens = readNumberField(value.total_tokens);
+  if (inputTokens === undefined && outputTokens === undefined && totalTokens === undefined) {
+    return undefined;
+  }
+
+  const inputDetails = isRecord(value.input_tokens_details) ? value.input_tokens_details : undefined;
+  return {
+    input_tokens: inputTokens ?? Math.max((totalTokens ?? 0) - (outputTokens ?? 0), 0),
+    output_tokens: outputTokens ?? Math.max((totalTokens ?? 0) - (inputTokens ?? 0), 0),
+    total_tokens: totalTokens ?? (inputTokens ?? 0) + (outputTokens ?? 0),
+    cache_read_tokens: readNumberField(inputDetails?.cached_tokens) ?? 0,
+    cache_write_tokens: 0,
+    cache_duration_seconds: 0
+  };
+}
+
+function hasBillableWebSocketUsage(usage: StandardUsage): boolean {
+  return [
+    usage.input_tokens,
+    usage.output_tokens,
+    usage.cache_read_tokens,
+    usage.cache_write_tokens,
+    usage.total_tokens
+  ].some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0);
+}
+
+function resolveWebSocketBillingRate(
+  config: GatewayConfig,
+  provider: Provider,
+  model: string | undefined,
+  providerConfig: ProviderConfig | undefined
+): BillingRate {
+  return (
+    (model ? providerConfig?.billing.byModel[model] : undefined) ||
+    providerConfig?.billing.default ||
+    config.billing.rates[provider]
+  );
+}
+
 function normalizeResponseCompletedTextPayload(payload: string): string {
   let parsed: unknown;
   try {
@@ -450,7 +1005,8 @@ async function buildMessageForUpstream(
   context: GatewaySocketContext,
   downstreamSocket: WebSocket,
   fastify: FastifyInstance,
-  config: GatewayConfig
+  config: GatewayConfig,
+  runtime?: Pick<GatewayRuntime, 'requestHooks'>
 ): Promise<{ payload: WebSocketPayload; binary: boolean } | undefined> {
   if (isBinary) {
     return {
@@ -484,7 +1040,8 @@ async function buildMessageForUpstream(
   const guardResult = await evaluateWebSocketResponseCreateGuards(
     context,
     normalizedPayload,
-    config
+    config,
+    runtime
   );
   if (!guardResult.ok) {
     sendWebSocketErrorEvent(
@@ -504,7 +1061,8 @@ async function buildMessageForUpstream(
 async function evaluateWebSocketResponseCreateGuards(
   context: GatewaySocketContext,
   payload: string,
-  config: GatewayConfig
+  config: GatewayConfig,
+  runtime?: Pick<GatewayRuntime, 'requestHooks'>
 ): Promise<{ ok: true } | { ok: false; statusCode: number; message: string }> {
   const responseCreatePayload = parseResponseCreatePayload(payload);
   if (!responseCreatePayload) {
@@ -512,6 +1070,32 @@ async function evaluateWebSocketResponseCreateGuards(
   }
 
   const model = readStringField(responseCreatePayload.model);
+  context.billingModel = model;
+  const sourceAdapterKey = context.sourceAdapterHint || 'openai_responses';
+  const hookInput = {
+    request: context.request,
+    config,
+    route: {
+      method: context.request.method,
+      url: context.request.url,
+      route: 'WS /v1/responses',
+      sourceAdapterKey,
+      sourceRoute: 'websocket'
+    },
+    source: {
+      adapterKey: sourceAdapterKey,
+      metadata: {
+        sourceRoute: 'websocket'
+      }
+    },
+    sourceProvider: 'openai' as Provider,
+    sourceAdapterKey,
+    targetProvider: 'openai' as Provider,
+    targetProviderConfig: context.targetProviderConfig,
+    model,
+    requestBody: responseCreatePayload
+  };
+
   const modelRestriction = evaluateApiKeyModelRestriction(context.request, model, {
     provider: 'openai',
     providerConfig: context.targetProviderConfig
@@ -524,6 +1108,37 @@ async function evaluateWebSocketResponseCreateGuards(
     };
   }
 
+  const beforePrecheckResult = await executeGatewayPluginRequestHookStage<{
+    allow: false;
+    statusCode?: number;
+    message: string;
+    details?: Record<string, unknown>;
+  }>(
+    runtime?.requestHooks?.list() || [],
+    'beforePrecheck',
+    hookInput
+  );
+  if (!beforePrecheckResult.ok) {
+    return {
+      ok: false,
+      statusCode: beforePrecheckResult.status || 403,
+      message: `Gateway plugin "${beforePrecheckResult.pluginKey}" beforePrecheck failed: ${beforePrecheckResult.error}`
+    };
+  }
+  const precheckDecision = beforePrecheckResult.value;
+  if (
+    precheckDecision &&
+    typeof precheckDecision === 'object' &&
+    'allow' in precheckDecision &&
+    precheckDecision.allow === false
+  ) {
+    return {
+      ok: false,
+      statusCode: precheckDecision.statusCode || 403,
+      message: precheckDecision.message
+    };
+  }
+
   const precheck = await evaluateGatewayPrecheck({
     request: context.request,
     config,
@@ -532,6 +1147,22 @@ async function evaluateWebSocketResponseCreateGuards(
     model,
     requestBody: responseCreatePayload
   });
+  const afterPrecheckResult = await executeGatewayPluginRequestHookStage(
+    runtime?.requestHooks?.list() || [],
+    'afterPrecheck',
+    ({
+      ...hookInput,
+      result: precheck
+    } as typeof hookInput & { result: typeof precheck })
+  );
+  if (!afterPrecheckResult.ok) {
+    return {
+      ok: false,
+      statusCode: afterPrecheckResult.status || 403,
+      message: `Gateway plugin "${afterPrecheckResult.pluginKey}" afterPrecheck failed: ${afterPrecheckResult.error}`
+    };
+  }
+
   if (!precheck.ok) {
     return {
       ok: false,
@@ -563,6 +1194,33 @@ function readStringField(value: unknown): string | undefined {
 
   const normalized = value.trim();
   return normalized || undefined;
+}
+
+function readNumberField(value: unknown): number | undefined {
+  const numberValue = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && value.trim()
+      ? Number(value)
+      : undefined;
+  return numberValue !== undefined && Number.isFinite(numberValue) && numberValue >= 0
+    ? numberValue
+    : undefined;
+}
+
+function sanitizeRequestUrlForEvent(url: string): string {
+  try {
+    const parsed = new URL(url, 'http://gateway.local');
+    for (const key of ['key', 'api_key', 'apikey', 'token', 'access_token']) {
+      if (parsed.searchParams.has(key)) {
+        parsed.searchParams.set(key, '***');
+      }
+    }
+
+    const query = parsed.searchParams.toString();
+    return query ? `${parsed.pathname}?${query}` : parsed.pathname;
+  } catch {
+    return url;
+  }
 }
 
 function buildUpstreamHeaders(
@@ -724,49 +1382,387 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
-function resolveResponsesWebSocketTarget(
-  config: Pick<GatewayConfig, 'openaiBaseUrl' | 'openaiApiKey' | 'providers'>,
-  context: GatewaySocketContext
-): {
-  baseUrl: string;
-  apiKey?: string;
-  providerConfig?: ProviderConfig;
-} {
+function recordResponsesWebSocketUpstreamConnection(
+  upstreamSocket: WebSocket,
+  upstreamTarget: ResponsesWebSocketUpstreamTarget,
+  context: GatewaySocketContext,
+  config: GatewayConfig
+): void {
+  const startedAt = Date.now();
+  let opened = false;
+
+  upstreamSocket.once('open', () => {
+    opened = true;
+    const latencyMs = Date.now() - startedAt;
+    recordProviderHealthResponse(
+      upstreamTarget.providerConfig,
+      101,
+      latencyMs,
+      new Date(),
+      config.providerHealthCheck?.storage
+    );
+    void recordProviderCircuitBreakerResponse(
+      config,
+      upstreamTarget.provider,
+      upstreamTarget.providerConfig,
+      200
+    );
+    recordGatewaySchedulingResponse({
+      config,
+      request: context.request,
+      providerConfig: upstreamTarget.providerConfig,
+      statusCode: 200
+    });
+  });
+
+  upstreamSocket.once('error', () => {
+    if (opened) {
+      return;
+    }
+    const latencyMs = Date.now() - startedAt;
+    recordProviderHealthFailure(
+      upstreamTarget.providerConfig,
+      latencyMs,
+      new Date(),
+      config.providerHealthCheck?.storage
+    );
+    void recordProviderCircuitBreakerFailure(
+      config,
+      upstreamTarget.provider,
+      upstreamTarget.providerConfig
+    );
+    recordGatewaySchedulingResponse({
+      config,
+      request: context.request,
+      providerConfig: upstreamTarget.providerConfig,
+      error: true
+    });
+  });
+}
+
+function resolveResponsesWebSocketTargetRoutes(
+  config: GatewayConfig,
+  context: GatewaySocketContext,
+  routeResolution?: GatewayPluginRouteResolution
+): { ok: true; value: ResponsesWebSocketTargetRoute[] } | { ok: false; error: string } {
   const providers = Array.isArray(config.providers) ? config.providers : [];
-  const hint = readTargetProviderHint(context);
-  const selectedByHint = hint ? findOpenAIProviderByHint(providers, hint) : undefined;
-  if (selectedByHint) {
-    return {
-      baseUrl: selectedByHint.baseurl || config.openaiBaseUrl,
-      apiKey: selectedByHint.apikey,
-      providerConfig: selectedByHint
-    };
-  }
-
-  const preferredResponsesProvider = providers.find(
-    (item) => item.type === 'openai_responses'
+  const pluginTargetsResult = resolveResponsesWebSocketPluginTargetRoutes(
+    providers,
+    routeResolution
   );
-  if (preferredResponsesProvider) {
+  if (!pluginTargetsResult.ok) {
+    return pluginTargetsResult;
+  }
+  if (pluginTargetsResult.value && pluginTargetsResult.value.length > 0) {
     return {
-      baseUrl: preferredResponsesProvider.baseurl || config.openaiBaseUrl,
-      apiKey: preferredResponsesProvider.apikey,
-      providerConfig: preferredResponsesProvider
+      ok: true,
+      value: dedupeResponsesWebSocketTargetRoutes(pluginTargetsResult.value)
     };
   }
 
-  const anyOpenAIProvider = findDefaultProviderConfig(providers, 'openai');
-  if (anyOpenAIProvider) {
+  const hints = readTargetProviderHints(context);
+  if (hints) {
+    const routes: ResponsesWebSocketTargetRoute[] = [];
+    for (const hint of hints) {
+      const hintedRouteResult = resolveResponsesWebSocketTargetProviderHint(providers, hint);
+      if (!hintedRouteResult.ok) {
+        return hintedRouteResult;
+      }
+      routes.push(...hintedRouteResult.value);
+    }
+    const deduped = dedupeResponsesWebSocketTargetRoutes(routes);
+    if (deduped.length === 0) {
+      return {
+        ok: false,
+        error: 'x-target-provider must select an OpenAI Responses-compatible provider.'
+      };
+    }
     return {
-      baseUrl: anyOpenAIProvider.baseurl || config.openaiBaseUrl,
-      apiKey: anyOpenAIProvider.apikey || config.openaiApiKey,
-      providerConfig: anyOpenAIProvider
+      ok: true,
+      value: deduped
+    };
+  }
+
+  return resolveDefaultResponsesWebSocketTargetRoutes(config, providers);
+}
+
+function resolveResponsesWebSocketTarget(
+  config: Pick<GatewayConfig, 'openaiBaseUrl' | 'openaiApiKey'>,
+  route: ResponsesWebSocketTargetRoute
+):
+  | {
+      ok: true;
+      value: ResponsesWebSocketUpstreamTarget;
+    }
+  | { ok: false; error: string } {
+  if (route.provider !== 'openai') {
+    return {
+      ok: false,
+      error: `Target provider "${route.provider}" is not compatible with /v1/responses websocket.`
+    };
+  }
+  if (route.providerConfig && !isOpenAIResponsesWebSocketCompatibleProvider(route.providerConfig)) {
+    return {
+      ok: false,
+      error: `Target provider "${route.providerConfig.name}" is not compatible with /v1/responses websocket.`
     };
   }
 
   return {
-    baseUrl: config.openaiBaseUrl,
-    apiKey: config.openaiApiKey
+    ok: true,
+    value: {
+      provider: 'openai',
+      baseUrl: route.providerConfig?.baseurl || config.openaiBaseUrl,
+      apiKey: route.providerConfig?.apikey || config.openaiApiKey,
+      providerConfig: route.providerConfig
+    }
   };
+}
+
+function resolveResponsesWebSocketPluginTargetRoutes(
+  providers: ProviderConfig[],
+  routeResolution: GatewayPluginRouteResolution | undefined
+): { ok: true; value?: ResponsesWebSocketTargetRoute[] } | { ok: false; error: string } {
+  if (!routeResolution) {
+    return { ok: true };
+  }
+
+  const rawRoutes = routeResolution.targetProviders;
+  if (rawRoutes && rawRoutes.length > 0) {
+    const routes: ResponsesWebSocketTargetRoute[] = [];
+    for (const rawRoute of rawRoutes) {
+      const routeResult = resolveResponsesWebSocketPluginTargetProviderRoutes(providers, rawRoute);
+      if (!routeResult.ok) {
+        return routeResult;
+      }
+      routes.push(...routeResult.value);
+    }
+    return {
+      ok: true,
+      value: dedupeResponsesWebSocketTargetRoutes(routes)
+    };
+  }
+
+  if (routeResolution.targetProvider || routeResolution.targetProviderName || routeResolution.targetProviderConfig) {
+    const routeResult = resolveResponsesWebSocketPluginTargetProviderRoutes(
+      providers,
+      {
+        provider: routeResolution.targetProvider,
+        providerName: routeResolution.targetProviderName,
+        providerConfig: routeResolution.targetProviderConfig
+      }
+    );
+    if (!routeResult.ok) {
+      return routeResult;
+    }
+    return {
+      ok: true,
+      value: routeResult.value
+    };
+  }
+
+  return { ok: true };
+}
+
+function resolveResponsesWebSocketPluginTargetProviderRoutes(
+  providers: ProviderConfig[],
+  route: GatewayPluginTargetRoute
+): { ok: true; value: ResponsesWebSocketTargetRoute[] } | { ok: false; error: string } {
+  if (route.providerConfig) {
+    if (route.provider && route.provider !== 'openai') {
+      return {
+        ok: false,
+        error: `Gateway plugin route resolver selected provider "${route.provider}", which is not compatible with /v1/responses websocket.`
+      };
+    }
+    if (!isOpenAIResponsesWebSocketCompatibleProvider(route.providerConfig)) {
+      return {
+        ok: false,
+        error: `Gateway plugin route resolver selected provider "${route.providerConfig.name}", which is not compatible with /v1/responses websocket.`
+      };
+    }
+    return {
+      ok: true,
+      value: [
+        {
+          provider: 'openai',
+          providerConfig: route.providerConfig
+        }
+      ]
+    };
+  }
+
+  if (route.providerName) {
+    const providerConfig = findProviderConfigByName(providers, route.providerName);
+    if (!providerConfig) {
+      return {
+        ok: false,
+        error: `Gateway plugin route resolver selected unknown provider "${route.providerName}".`
+      };
+    }
+    if (!isOpenAIResponsesWebSocketCompatibleProvider(providerConfig)) {
+      return {
+        ok: false,
+        error: `Gateway plugin route resolver selected provider "${providerConfig.name}", which is not compatible with /v1/responses websocket.`
+      };
+    }
+    return {
+      ok: true,
+      value: [
+        {
+          provider: 'openai',
+          providerConfig
+        }
+      ]
+    };
+  }
+
+  if (route.provider) {
+    if (route.provider !== 'openai') {
+      return {
+        ok: false,
+        error: `Gateway plugin route resolver selected provider "${route.provider}", which is not compatible with /v1/responses websocket.`
+      };
+    }
+    return {
+      ok: true,
+      value: resolveOpenAIResponsesProviderRoutes(providers)
+    };
+  }
+
+  return {
+    ok: false,
+    error: 'Gateway plugin route resolver returned an invalid target provider.'
+  };
+}
+
+function resolveResponsesWebSocketTargetProviderHint(
+  providers: ProviderConfig[],
+  hintRaw: string
+): { ok: true; value: ResponsesWebSocketTargetRoute[] } | { ok: false; error: string } {
+  const hint = hintRaw.trim();
+  if (!hint) {
+    return {
+      ok: false,
+      error: 'x-target-provider must not be empty.'
+    };
+  }
+
+  const byName = findProviderConfigByName(providers, hint);
+  if (byName) {
+    if (!isOpenAIResponsesWebSocketCompatibleProvider(byName)) {
+      return {
+        ok: false,
+        error: `Target provider "${byName.name}" is not compatible with /v1/responses websocket.`
+      };
+    }
+    return {
+      ok: true,
+      value: [
+        {
+          provider: 'openai',
+          providerConfig: byName
+        }
+      ]
+    };
+  }
+
+  const parsedProvider = parseProvider(hint);
+  if (!parsedProvider || parsedProvider !== 'openai') {
+    return {
+      ok: false,
+      error: `Target provider "${hint}" is not compatible with /v1/responses websocket.`
+    };
+  }
+
+  return {
+    ok: true,
+    value: resolveOpenAIResponsesProviderRoutes(providers)
+  };
+}
+
+function resolveDefaultResponsesWebSocketTargetRoutes(
+  config: GatewayConfig,
+  providers: ProviderConfig[]
+): { ok: true; value: ResponsesWebSocketTargetRoute[] } | { ok: false; error: string } {
+  const defaultTargets = Array.isArray(config.defaultTargetProviders) && config.defaultTargetProviders.length > 0
+    ? config.defaultTargetProviders
+    : config.defaultTargetProvider
+      ? [config.defaultTargetProvider]
+      : undefined;
+
+  if (!defaultTargets) {
+    return {
+      ok: true,
+      value: resolveOpenAIResponsesProviderRoutes(providers)
+    };
+  }
+
+  const routes: ResponsesWebSocketTargetRoute[] = [];
+  for (const provider of defaultTargets) {
+    if (provider === 'openai') {
+      routes.push(...resolveOpenAIResponsesProviderRoutes(providers));
+    }
+  }
+
+  const deduped = dedupeResponsesWebSocketTargetRoutes(routes);
+  if (deduped.length === 0) {
+    return {
+      ok: false,
+      error: 'Configured default target provider does not support /v1/responses websocket.'
+    };
+  }
+  return {
+    ok: true,
+    value: deduped
+  };
+}
+
+function resolveOpenAIResponsesProviderRoutes(providers: ProviderConfig[]): ResponsesWebSocketTargetRoute[] {
+  const responsesProviders = providers.filter((item) => isOpenAIResponsesWebSocketCompatibleProvider(item));
+  if (responsesProviders.length === 0) {
+    return [{ provider: 'openai' }];
+  }
+
+  return responsesProviders.map((providerConfig) => ({
+    provider: 'openai',
+    providerConfig
+  }));
+}
+
+function isOpenAIResponsesWebSocketCompatibleProvider(providerConfig: ProviderConfig): boolean {
+  return providerConfig.type === 'openai_responses';
+}
+
+function findProviderConfigByName(
+  providers: ProviderConfig[],
+  name: string
+): ProviderConfig | undefined {
+  const normalized = name.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+
+  return providers.find((item) => item.name.trim().toLowerCase() === normalized);
+}
+
+function dedupeResponsesWebSocketTargetRoutes(
+  routes: ResponsesWebSocketTargetRoute[]
+): ResponsesWebSocketTargetRoute[] {
+  const deduped: ResponsesWebSocketTargetRoute[] = [];
+  const usedKeys = new Set<string>();
+
+  for (const route of routes) {
+    const key = route.providerConfig ? `name:${route.providerConfig.name}` : `type:${route.provider}`;
+    if (usedKeys.has(key)) {
+      continue;
+    }
+
+    usedKeys.add(key);
+    deduped.push(route);
+  }
+
+  return deduped;
 }
 
 interface WebSocketProviderPluginContext {
@@ -808,48 +1804,153 @@ async function applyWebSocketProviderRequestPlugins(
       standardRequest: undefined
     };
     if (!shouldRunProviderPlugin(plugin, pluginInput)) {
+      if (plugin.authenticate) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'skipped'
+        });
+      }
+      if (plugin.transformRequest) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'skipped'
+        });
+      }
       continue;
     }
 
     if (plugin.authenticate) {
-      const result = await plugin.authenticate(pluginInput);
-      if (!result.ok) {
-        return err(`Provider plugin "${plugin.key}" auth failed: ${result.error}`);
+      const startedAt = process.hrtime.bigint();
+      const executionResult = await runGatewayPluginProtectedOperation({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'authenticate',
+        execution: plugin.execution,
+        operation: () => plugin.authenticate?.(pluginInput)
+      });
+      if (!executionResult.ok) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: executionResult.reason,
+          durationMs: elapsedMs(startedAt)
+        });
+        return err(`Provider plugin "${plugin.key}" auth failed: ${executionResult.error}`);
       }
-
-      upstreamRequest = result.value;
+      if ('skipped' in executionResult) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: executionResult.reason,
+          durationMs: elapsedMs(startedAt)
+        });
+      } else if (!executionResult.value?.ok) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'error',
+          durationMs: elapsedMs(startedAt)
+        });
+        return err(`Provider plugin "${plugin.key}" auth failed: ${executionResult.value?.error || 'unknown error'}`);
+      } else {
+        upstreamRequest = executionResult.value.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'success',
+          durationMs: elapsedMs(startedAt)
+        });
+      }
     }
 
     if (plugin.transformRequest) {
-      const result = await plugin.transformRequest({
-        ...pluginInput,
-        upstreamRequest
+      const startedAt = process.hrtime.bigint();
+      const executionResult = await runGatewayPluginProtectedOperation({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformRequest',
+        execution: plugin.execution,
+        operation: () => plugin.transformRequest?.({
+          ...pluginInput,
+          upstreamRequest
+        })
       });
-      if (!result.ok) {
-        return err(`Provider plugin "${plugin.key}" request transform failed: ${result.error}`);
+      if (!executionResult.ok) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: executionResult.reason,
+          durationMs: elapsedMs(startedAt)
+        });
+        return err(`Provider plugin "${plugin.key}" request transform failed: ${executionResult.error}`);
       }
-
-      upstreamRequest = result.value;
+      if ('skipped' in executionResult) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: executionResult.reason,
+          durationMs: elapsedMs(startedAt)
+        });
+      } else if (!executionResult.value?.ok) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'error',
+          durationMs: elapsedMs(startedAt)
+        });
+        return err(`Provider plugin "${plugin.key}" request transform failed: ${executionResult.value?.error || 'unknown error'}`);
+      } else {
+        upstreamRequest = executionResult.value.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'success',
+          durationMs: elapsedMs(startedAt)
+        });
+      }
     }
   }
 
   return ok(upstreamRequest);
 }
 
-function readTargetProviderHint(context: GatewaySocketContext): string | undefined {
+function readTargetProviderHints(context: GatewaySocketContext): string[] | undefined {
+  const fromHeaderList = normalizeHeaderValue(context.headers['x-target-providers']);
+  if (fromHeaderList) {
+    return splitTargetProviderHints(fromHeaderList);
+  }
+
   const fromHeader = normalizeHeaderValue(context.headers['x-target-provider']);
   if (fromHeader) {
-    return fromHeader;
+    return [fromHeader];
   }
 
   try {
     const url = new URL(context.requestUrl);
+    const fromQueryList =
+      url.searchParams.get('target_providers') ||
+      url.searchParams.get('target-providers');
+    if (fromQueryList?.trim()) {
+      return splitTargetProviderHints(fromQueryList);
+    }
     const fromQuery =
       url.searchParams.get('target_provider') ||
       url.searchParams.get('target-provider');
     const normalizedQuery = fromQuery?.trim();
     if (normalizedQuery) {
-      return normalizedQuery;
+      return [normalizedQuery];
     }
   } catch {
     return undefined;
@@ -858,29 +1959,11 @@ function readTargetProviderHint(context: GatewaySocketContext): string | undefin
   return undefined;
 }
 
-function findOpenAIProviderByHint(
-  providers: ProviderConfig[],
-  hintRaw: string
-): ProviderConfig | undefined {
-  const hint = hintRaw.trim();
-  if (!hint) {
-    return undefined;
-  }
-
-  const byName = providers.find((item) => item.name.toLowerCase() === hint.toLowerCase());
-  if (byName && providerFromProviderType(byName.type) === 'openai') {
-    return byName;
-  }
-
-  const parsedProviderType = parseProvider(hint);
-  if (!parsedProviderType || parsedProviderType !== 'openai') {
-    return undefined;
-  }
-
-  return (
-    providers.find((item) => item.type === 'openai_responses') ||
-    findDefaultProviderConfig(providers, 'openai')
-  );
+function splitTargetProviderHints(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function readSourceAdapterHintFromRequestUrl(url: URL): GatewayCodexWsSourceAdapterKey | undefined {
@@ -898,6 +1981,10 @@ function resolveGatewayWebSocketMaxPayloadBytes(config: GatewayConfig): number {
   }
 
   return 1024 * 1024;
+}
+
+function elapsedMs(startedAt: bigint): number {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000;
 }
 
 function webSocketPayloadByteLength(payload: WebSocketPayload): number {
@@ -971,6 +2058,8 @@ function normalizeHeaderValue(value: string | string[] | undefined): string | un
   return undefined;
 }
 
+function noop(): void {}
+
 function normalizeCloseCode(code: number): number {
   if (code >= 1000 && code <= 4999) {
     return code;
@@ -1020,6 +2109,7 @@ function createWebSocketPluginCompatibleRequest(
     headers: request.headers,
     method: request.method || 'GET',
     url: request.url || requestUrl.pathname,
+    ip: request.socket.remoteAddress || '',
     query,
     body: undefined,
     log: fastify.log
@@ -1040,6 +2130,14 @@ function rejectUpgrade(socket: Socket, statusCode: number, message: string): voi
 
   socket.write(response);
   socket.destroy();
+}
+
+function resolveGatewayWebSocketHandshakeTimeoutMs(config: GatewayConfig): number {
+  const configured = Number(config.upstreamTimeoutMs);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return 60000;
+  }
+  return Math.max(1, Math.min(Math.trunc(configured), 300000));
 }
 
 function resolveStatusMessage(statusCode: number): string {

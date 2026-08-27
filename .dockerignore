@@ -4,6 +4,7 @@ node_modules
 dist
 .env
 .env.*
+!.env.production.example
 *.log
 .DS_Store
 .idea
@@ -18,3 +19,4 @@ tmp
 gateway.config.json
 gateway.config.*.json
 !gateway.config.compose.json
+!gateway.config.production.json

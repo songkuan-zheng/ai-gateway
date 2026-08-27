@@ -7,12 +7,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer } from 'ws';
 import { parseGatewayConfigFromRaw } from '../config';
 import { renderGatewayMetrics, resetGatewayMetricsForTests } from '../gateway/metrics';
+import { resetGatewayPluginExecutionStateForTests } from '../plugins/execution';
 import type { GatewayPluginEventPublisher, GatewayPluginOutbox } from '../plugins/events';
 import type { BillingQueueConfig, BillingWebhookConfig } from '../types';
 import {
   closeBillingPublisher,
   initializeBillingPublisher,
   publishBillingEvent,
+  validateBillingPublisherRequirements,
   type BillingQueueEvent
 } from './publisher';
 
@@ -23,6 +25,7 @@ describe('billing publisher', () => {
 
   afterEach(async () => {
     await closeBillingPublisher();
+    resetGatewayPluginExecutionStateForTests();
     resetGatewayMetricsForTests();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -218,6 +221,215 @@ describe('billing publisher', () => {
 
     expect(delivered).toBe(true);
     expect(append).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails open when a billing event hook times out', async () => {
+    const append = vi.fn(async () => true);
+    const transform = vi.fn(() => new Promise<never>(() => undefined));
+    await initializeBillingPublisher(
+      buildQueueConfig(false),
+      {
+        ...buildWebhookConfig('http', ''),
+        enabled: false
+      },
+      undefined,
+      {
+        eventHooks: [
+          {
+            key: 'slow-billing-event-hook',
+            execution: {
+              timeoutMs: 1,
+              failureMode: 'fail_open'
+            },
+            transform
+          }
+        ],
+        outboxes: [
+          {
+            key: 'billing-after-timeout',
+            append
+          }
+        ]
+      }
+    );
+
+    await expect(publishBillingEvent(buildEvent())).resolves.toBe(true);
+
+    expect(transform).toHaveBeenCalledTimes(1);
+    expect(append).toHaveBeenCalledTimes(1);
+    expect(renderGatewayMetricsForTest()).toContain(
+      'gateway_plugin_hook_executions_total{hook="transform",kind="billing_event",outcome="timeout",plugin_key="slow-billing-event-hook"} 1'
+    );
+  });
+
+  it('validates required billing publishers and outboxes', async () => {
+    await initializeBillingPublisher(buildQueueConfig(false), {
+      ...buildWebhookConfig('http', ''),
+      enabled: false
+    });
+
+    const strictConfig = parseGatewayConfigFromRaw({
+      billing: {
+        delivery: {
+          requirePublisher: true,
+          requireOutbox: true
+        }
+      }
+    });
+    expect(() => validateBillingPublisherRequirements(strictConfig.billing)).toThrow(
+      'requires a plugin billing outbox'
+    );
+
+    await initializeBillingPublisher(
+      buildQueueConfig(false),
+      {
+        ...buildWebhookConfig('http', ''),
+        enabled: false
+      },
+      undefined,
+      {
+        outboxes: [
+          {
+            key: 'required-outbox',
+            append: async () => true
+          }
+        ]
+      }
+    );
+
+    expect(() => validateBillingPublisherRequirements(strictConfig.billing)).not.toThrow();
+    expect(() =>
+      validateBillingPublisherRequirements(
+        strictConfig.billing,
+        { publishers: [], outboxes: [] },
+        { ...buildWebhookConfig('http', ''), enabled: false }
+      )
+    ).toThrow('requires a plugin billing outbox');
+
+    await initializeBillingPublisher(buildQueueConfig(false), {
+      ...buildWebhookConfig('http', ''),
+      enabled: false
+    });
+    expect(() =>
+      validateBillingPublisherRequirements(
+        strictConfig.billing,
+        {
+          outboxes: [
+            {
+              key: 'candidate-outbox',
+              append: async () => true
+            }
+          ]
+        },
+        { ...buildWebhookConfig('http', ''), enabled: false }
+      )
+    ).not.toThrow();
+  });
+
+  it('does not let a successful webhook mask a required outbox failure', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const strictConfig = parseGatewayConfigFromRaw({
+      billing: {
+        delivery: {
+          mode: 'await',
+          requireOutbox: true
+        }
+      }
+    });
+    const append = vi.fn().mockRejectedValue(new Error('outbox unavailable'));
+
+    await initializeBillingPublisher(
+      buildQueueConfig(false),
+      buildWebhookConfig('http', 'https://billing.example/events'),
+      undefined,
+      {
+        outboxes: [
+          {
+            key: 'required-outbox',
+            append
+          }
+        ]
+      },
+      strictConfig.billing.delivery
+    );
+
+    await expect(publishBillingEvent(buildEvent())).rejects.toThrow(
+      'Required billing outbox delivery failed: outbox unavailable'
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(append).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns not delivered when every required outbox declines the event', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const strictConfig = parseGatewayConfigFromRaw({
+      billing: {
+        delivery: {
+          requireOutbox: true
+        }
+      }
+    });
+
+    await initializeBillingPublisher(
+      buildQueueConfig(false),
+      buildWebhookConfig('http', 'https://billing.example/events'),
+      undefined,
+      {
+        outboxes: [
+          {
+            key: 'declining-outbox',
+            append: async () => false
+          }
+        ]
+      },
+      strictConfig.billing.delivery
+    );
+
+    await expect(publishBillingEvent(buildEvent())).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('drains pending billing deliveries before closing plugin publishers', async () => {
+    let resolveAppend!: () => void;
+    const appendStarted = new Promise<void>((resolve) => {
+      resolveAppend = resolve;
+    });
+    const close = vi.fn();
+    const outbox: GatewayPluginOutbox<BillingQueueEvent> = {
+      key: 'slow-outbox',
+      append: async () => {
+        await appendStarted;
+        return true;
+      },
+      close
+    };
+    await initializeBillingPublisher(
+      buildQueueConfig(false),
+      {
+        ...buildWebhookConfig('http', ''),
+        enabled: false
+      },
+      undefined,
+      {
+        outboxes: [outbox]
+      },
+      {
+        mode: 'async',
+        requirePublisher: false,
+        requireOutbox: false,
+        shutdownDrainTimeoutMs: 1000
+      }
+    );
+
+    const publishPromise = publishBillingEvent(buildEvent());
+    await Promise.resolve();
+    resolveAppend();
+    await closeBillingPublisher();
+
+    await expect(publishPromise).resolves.toBe(true);
+    expect(close).toHaveBeenCalledTimes(1);
   });
 });
 

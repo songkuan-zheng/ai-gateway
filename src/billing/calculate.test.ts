@@ -10,6 +10,14 @@ import type { BillingConfig } from '../types';
 const config: BillingConfig = {
   enabled: true,
   currency: 'USD',
+  delivery: {
+    mode: 'async',
+    requirePublisher: false,
+    requireOutbox: false,
+    shutdownDrainTimeoutMs: 5000
+  },
+  requireUsage: false,
+  requireRates: false,
   rates: {
     openai: {
       inputPerMillionUsd: 1,

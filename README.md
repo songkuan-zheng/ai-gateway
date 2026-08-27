@@ -31,6 +31,20 @@ export ANTHROPIC_API_KEY='replace-with-tool-search-provider-key'
 docker compose up --build
 ```
 
+Production Docker Compose:
+
+```bash
+cp .env.production.example .env.production
+# edit .env.production
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+```
+
+For multi-instance deployments, enable Redis-backed shared state:
+
+```bash
+docker compose --env-file .env.production -f docker-compose.prod.yml --profile redis up -d --build
+```
+
 ## Features
 
 - OpenAI `chat/completions`, `responses`, `embeddings`, `moderations`, `images/generations`, `images/edits`, `videos`, `videos/:id`, and `videos/:id/content`

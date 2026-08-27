@@ -50,6 +50,7 @@ describe('resolveBillingResponseSnapshot', () => {
       value: {
         model: 'claude-3-5-sonnet-latest',
         recovered: false,
+        usageReported: true,
         usage: {
           input_tokens: 120,
           output_tokens: 18,
@@ -84,6 +85,7 @@ describe('resolveBillingResponseSnapshot', () => {
       value: {
         model: 'gpt-5.6',
         recovered: true,
+        usageReported: true,
         usage: {
           input_tokens: 55,
           output_tokens: 11,
@@ -112,6 +114,7 @@ describe('resolveBillingResponseSnapshot', () => {
       value: {
         model: 'gpt-5.4',
         recovered: true,
+        usageReported: false,
         usage: {
           input_tokens: 0,
           output_tokens: 0,
@@ -184,6 +187,7 @@ describe('resolveBillingResponseSnapshot', () => {
       value: {
         model: 'gpt-5.4',
         recovered: true,
+        usageReported: false,
         usage: {
           input_tokens: 0,
           output_tokens: 0,
@@ -212,6 +216,7 @@ describe('resolveBillingResponseSnapshot', () => {
       value: {
         model: 'claude-3-5-sonnet-latest',
         recovered: true,
+        usageReported: true,
         usage: {
           input_tokens: 120,
           output_tokens: 18,

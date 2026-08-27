@@ -1,0 +1,105 @@
+services:
+  gateway:
+    image: ${GATEWAY_IMAGE:-next-ai-gateway:prod}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    init: true
+    restart: unless-stopped
+    env_file:
+      - ${GATEWAY_ENV_FILE:-.env.production}
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      HOME: /tmp
+      DENO_DIR: /tmp/deno
+      GATEWAY_CONFIG_PATH: /data/gateway/config/gateway.config.json
+      RAW_TRACE_SPOOL_DIR: /data/gateway/raw-trace
+      AGENT_STORAGE_DIR: /data/gateway/agent
+      GATEWAY_IDEMPOTENCY_REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      GATEWAY_UPSTREAM_CONCURRENCY_REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      GATEWAY_UPSTREAM_CIRCUIT_BREAKER_REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      GATEWAY_SCHEDULING_REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      PROVIDER_HEALTH_CHECK_REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      PRECHECK_REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    ports:
+      - "${GATEWAY_BIND_ADDRESS:-127.0.0.1}:${GATEWAY_PUBLISHED_PORT:-3000}:3000"
+    volumes:
+      - ./gateway.config.production.json:/app/gateway.config.seed.json:ro
+      - gateway-data:/data/gateway
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /data/gateway/config
+        if [ ! -f /data/gateway/config/gateway.config.json ]; then
+          cp /app/gateway.config.seed.json /data/gateway/config/gateway.config.json
+        fi
+        exec node dist/index.js
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/ready').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+        reservations:
+          memory: 512m
+
+  redis:
+    image: redis:7.4-alpine
+    profiles:
+      - redis
+    user: redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - "60"
+      - "1000"
+    volumes:
+      - redis-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  gateway-data:
+  redis-data:

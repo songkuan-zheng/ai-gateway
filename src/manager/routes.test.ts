@@ -254,6 +254,56 @@ describe('manager config routes', () => {
     }
   });
 
+  it('keeps file and in-memory config unchanged when runtime reload fails', async () => {
+    const initialConfig = {
+      host: '127.0.0.1',
+      port: 3000,
+      upstreamTimeoutMs: 15000
+    };
+    const setup = prepareTempConfig(initialConfig);
+    tempDir = setup.tempDir;
+    process.env.GATEWAY_CONFIG_PATH = setup.configPath;
+    delete process.env.MANAGER_API_KEY;
+
+    const app = Fastify({ logger: false });
+    const runtimeConfig = createRuntimeConfig();
+    const reloadedPorts: number[] = [];
+    const onConfigReload = vi.fn(async (nextConfig: GatewayConfig) => {
+      reloadedPorts.push(nextConfig.port);
+      if (nextConfig.port === 3011) {
+        throw new Error('strict billing validation failed');
+      }
+    });
+    registerManagerRoutes(app, {
+      config: runtimeConfig,
+      onConfigReload
+    });
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/manager/config',
+        payload: {
+          host: '127.0.0.1',
+          port: 3011,
+          upstreamTimeoutMs: 5000,
+          billingQueue: { enabled: false },
+          billingWebhook: { enabled: false }
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).error.message).toContain('strict billing validation failed');
+      expect(JSON.parse(readFileSync(setup.configPath, 'utf8'))).toEqual(initialConfig);
+      expect(runtimeConfig.port).toBe(3000);
+      expect(runtimeConfig.upstreamTimeoutMs).toBe(15000);
+      expect(reloadedPorts).toEqual([3011, 3000]);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('preserves existing secrets when updating a redacted manager config', async () => {
     const setup = prepareTempConfig({
       host: '0.0.0.0',

@@ -13,6 +13,12 @@ import type {
   GatewayBillingTrace,
   GatewayConfig,
   GatewayRequestClientContext,
+  GatewayPluginHookFailure,
+  GatewayPluginRequestHeaderMutations,
+  GatewayPluginRequestTransformValue,
+  GatewayPluginResponseHookInput,
+  GatewayPluginRouteResolution,
+  GatewayPluginTargetRoute,
   GatewaySourceContext,
   Provider,
   ProviderPlugin,
@@ -111,9 +117,19 @@ import { matchesAnyPattern } from '../shared/pattern';
 import { evaluateApiKeyModelRestriction } from './auth';
 import { shouldRunProviderPlugin } from '../provider/plugins';
 import {
+  applyGatewayPluginRequestTransforms,
+  applyGatewayPluginResponseHooks,
   applyGatewayPluginStreamResponseHooks,
-  executeGatewayPluginRequestHookStage
+  executeGatewayPluginRequestHookStage,
+  resolveGatewayPluginRoute
 } from '../plugins/hooks';
+import { runGatewayPluginProtectedOperation } from '../plugins/execution';
+import {
+  shouldAwaitBillingDelivery,
+  shouldBlockLiveStreamingForStrictBilling,
+  strictBillingLiveStreamingUnsupportedMessage
+} from './strict-billing';
+import { applyDeferredGatewayIdempotency } from './idempotency';
 
 interface ProviderAttemptFailure {
   provider: Provider;
@@ -257,6 +273,7 @@ export interface VirtualMultimodalRewrite {
 interface BillingResponseSnapshot {
   model?: string;
   usage: StandardUsage;
+  usageReported: boolean;
   recovered: boolean;
 }
 
@@ -280,6 +297,8 @@ interface GatewayRawTraceCapture {
   upstreamResponseStreamContentType?: string;
 }
 
+const rawTraceRequestStartedAtMs = new WeakMap<FastifyRequest, number>();
+
 export async function handleGatewayRequest(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -287,8 +306,9 @@ export async function handleGatewayRequest(
   config: GatewayConfig,
   runtime: GatewayRuntime
 ) {
+  rawTraceRequestStartedAtMs.set(request, Date.now());
   const clientAbortSignal = createClientDisconnectSignal(request, reply);
-  const sourceAdapter = runtime.sourceAdapters.get(source.adapterKey);
+  let sourceAdapter = runtime.sourceAdapters.get(source.adapterKey);
   if (!sourceAdapter) {
     return reply.code(500).send({
       error: {
@@ -297,19 +317,73 @@ export async function handleGatewayRequest(
     });
   }
 
-  const body = request.body;
-  if (!isObject(body)) {
+  const initialBody = request.body;
+  if (!isObject(initialBody)) {
     return sendBadRequest(reply, 'Request body must be a JSON object.');
   }
+  let body: Record<string, unknown> = initialBody;
 
-  const adapterInput = {
+  let adapterInput = {
     request,
     body,
     source,
     config
   };
-  const requestedModelSelector =
+  let requestedModelSelector =
     readHeader(request.headers['x-target-model']) || resolvePassthroughModel(body, source);
+  const beforeRoutingTransformResult = await applyGatewayPluginRequestTransforms(
+    runtime.requestTransforms.list(),
+    {
+      stage: 'beforeRouting',
+      request,
+      config,
+      route: {
+        method: request.method,
+        url: request.url,
+        route: request.routeOptions?.url,
+        sourceAdapterKey: source.adapterKey,
+        sourceRoute: source.metadata?.sourceRoute
+      },
+      source,
+      sourceProvider: sourceAdapter.provider,
+      sourceAdapterKey: source.adapterKey,
+      model: requestedModelSelector,
+      requestBody: body
+    }
+  );
+  if (!beforeRoutingTransformResult.ok) {
+    return sendGatewayPluginHookFailure(reply, 'request transform', beforeRoutingTransformResult);
+  }
+  const beforeRoutingTransform = beforeRoutingTransformResult.value;
+  if (beforeRoutingTransform.source) {
+    source = beforeRoutingTransform.source;
+  }
+  if (beforeRoutingTransform.requestBody !== undefined) {
+    const transformedBody = beforeRoutingTransform.requestBody;
+    if (!isObject(transformedBody)) {
+      return sendBadRequest(reply, 'Request body must be a JSON object after gateway plugin request transform.');
+    }
+    body = transformedBody;
+    (request as unknown as { body?: unknown }).body = body;
+  }
+  sourceAdapter = runtime.sourceAdapters.get(source.adapterKey);
+  if (!sourceAdapter) {
+    return reply.code(500).send({
+      error: {
+        message: `Source adapter is not registered: ${source.adapterKey}`
+      }
+    });
+  }
+  adapterInput = {
+    request,
+    body,
+    source,
+    config
+  };
+  requestedModelSelector =
+    beforeRoutingTransform.model ||
+    readHeader(request.headers['x-target-model']) ||
+    resolvePassthroughModel(body, source);
   const beforeRoutingResult = await executeGatewayPluginRequestHookStage(
     runtime.requestHooks.list(),
     'beforeRouting',
@@ -339,27 +413,115 @@ export async function handleGatewayRequest(
     });
   }
 
+  let pluginTargetProviders: TargetProviderRoute[] | undefined;
+  const pluginRouteResult = await resolveGatewayPluginRoute(
+    runtime.routeResolvers.list(),
+    {
+      request,
+      config,
+      route: {
+        method: request.method,
+        url: request.url,
+        route: request.routeOptions?.url,
+        sourceAdapterKey: source.adapterKey,
+        sourceRoute: source.metadata?.sourceRoute
+      },
+      source,
+      sourceProvider: sourceAdapter.provider,
+      sourceAdapterKey: source.adapterKey,
+      model: requestedModelSelector,
+      requestBody: body
+    }
+  );
+  if (!pluginRouteResult.ok) {
+    return sendGatewayPluginHookFailure(reply, 'route resolver', pluginRouteResult);
+  }
+  if (pluginRouteResult.value) {
+    const routeResolution = pluginRouteResult.value;
+    if (routeResolution.source) {
+      source = routeResolution.source;
+    }
+    if (routeResolution.metadata && source) {
+      source = {
+        ...source,
+        metadata: mergeGatewaySourceMetadata(source.metadata, routeResolution.metadata)
+      };
+    }
+    if (routeResolution.requestBody !== undefined) {
+      const resolvedBody = routeResolution.requestBody;
+      if (!isObject(resolvedBody)) {
+        return sendBadRequest(reply, 'Request body must be a JSON object after gateway plugin route resolution.');
+      }
+      body = resolvedBody;
+      (request as unknown as { body?: unknown }).body = body;
+    }
+    applyRequestHeadersFromGatewayPluginRouteResolution(request, routeResolution.headers);
+    sourceAdapter = runtime.sourceAdapters.get(source.adapterKey);
+    if (!sourceAdapter) {
+      return reply.code(500).send({
+        error: {
+          message: `Source adapter is not registered: ${source.adapterKey}`
+        }
+      });
+    }
+    adapterInput = {
+      request,
+      body,
+      source,
+      config
+    };
+    if ('model' in routeResolution) {
+      requestedModelSelector = typeof routeResolution.model === 'string' && routeResolution.model.trim()
+        ? routeResolution.model.trim()
+        : undefined;
+    }
+    const routeTargetsResult = resolveGatewayPluginTargetProviders(routeResolution, config);
+    if (!routeTargetsResult.ok) {
+      return sendBadRequest(reply, routeTargetsResult.error);
+    }
+    pluginTargetProviders = routeTargetsResult.value;
+  }
+
+  const idempotencyHandled = await applyDeferredGatewayIdempotency(
+    request,
+    reply,
+    config,
+    buildDeferredGatewayIdempotencyFingerprint({
+      source,
+      requestedModelSelector,
+      targetProviders: pluginTargetProviders
+    })
+  );
+  if (idempotencyHandled) {
+    return reply;
+  }
+
   const virtualModelResolution = requestedModelSelector
     ? resolveVirtualModelRequest(config, runtime, requestedModelSelector)
     : undefined;
 
-  const targetProvidersResult = resolveTargetProviders(
-    request,
-    sourceAdapter.provider,
-    config,
-    virtualModelResolution?.targetModelSelector || resolvePassthroughModel(body, source)
-  );
+  const targetProvidersResult = pluginTargetProviders
+    ? ({ ok: true, value: pluginTargetProviders } as const)
+    : resolveTargetProviders(
+        request,
+        sourceAdapter.provider,
+        config,
+        virtualModelResolution?.targetModelSelector || resolvePassthroughModel(body, source)
+      );
   if (!targetProvidersResult.ok) {
     return sendBadRequest(reply, targetProvidersResult.error);
   }
 
-  const scheduledTargetProviders = applyGatewayScheduling(targetProvidersResult.value, {
+  const scheduledTargetProviders = await applyGatewayScheduling(targetProvidersResult.value, {
     config,
     request,
     requestModel: virtualModelResolution?.targetModelSelector || resolvePassthroughModel(body, source)
   });
-  const targetProviders = applyHealthAwareRouting(scheduledTargetProviders, config);
+  const targetProviders = await applyHealthAwareRouting(scheduledTargetProviders, config);
   const isStreaming = sourceAdapter.isStreamingRequest(adapterInput);
+  if (isStreaming && shouldBlockLiveStreamingForStrictBilling(config)) {
+    return sendBadRequest(reply, strictBillingLiveStreamingUnsupportedMessage);
+  }
 
   if (virtualModelResolution) {
     return handleVirtualModelRequest(
@@ -376,6 +538,20 @@ export async function handleGatewayRequest(
       clientAbortSignal
     );
   }
+
+  const fallbackRequestBody = cloneGatewayFallbackRequestBody(body);
+  const fallbackRequestHeaders = cloneGatewayFallbackRequestHeaders(request.headers);
+  const resetFallbackRequestState = (): void => {
+    body = cloneGatewayFallbackRequestBody(fallbackRequestBody);
+    (request as unknown as { body?: unknown }).body = body;
+    replaceGatewayFallbackRequestHeaders(request, fallbackRequestHeaders);
+    adapterInput = {
+      request,
+      body,
+      source,
+      config
+    };
+  };
 
   const attempts: ProviderAttemptFailure[] = [];
   let upstreamAttemptSequence = 0;
@@ -466,6 +642,7 @@ export async function handleGatewayRequest(
   };
 
   for (const [targetIndex, target] of targetProviders.entries()) {
+    resetFallbackRequestState();
     if (clientAbortSignal.aborted) {
       return;
     }
@@ -495,18 +672,6 @@ export async function handleGatewayRequest(
       ) &&
       !shouldUseTransparentToolExecutionPath(config, isStreaming)
     ) {
-      const passthroughResult = sourceAdapter.buildPassthroughRequest(adapterInput);
-      if (!passthroughResult.ok) {
-        attempts.push({
-          provider: targetProvider,
-          providerName: targetProviderConfig?.name,
-          stage: 'passthrough_build',
-          message: passthroughResult.error,
-          status: 400
-        });
-        continue;
-      }
-
       const passthroughModelResult = resolveTargetModel(
         request,
         target,
@@ -524,7 +689,73 @@ export async function handleGatewayRequest(
         continue;
       }
 
-      const passthroughModel = passthroughModelResult.value;
+      let passthroughModel = passthroughModelResult.value;
+      let passthroughStandardRequest: StandardRequest | undefined;
+      let standardRequestTransformed = false;
+      if (hasBeforeUpstreamGatewayRequestTransforms(runtime)) {
+        const standardRequestResult = sourceAdapter.toStandardRequest(adapterInput);
+        if (!standardRequestResult.ok) {
+          attempts.push({
+            provider: targetProvider,
+            providerName: targetProviderConfig?.name,
+            stage: 'source_parse',
+            message: standardRequestResult.error,
+            status: 400
+          });
+          continue;
+        }
+        const transformModel = passthroughModel || standardRequestResult.value.model;
+        if (!transformModel) {
+          attempts.push({
+            provider: targetProvider,
+            providerName: targetProviderConfig?.name,
+            stage: 'model_resolution',
+            message: `Model is required. Provide model in body, x-target-model header, or default model env for ${targetProviderLabel}.`,
+            status: 400
+          });
+          continue;
+        }
+
+        const requestTransformResult = await applyBeforeUpstreamGatewayRequestTransforms({
+          runtime,
+          request,
+          config,
+          source,
+          sourceAdapter,
+          target,
+          targetProvider,
+          targetProviderConfig,
+          model: transformModel,
+          standardRequest: {
+            ...standardRequestResult.value,
+            model: transformModel
+          },
+          requestBody: body
+        });
+        if (!requestTransformResult.ok) {
+          attempts.push({
+            provider: targetProvider,
+            providerName: targetProviderConfig?.name,
+            stage: 'plugin_request_transform',
+            message: requestTransformResult.error,
+            status: requestTransformResult.status
+          });
+          continue;
+        }
+
+        passthroughModel = requestTransformResult.value.model;
+        passthroughStandardRequest = requestTransformResult.value.standardRequest;
+        standardRequestTransformed = requestTransformResult.value.standardRequestTransformed;
+        body = requestTransformResult.value.requestBody;
+        (request as unknown as { body?: unknown }).body = body;
+        adapterInput = {
+          request,
+          body,
+          source,
+          config
+        };
+      }
+
       const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, passthroughModel, {
         provider: targetProvider,
         providerConfig: targetProviderConfig
@@ -545,6 +776,25 @@ export async function handleGatewayRequest(
       });
       if (!policyResult.ok) {
         attempts.push(buildGatewayPolicyAttempt(targetProvider, targetProviderConfig, policyResult));
+        continue;
+      }
+
+      const passthroughResult = standardRequestTransformed && passthroughStandardRequest
+        ? targetAdapter.buildRequestFromStandard({
+            request,
+            standardRequest: passthroughStandardRequest,
+            config,
+            targetProviderConfig
+          })
+        : sourceAdapter.buildPassthroughRequest(adapterInput);
+      if (!passthroughResult.ok) {
+        attempts.push({
+          provider: targetProvider,
+          providerName: targetProviderConfig?.name,
+          stage: standardRequestTransformed ? 'target_request_build' : 'passthrough_build',
+          message: passthroughResult.error,
+          status: 400
+        });
         continue;
       }
 
@@ -578,7 +828,7 @@ export async function handleGatewayRequest(
         targetProvider,
         targetProviderConfig,
         passthroughModel,
-        undefined,
+        passthroughStandardRequest,
         body
       );
       if (!precheckResult.ok) {
@@ -680,12 +930,15 @@ export async function handleGatewayRequest(
       let passthroughStreamResponse = upstreamResponse;
       if (!isStreaming) {
         const hasResponseTransformPlugin = providerPlugins.some((plugin) => Boolean(plugin.transformResponse));
+        const hasResponseHook = runtime.responseHooks.list().length > 0;
         let transformedPayload: unknown | undefined;
+        let upstreamPayloadForResponseHooks: unknown | undefined;
         if (
           !isEventStreamResponse(upstreamResponse) &&
           (hasResponseTransformPlugin ||
             config.billing.enabled ||
-            config.rawTrace.enabled)
+            config.rawTrace.enabled ||
+            hasResponseHook)
         ) {
           const upstreamPayload = await safeReadUpstreamPayload(
             request,
@@ -696,6 +949,7 @@ export async function handleGatewayRequest(
           if (clientAbortSignal.aborted) {
             return;
           }
+          upstreamPayloadForResponseHooks = upstreamPayload;
           let billingPayload = upstreamPayload;
 
           if (hasResponseTransformPlugin) {
@@ -739,7 +993,7 @@ export async function handleGatewayRequest(
           }
 
           if (config.billing.enabled || config.rawTrace.enabled) {
-            tryAttachBillingHeadersFromUpstreamPayload(
+            await tryAttachBillingHeadersFromUpstreamPayload(
               request,
               reply,
               config,
@@ -777,6 +1031,39 @@ export async function handleGatewayRequest(
         }
 
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
+        if (hasResponseHook && upstreamPayloadForResponseHooks !== undefined) {
+          const responseHookResult = await applyFinalGatewayResponseHooks(runtime, {
+            request,
+            config,
+            source,
+            sourceProvider: sourceAdapter.provider,
+            sourceAdapterKey: source.adapterKey,
+            targetProvider,
+            targetProviderConfig,
+            model: passthroughModel,
+            passthrough: true,
+            streaming: false,
+            upstreamRequest,
+            upstreamResponse,
+            upstreamPayload: upstreamPayloadForResponseHooks,
+            responsePayload: transformedPayload ?? upstreamPayloadForResponseHooks,
+            statusCode: upstreamResponse.status,
+            responseHeaders: responseHeadersToRecord(upstreamResponse.headers)
+          });
+          if (!responseHookResult.ok) {
+            return sendGatewayPluginHookFailure(reply, 'response hook', responseHookResult);
+          }
+          return relayUpstreamResponseWithPayload(
+            reply,
+            upstreamResponse,
+            responseHookResult.value.responsePayload,
+            {
+              statusCode: responseHookResult.value.statusCode,
+              headers: responseHookResult.value.responseHeaders,
+              removeHeaders: responseHookResult.value.removeHeaders
+            }
+          );
+        }
         if (transformedPayload !== undefined) {
           return relayUpstreamResponseWithPayload(reply, upstreamResponse, transformedPayload);
         }
@@ -844,7 +1131,15 @@ export async function handleGatewayRequest(
           targetProviderConfig,
           rawTraceStreamResponse,
           clientAbortSignal
-        );
+        ).catch((error) => {
+          request.log.warn(
+            {
+              provider: targetProvider,
+              details: error instanceof Error ? error.message : String(error)
+            },
+            'Failed to process streaming billing event.'
+          );
+        });
       }
 
       attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
@@ -884,7 +1179,7 @@ export async function handleGatewayRequest(
         continue;
       }
 
-      const model = modelResult.value;
+      let model = modelResult.value;
       if (!model) {
         attempts.push({
           provider: targetProvider,
@@ -895,6 +1190,42 @@ export async function handleGatewayRequest(
         });
         continue;
       }
+
+      const supportsLiveStreamConversion = canRelayLiveConvertedStream(source, targetProvider, targetProviderConfig);
+      let standardRequest: StandardRequest = {
+        ...baseStandardRequest,
+        model,
+        stream: supportsLiveStreamConversion
+      };
+      const requestTransformResult = await applyBeforeUpstreamGatewayRequestTransforms({
+        runtime,
+        request,
+        config,
+        source,
+        sourceAdapter,
+        target,
+        targetProvider,
+        targetProviderConfig,
+        model,
+        standardRequest,
+        requestBody: body
+      });
+      if (!requestTransformResult.ok) {
+        attempts.push({
+          provider: targetProvider,
+          providerName: targetProviderConfig?.name,
+          stage: 'plugin_request_transform',
+          message: requestTransformResult.error,
+          status: requestTransformResult.status
+        });
+        continue;
+      }
+      model = requestTransformResult.value.model;
+      standardRequest = {
+        ...requestTransformResult.value.standardRequest,
+        stream: supportsLiveStreamConversion
+      };
+      body = requestTransformResult.value.requestBody;
 
       const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, model, {
         provider: targetProvider,
@@ -918,13 +1249,6 @@ export async function handleGatewayRequest(
         attempts.push(buildGatewayPolicyAttempt(targetProvider, targetProviderConfig, policyResult));
         continue;
       }
-
-      const supportsLiveStreamConversion = canRelayLiveConvertedStream(source, targetProvider, targetProviderConfig);
-      const standardRequest: StandardRequest = {
-        ...baseStandardRequest,
-        model,
-        stream: supportsLiveStreamConversion
-      };
 
       const targetRequestResult = targetAdapter.buildRequestFromStandard({
         request,
@@ -1118,6 +1442,10 @@ export async function handleGatewayRequest(
           targetProviderName: targetProviderConfig?.name,
           mode: 'live'
         });
+        if (shouldBlockLiveStreamingForStrictBilling(config)) {
+          await cancelResponseBody(transformedStreamResponse);
+          return sendBadRequest(reply, strictBillingLiveStreamingUnsupportedMessage);
+        }
         const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, transformedStreamResponse);
         void tryPublishStreamingBillingEventFromUpstreamResponse(
           request,
@@ -1135,7 +1463,15 @@ export async function handleGatewayRequest(
           targetProviderConfig,
           rawTraceStreamResponse,
           clientAbortSignal
-        );
+        ).catch((error) => {
+          request.log.warn(
+            {
+              provider: targetProvider,
+              details: error instanceof Error ? error.message : String(error)
+            },
+            'Failed to process streaming billing event.'
+          );
+        });
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
         return relayConvertedStreamFromUpstreamResponse(
           reply,
@@ -1276,7 +1612,7 @@ export async function handleGatewayRequest(
         standardResponseResult.value,
         standardRequest
       );
-      attachBillingHeaders(
+      await attachBillingHeaders(
         request,
         reply,
         sourceAdapter.provider,
@@ -1321,19 +1657,50 @@ export async function handleGatewayRequest(
         status: 400
       });
       continue;
-      }
+    }
 
-      const model = modelResult.value;
-      if (!model) {
-        attempts.push({
+    let model = modelResult.value;
+    if (!model) {
+      attempts.push({
         provider: targetProvider,
         providerName: targetProviderConfig?.name,
         stage: 'model_resolution',
         message: `Model is required. Provide model in body, x-target-model header, or default model env for ${targetProviderLabel}.`,
         status: 400
       });
-        continue;
-      }
+      continue;
+    }
+
+    let standardRequest: StandardRequest = {
+      ...baseStandardRequest,
+      model
+    };
+    const requestTransformResult = await applyBeforeUpstreamGatewayRequestTransforms({
+      runtime,
+      request,
+      config,
+      source,
+      sourceAdapter,
+      target,
+      targetProvider,
+      targetProviderConfig,
+      model,
+      standardRequest,
+      requestBody: body
+    });
+    if (!requestTransformResult.ok) {
+      attempts.push({
+        provider: targetProvider,
+        providerName: targetProviderConfig?.name,
+        stage: 'plugin_request_transform',
+        message: requestTransformResult.error,
+        status: requestTransformResult.status
+      });
+      continue;
+    }
+    model = requestTransformResult.value.model;
+    standardRequest = requestTransformResult.value.standardRequest;
+    body = requestTransformResult.value.requestBody;
 
     const apiKeyModelRestriction = evaluateApiKeyModelRestriction(request, model, {
       provider: targetProvider,
@@ -1357,11 +1724,6 @@ export async function handleGatewayRequest(
       attempts.push(buildGatewayPolicyAttempt(targetProvider, targetProviderConfig, policyResult));
       continue;
     }
-
-    const standardRequest: StandardRequest = {
-      ...baseStandardRequest,
-      model
-    };
 
     const targetRequestResult = targetAdapter.buildRequestFromStandard({
       request,
@@ -1663,7 +2025,7 @@ export async function handleGatewayRequest(
     });
 
     attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
-    attachBillingHeaders(
+    await attachBillingHeaders(
       request,
       reply,
       sourceAdapter.provider,
@@ -1686,9 +2048,40 @@ export async function handleGatewayRequest(
       }
     );
 
-    return reply.code(200).send(sourcePayload);
+    const responseHookResult = await applyFinalGatewayResponseHooks(runtime, {
+      request,
+      config,
+      source,
+      sourceProvider: sourceAdapter.provider,
+      sourceAdapterKey: source.adapterKey,
+      targetProvider,
+      targetProviderConfig,
+      model,
+      passthrough: false,
+      streaming: false,
+      upstreamRequest: transparentToolExecutionResult.upstreamRequest,
+      upstreamResponse,
+      upstreamPayload: transformedPayload,
+      standardRequest: transparentToolExecutionResult.standardRequest,
+      standardResponse: transparentToolExecutionResult.standardResponse,
+      responsePayload: sourcePayload,
+      statusCode: 200,
+      responseHeaders: {}
+    });
+    if (!responseHookResult.ok) {
+      return sendGatewayPluginHookFailure(reply, 'response hook', responseHookResult);
+    }
+    applyReplyHeaderMutations(
+      reply,
+      responseHookResult.value.responseHeaders,
+      responseHookResult.value.removeHeaders
+    );
+    return reply
+      .code(responseHookResult.value.statusCode)
+      .send(responseHookResult.value.responsePayload);
   }
 
+  resetFallbackRequestState();
   if (clientAbortSignal.aborted) {
     return;
   }
@@ -2551,6 +2944,10 @@ async function handleVirtualModelRequest(
           targetProviderName: targetProviderConfig?.name,
           mode: 'live'
         });
+        if (shouldBlockLiveStreamingForStrictBilling(config)) {
+          await cancelResponseBody(upstreamResponse);
+          return sendBadRequest(reply, strictBillingLiveStreamingUnsupportedMessage);
+        }
         const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, upstreamResponse);
         void tryPublishStreamingBillingEventFromUpstreamResponse(
           request,
@@ -2568,7 +2965,15 @@ async function handleVirtualModelRequest(
           targetProviderConfig,
           rawTraceStreamResponse,
           clientAbortSignal
-        );
+        ).catch((error) => {
+          request.log.warn(
+            {
+              provider: targetProvider,
+              details: error instanceof Error ? error.message : String(error)
+            },
+            'Failed to process streaming billing event.'
+          );
+        });
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
         return relayConvertedStreamFromUpstreamResponse(
           reply,
@@ -2590,6 +2995,10 @@ async function handleVirtualModelRequest(
           providerPlugins
         )
       ) {
+        if (shouldBlockLiveStreamingForStrictBilling(config)) {
+          await cancelResponseBody(upstreamResponse);
+          return sendBadRequest(reply, strictBillingLiveStreamingUnsupportedMessage);
+        }
         return sendOptimisticVirtualModelStream({
           reply,
           request,
@@ -4354,7 +4763,7 @@ function publishOptimisticVirtualModelBillingEvent(
     'Optimistic streaming usage billing computed.'
   );
 
-  publishBillingEventSafe(
+  void publishBillingEventSafe(
     input.request,
     input.reply,
     input.config,
@@ -4373,10 +4782,10 @@ function publishOptimisticVirtualModelBillingEvent(
       billingTrace: input.config.billing.trace,
       standardResponse: response
     })
-  );
+  ).catch(() => undefined);
 }
 
-function sendVirtualModelResponse(
+async function sendVirtualModelResponse(
   reply: FastifyReply,
   request: FastifyRequest,
   source: GatewaySourceContext,
@@ -4404,7 +4813,7 @@ function sendVirtualModelResponse(
       source,
       config
     });
-    attachBillingHeaders(
+    await attachBillingHeaders(
       request,
       reply,
       sourceAdapter.provider,
@@ -4429,7 +4838,7 @@ function sendVirtualModelResponse(
     return reply.code(200).send(sourcePayload);
   }
 
-  attachBillingHeaders(
+  await attachBillingHeaders(
     request,
     reply,
     sourceAdapter.provider,
@@ -5375,6 +5784,323 @@ export function parseGeminiTail(tail: string): { model: string; action: 'generat
   };
 }
 
+function resolveGatewayPluginTargetProviders(
+  resolution: GatewayPluginRouteResolution,
+  config: GatewayConfig
+): { ok: true; value?: TargetProviderRoute[] } | { ok: false; error: string } {
+  const rawRoutes = resolution.targetProviders;
+  if (rawRoutes && rawRoutes.length > 0) {
+    const routes: TargetProviderRoute[] = [];
+    for (const rawRoute of rawRoutes) {
+      const route = resolveGatewayPluginTargetProvider(rawRoute, config);
+      if (!route) {
+        return {
+          ok: false,
+          error: `Gateway plugin route resolver returned an invalid target provider: ${formatGatewayPluginTargetRoute(rawRoute)}`
+        };
+      }
+      routes.push(route);
+    }
+    const deduped = dedupeProviderRoutes(routes);
+    return {
+      ok: true,
+      value: deduped.length > 0 ? deduped : undefined
+    };
+  }
+
+  if (resolution.targetProvider || resolution.targetProviderName || resolution.targetProviderConfig) {
+    const route = resolveGatewayPluginTargetProvider(
+      {
+        provider: resolution.targetProvider,
+        providerName: resolution.targetProviderName,
+        providerConfig: resolution.targetProviderConfig
+      },
+      config
+    );
+    if (!route) {
+      return {
+        ok: false,
+        error: 'Gateway plugin route resolver returned an invalid target provider.'
+      };
+    }
+    return {
+      ok: true,
+      value: [route]
+    };
+  }
+
+  return {
+    ok: true
+  };
+}
+
+function buildDeferredGatewayIdempotencyFingerprint(input: {
+  source: GatewaySourceContext;
+  requestedModelSelector?: string;
+  targetProviders?: TargetProviderRoute[];
+}): Record<string, unknown> {
+  return {
+    sourceAdapterKey: input.source.adapterKey,
+    sourceMetadata: input.source.metadata || {},
+    requestedModelSelector: input.requestedModelSelector || null,
+    targetProviders: input.targetProviders
+      ? input.targetProviders.map((route) => summarizeIdempotencyTargetProvider(route))
+      : null
+  };
+}
+
+function summarizeIdempotencyTargetProvider(route: TargetProviderRoute): Record<string, unknown> {
+  const providerConfig = route.providerConfig;
+  return {
+    provider: route.provider,
+    providerName: providerConfig?.name || null,
+    providerType: providerConfig?.type || null,
+    providerBaseUrl: providerConfig?.baseurl || null,
+    credentialId: providerConfig?.credentialId || null,
+    credentialSourceProviderName: providerConfig?.credentialSourceProviderName || null
+  };
+}
+
+function resolveGatewayPluginTargetProvider(
+  route: GatewayPluginTargetRoute,
+  config: GatewayConfig
+): TargetProviderRoute | undefined {
+  if (route.providerConfig) {
+    return {
+      provider: route.provider || providerFromProviderType(route.providerConfig.type),
+      providerConfig: route.providerConfig
+    };
+  }
+
+  if (route.providerName) {
+    const providerConfig = findProviderConfigBySelectorAlias(config.providers, route.providerName);
+    if (!providerConfig) {
+      return undefined;
+    }
+    return {
+      provider: route.provider || providerFromProviderType(providerConfig.type),
+      providerConfig
+    };
+  }
+
+  if (route.provider) {
+    return {
+      provider: route.provider
+    };
+  }
+
+  return undefined;
+}
+
+function formatGatewayPluginTargetRoute(route: GatewayPluginTargetRoute): string {
+  if (route.providerConfig) {
+    return route.providerConfig.name;
+  }
+  return route.providerName || route.provider || 'unknown';
+}
+
+function mergeGatewaySourceMetadata(
+  current: Record<string, string> | undefined,
+  mutations: Record<string, string | null | undefined>
+): Record<string, string> | undefined {
+  const next = {
+    ...(current || {})
+  };
+
+  for (const [key, value] of Object.entries(mutations)) {
+    if (!key) {
+      continue;
+    }
+    if (value === null || value === undefined) {
+      delete next[key];
+      continue;
+    }
+    next[key] = value;
+  }
+
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+function applyRequestHeadersFromGatewayPluginRouteResolution(
+  request: FastifyRequest,
+  headers: GatewayPluginRequestTransformValue['headers']
+): void {
+  if (!headers) {
+    return;
+  }
+
+  if (isGatewayPluginRequestHeaderMutations(headers)) {
+    for (const headerName of headers.remove || []) {
+      delete request.headers[headerName.toLowerCase()];
+    }
+    for (const [headerName, headerValue] of Object.entries(headers.set || {})) {
+      applyRequestHeaderFromGatewayPluginRouteResolution(request, headerName, headerValue);
+    }
+    return;
+  }
+
+  for (const [headerName, headerValue] of Object.entries(headers)) {
+    applyRequestHeaderFromGatewayPluginRouteResolution(request, headerName, headerValue);
+  }
+}
+
+function cloneGatewayFallbackRequestBody(
+  body: Record<string, unknown>
+): Record<string, unknown> {
+  return structuredClone(body) as Record<string, unknown>;
+}
+
+function cloneGatewayFallbackRequestHeaders(
+  headers: FastifyRequest['headers']
+): FastifyRequest['headers'] {
+  return Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => [
+      name,
+      Array.isArray(value) ? [...value] : value
+    ])
+  );
+}
+
+function replaceGatewayFallbackRequestHeaders(
+  request: FastifyRequest,
+  headers: FastifyRequest['headers']
+): void {
+  for (const name of Object.keys(request.headers)) {
+    delete request.headers[name];
+  }
+  Object.assign(request.headers, cloneGatewayFallbackRequestHeaders(headers));
+}
+
+function applyRequestHeaderFromGatewayPluginRouteResolution(
+  request: FastifyRequest,
+  headerName: string,
+  headerValue: string | number | boolean | null | undefined
+): void {
+  const normalizedName = headerName.trim().toLowerCase();
+  if (!normalizedName) {
+    return;
+  }
+  if (headerValue === null || headerValue === undefined) {
+    delete request.headers[normalizedName];
+    return;
+  }
+  request.headers[normalizedName] = String(headerValue);
+}
+
+function isGatewayPluginRequestHeaderMutations(
+  value: GatewayPluginRequestTransformValue['headers']
+): value is GatewayPluginRequestHeaderMutations {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as GatewayPluginRequestHeaderMutations;
+  return candidate.set !== undefined || candidate.remove !== undefined;
+}
+
+function hasBeforeUpstreamGatewayRequestTransforms(runtime: GatewayRuntime): boolean {
+  return runtime.requestTransforms.list().some(
+    (transform) => !transform.stage || transform.stage === 'beforeUpstream'
+  );
+}
+
+async function applyBeforeUpstreamGatewayRequestTransforms(input: {
+  runtime: GatewayRuntime;
+  request: FastifyRequest;
+  config: GatewayConfig;
+  source: GatewaySourceContext;
+  sourceAdapter: SourceAdapter;
+  target: TargetProviderRoute;
+  targetProvider: Provider;
+  targetProviderConfig?: ProviderConfig;
+  model: string;
+  standardRequest: StandardRequest;
+  requestBody: Record<string, unknown>;
+}): Promise<
+  | {
+      ok: true;
+      value: {
+        model: string;
+        standardRequest: StandardRequest;
+        standardRequestTransformed: boolean;
+        requestBody: Record<string, unknown>;
+      };
+    }
+  | { ok: false; status: number; error: string }
+> {
+  const transformResult = await applyGatewayPluginRequestTransforms(
+    input.runtime.requestTransforms.list(),
+    {
+      stage: 'beforeUpstream',
+      request: input.request,
+      config: input.config,
+      route: {
+        method: input.request.method,
+        url: input.request.url,
+        route: input.request.routeOptions?.url,
+        sourceAdapterKey: input.source.adapterKey,
+        sourceRoute: input.source.metadata?.sourceRoute
+      },
+      source: input.source,
+      sourceProvider: input.sourceAdapter.provider,
+      sourceAdapterKey: input.source.adapterKey,
+      targetProvider: input.targetProvider,
+      targetProviderConfig: input.targetProviderConfig,
+      model: input.model,
+      standardRequest: input.standardRequest,
+      requestBody: input.requestBody
+    }
+  );
+  if (!transformResult.ok) {
+    return {
+      ok: false,
+      status: transformResult.status || 400,
+      error: `Gateway plugin "${transformResult.pluginKey}" beforeUpstream request transform failed: ${transformResult.error}`
+    };
+  }
+
+  let requestBody = input.requestBody;
+  if (transformResult.value.requestBody !== undefined) {
+    if (!isObject(transformResult.value.requestBody)) {
+      return {
+        ok: false,
+        status: 400,
+        error: 'Request body must be a JSON object after gateway plugin beforeUpstream transform.'
+      };
+    }
+    requestBody = transformResult.value.requestBody;
+  }
+
+  let standardRequest = transformResult.value.standardRequest || input.standardRequest;
+  const model =
+    transformResult.value.model ||
+    (typeof standardRequest.model === 'string' && standardRequest.model.trim()
+      ? standardRequest.model.trim()
+      : input.model);
+  const modelResult = validateModelForTarget(model, input.target, input.config);
+  if (!modelResult.ok) {
+    return {
+      ok: false,
+      status: 400,
+      error: modelResult.error
+    };
+  }
+
+  standardRequest = {
+    ...standardRequest,
+    model: modelResult.value || model
+  };
+
+  return {
+    ok: true,
+    value: {
+      model: standardRequest.model as string,
+      standardRequest,
+      standardRequestTransformed: transformResult.value.standardRequestTransformed,
+      requestBody
+    }
+  };
+}
+
 function resolveTargetProviders(
   request: FastifyRequest,
   sourceProvider: Provider,
@@ -6291,7 +7017,7 @@ function attachTargetRoutingHeaders(
   }
 }
 
-function attachBillingHeaders(
+async function attachBillingHeaders(
   request: FastifyRequest,
   reply: FastifyReply,
   sourceProvider: Provider,
@@ -6334,6 +7060,7 @@ function attachBillingHeaders(
     config.billing,
     resolveProviderBillingRate(config, provider, model, targetProviderConfig)
   );
+  assertStrictBillingRequirements(config, provider, model, usage, billing);
   const headers = buildBillingHeaders(billing);
   for (const [key, value] of Object.entries(headers)) {
     reply.header(key, value);
@@ -6349,7 +7076,7 @@ function attachBillingHeaders(
     'Usage billing computed.'
   );
 
-  publishBillingEventSafe(
+  await publishBillingEventSafe(
     request,
     reply,
     config,
@@ -6433,8 +7160,12 @@ async function tryAttachBillingHeadersFromUpstreamResponse(
       },
       'Failed to parse passthrough response usage for billing.'
     );
+    if (config.billing.requireUsage) {
+      throw new Error(`Billing usage is required but could not be parsed for provider ${targetProvider}.`);
+    }
     return;
   }
+  assertBillingResponseUsageReported(config, targetProvider, billingResponseResult.value);
 
   if (billingResponseResult.value.recovered) {
     request.log.debug(
@@ -6445,7 +7176,7 @@ async function tryAttachBillingHeadersFromUpstreamResponse(
     );
   }
 
-  attachBillingHeaders(
+  await attachBillingHeaders(
     request,
     reply,
     sourceProvider,
@@ -6466,7 +7197,7 @@ async function tryAttachBillingHeadersFromUpstreamResponse(
   );
 }
 
-function tryAttachBillingHeadersFromUpstreamPayload(
+async function tryAttachBillingHeadersFromUpstreamPayload(
   request: FastifyRequest,
   reply: FastifyReply,
   config: GatewayConfig,
@@ -6516,8 +7247,12 @@ function tryAttachBillingHeadersFromUpstreamPayload(
       },
       'Failed to parse passthrough payload usage for billing.'
     );
+    if (config.billing.requireUsage) {
+      throw new Error(`Billing usage is required but could not be parsed for provider ${targetProvider}.`);
+    }
     return;
   }
+  assertBillingResponseUsageReported(config, targetProvider, billingResponseResult.value);
 
   if (billingResponseResult.value.recovered) {
     request.log.debug(
@@ -6528,7 +7263,7 @@ function tryAttachBillingHeadersFromUpstreamPayload(
     );
   }
 
-  attachBillingHeaders(
+  await attachBillingHeaders(
     request,
     reply,
     sourceProvider,
@@ -6617,6 +7352,9 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
       },
       'Failed to collect streaming response payload for billing.'
     );
+    if (config.billing.enabled && config.billing.requireUsage) {
+      throw new Error(`Billing usage is required but streaming response could not be read for provider ${targetProvider}.`);
+    }
     return;
   }
   const rawStreamCapture = await rawStreamCapturePromise;
@@ -6652,8 +7390,12 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
       },
       'Failed to parse streaming response usage for billing.'
     );
+    if (config.billing.requireUsage) {
+      throw new Error(`Billing usage is required but could not be parsed for provider ${targetProvider}.`);
+    }
     return;
   }
+  assertBillingResponseUsageReported(config, targetProvider, billingResponseResult.value);
 
   if (billingResponseResult.value.recovered) {
     request.log.debug(
@@ -6679,6 +7421,13 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
     config.billing,
     resolveProviderBillingRate(config, targetProvider, billingModel, targetProviderConfig)
   );
+  assertStrictBillingRequirements(
+    config,
+    targetProvider,
+    billingModel,
+    billingResponseResult.value.usage,
+    billing
+  );
 
   request.log.info(
     {
@@ -6690,7 +7439,7 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
     'Streaming usage billing computed.'
   );
 
-  publishBillingEventSafe(
+  await publishBillingEventSafe(
     request,
     reply,
     config,
@@ -6718,6 +7467,7 @@ export function resolveBillingResponseSnapshot(
 ): { ok: true; value: BillingResponseSnapshot } | { ok: false; error: string } {
   const standardResponseResult = targetAdapter.toStandardResponse(upstreamPayload);
   if (standardResponseResult.ok) {
+    const usageReported = hasUsageData(standardResponseResult.value.usage);
     return {
       ok: true,
       value: {
@@ -6726,6 +7476,7 @@ export function resolveBillingResponseSnapshot(
           targetProvider,
           standardResponseResult.value.usage,
         ),
+        usageReported,
         recovered: false
       }
     };
@@ -6830,7 +7581,8 @@ function extractOpenAIBillingResponseSnapshot(
 
   return {
     model: asString(responsePayload.model) || undefined,
-    usage
+    usage,
+    usageReported: true
   };
 }
 
@@ -6848,7 +7600,8 @@ function recoverZeroOpenAIBillingResponseSnapshot(
       output_tokens: 0,
       total_tokens: 0,
       cache_read_tokens: 0
-    }
+    },
+    usageReported: false
   };
 }
 
@@ -6908,7 +7661,8 @@ function extractAnthropicBillingResponseSnapshot(
 
   return {
     model: asString(payload.model) || undefined,
-    usage
+    usage,
+    usageReported: true
   };
 }
 
@@ -6937,7 +7691,8 @@ function extractGeminiBillingResponseSnapshot(
 
   return {
     model: asString(payload.modelVersion) || undefined,
-    usage
+    usage,
+    usageReported: true
   };
 }
 
@@ -6951,6 +7706,7 @@ function hasUsageData(usage: StandardUsage): boolean {
     usage.cache_duration_seconds !== undefined ||
     usage.cache_ttl_seconds !== undefined ||
     usage.cache_age_seconds !== undefined ||
+    usage.video_seconds !== undefined ||
     usage.server_tool_use?.web_search_requests !== undefined ||
     usage.server_tool_use?.web_fetch_requests !== undefined
   );
@@ -7175,7 +7931,7 @@ async function callUpstreamWithFailureCapture(
       details?: unknown;
     }
 > {
-  const circuit = checkProviderCircuitBreaker(
+  const circuit = await checkProviderCircuitBreaker(
     context.config,
     context.targetProvider,
     context.targetProviderConfig
@@ -7231,9 +7987,11 @@ async function callUpstreamWithFailureCapture(
     recordProviderHealthResponse(
       context.targetProviderConfig,
       response.status,
-      Date.now() - startedAt
+      Date.now() - startedAt,
+      new Date(),
+      context.config.providerHealthCheck?.storage
     );
-    recordProviderCircuitBreakerResponse(
+    await recordProviderCircuitBreakerResponse(
       context.config,
       context.targetProvider,
       context.targetProviderConfig,
@@ -7254,9 +8012,11 @@ async function callUpstreamWithFailureCapture(
     if (!context.clientAbortSignal?.aborted) {
       recordProviderHealthFailure(
         context.targetProviderConfig,
-        Date.now() - startedAt
+        Date.now() - startedAt,
+        new Date(),
+        context.config.providerHealthCheck?.storage
       );
-      recordProviderCircuitBreakerFailure(
+      await recordProviderCircuitBreakerFailure(
         context.config,
         context.targetProvider,
         context.targetProviderConfig
@@ -7428,33 +8188,37 @@ async function applyProviderRequestPlugins(
 
     if (plugin.authenticate) {
       const startedAt = process.hrtime.bigint();
-      try {
-        const result = await plugin.authenticate(pluginInput);
-        if (!result.ok) {
-          recordGatewayPluginHookExecution({
-            pluginKey: plugin.key,
-            kind: 'provider',
-            hook: 'authenticate',
-            outcome: 'error',
-            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-          });
-          return {
-            ok: false,
-            stage: 'provider_auth',
-            status: 400,
-            message: `Provider plugin "${plugin.key}" auth failed: ${result.error}`
-          };
-        }
-
-        upstreamRequest = result.value;
+      const executionResult = await runGatewayPluginProtectedOperation({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'authenticate',
+        execution: plugin.execution,
+        operation: () => plugin.authenticate?.(pluginInput)
+      });
+      if (!executionResult.ok) {
         recordGatewayPluginHookExecution({
           pluginKey: plugin.key,
           kind: 'provider',
           hook: 'authenticate',
-          outcome: 'success',
+          outcome: executionResult.reason,
           durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
         });
-      } catch (error) {
+        return {
+          ok: false,
+          stage: 'provider_auth',
+          status: 400,
+          message: `Provider plugin "${plugin.key}" auth failed: ${executionResult.error}`
+        };
+      }
+      if ('skipped' in executionResult) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: executionResult.reason,
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
+      } else if (!executionResult.value?.ok) {
         recordGatewayPluginHookExecution({
           pluginKey: plugin.key,
           kind: 'provider',
@@ -7466,43 +8230,56 @@ async function applyProviderRequestPlugins(
           ok: false,
           stage: 'provider_auth',
           status: 400,
-          message: `Provider plugin "${plugin.key}" auth failed: ${formatPluginExecutionError(error)}`
+          message: `Provider plugin "${plugin.key}" auth failed: ${executionResult.value?.error || 'unknown error'}`
         };
+      } else {
+        upstreamRequest = executionResult.value.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
       }
     }
 
     if (plugin.transformRequest) {
       const startedAt = process.hrtime.bigint();
-      try {
-        const result = await plugin.transformRequest({
+      const executionResult = await runGatewayPluginProtectedOperation({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformRequest',
+        execution: plugin.execution,
+        operation: () => plugin.transformRequest?.({
           ...pluginInput,
           upstreamRequest
-        });
-        if (!result.ok) {
-          recordGatewayPluginHookExecution({
-            pluginKey: plugin.key,
-            kind: 'provider',
-            hook: 'transformRequest',
-            outcome: 'error',
-            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-          });
-          return {
-            ok: false,
-            stage: 'provider_request_transform',
-            status: 400,
-            message: `Provider plugin "${plugin.key}" request transform failed: ${result.error}`
-          };
-        }
-
-        upstreamRequest = result.value;
+        })
+      });
+      if (!executionResult.ok) {
         recordGatewayPluginHookExecution({
           pluginKey: plugin.key,
           kind: 'provider',
           hook: 'transformRequest',
-          outcome: 'success',
+          outcome: executionResult.reason,
           durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
         });
-      } catch (error) {
+        return {
+          ok: false,
+          stage: 'provider_request_transform',
+          status: 400,
+          message: `Provider plugin "${plugin.key}" request transform failed: ${executionResult.error}`
+        };
+      }
+      if ('skipped' in executionResult) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: executionResult.reason,
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
+      } else if (!executionResult.value?.ok) {
         recordGatewayPluginHookExecution({
           pluginKey: plugin.key,
           kind: 'provider',
@@ -7514,8 +8291,17 @@ async function applyProviderRequestPlugins(
           ok: false,
           stage: 'provider_request_transform',
           status: 400,
-          message: `Provider plugin "${plugin.key}" request transform failed: ${formatPluginExecutionError(error)}`
+          message: `Provider plugin "${plugin.key}" request transform failed: ${executionResult.value?.error || 'unknown error'}`
         };
+      } else {
+        upstreamRequest = executionResult.value.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
       }
     }
   }
@@ -7569,33 +8355,39 @@ async function applyProviderResponsePlugins(
     }
 
     const startedAt = process.hrtime.bigint();
-    try {
-      const result = await plugin.transformResponse(pluginInput);
-      if (!result.ok) {
-        recordGatewayPluginHookExecution({
-          pluginKey: plugin.key,
-          kind: 'provider',
-          hook: 'transformResponse',
-          outcome: 'error',
-          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-        });
-        return {
-          ok: false,
-          stage: 'provider_response_transform',
-          status: 502,
-          message: `Provider plugin "${plugin.key}" response transform failed: ${result.error}`
-        };
-      }
-
-      payload = result.value;
+    const executionResult = await runGatewayPluginProtectedOperation({
+      pluginKey: plugin.key,
+      kind: 'provider',
+      hook: 'transformResponse',
+      execution: plugin.execution,
+      operation: () => plugin.transformResponse?.(pluginInput)
+    });
+    if (!executionResult.ok) {
       recordGatewayPluginHookExecution({
         pluginKey: plugin.key,
         kind: 'provider',
         hook: 'transformResponse',
-        outcome: 'success',
+        outcome: executionResult.reason,
         durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
       });
-    } catch (error) {
+      return {
+        ok: false,
+        stage: 'provider_response_transform',
+        status: 502,
+        message: `Provider plugin "${plugin.key}" response transform failed: ${executionResult.error}`
+      };
+    }
+    if ('skipped' in executionResult) {
+      recordGatewayPluginHookExecution({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformResponse',
+        outcome: executionResult.reason,
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
+      continue;
+    }
+    if (!executionResult.value?.ok) {
       recordGatewayPluginHookExecution({
         pluginKey: plugin.key,
         kind: 'provider',
@@ -7607,9 +8399,18 @@ async function applyProviderResponsePlugins(
         ok: false,
         stage: 'provider_response_transform',
         status: 502,
-        message: `Provider plugin "${plugin.key}" response transform failed: ${formatPluginExecutionError(error)}`
+        message: `Provider plugin "${plugin.key}" response transform failed: ${executionResult.value?.error || 'unknown error'}`
       };
     }
+
+    payload = executionResult.value.value;
+    recordGatewayPluginHookExecution({
+      pluginKey: plugin.key,
+      kind: 'provider',
+      hook: 'transformResponse',
+      outcome: 'success',
+      durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+    });
   }
 
   return {
@@ -7632,25 +8433,126 @@ const hopByHopResponseHeaders = new Set([
   'host'
 ]);
 
+async function applyFinalGatewayResponseHooks(
+  runtime: Pick<GatewayRuntime, 'responseHooks'>,
+  input: GatewayPluginResponseHookInput
+) {
+  const responseHooks = runtime.responseHooks.list();
+  if (responseHooks.length === 0) {
+    return {
+      ok: true as const,
+      value: {
+        responsePayload: input.responsePayload,
+        statusCode: input.statusCode,
+        responseHeaders: input.responseHeaders,
+        removeHeaders: []
+      }
+    };
+  }
+
+  return applyGatewayPluginResponseHooks(responseHooks, input);
+}
+
+function sendGatewayPluginHookFailure(
+  reply: FastifyReply,
+  stage: string,
+  failure: GatewayPluginHookFailure & { pluginKey?: string }
+) {
+  return reply.code(failure.status || defaultGatewayPluginHookFailureStatus(stage)).send({
+    error: {
+      message: `Gateway plugin "${failure.pluginKey || stage}" ${stage} failed: ${failure.error}`,
+      details: failure.details
+    }
+  });
+}
+
+function defaultGatewayPluginHookFailureStatus(stage: string): number {
+  if (stage === 'response hook') {
+    return 502;
+  }
+  if (stage === 'request transform' || stage === 'route resolver') {
+    return 400;
+  }
+  return 403;
+}
+
 function relayUpstreamResponseWithPayload(
   reply: FastifyReply,
   upstreamResponse: Response,
-  payload: unknown
+  payload: unknown,
+  overrides?: {
+    statusCode?: number;
+    headers?: Record<string, string>;
+    removeHeaders?: string[];
+  }
 ) {
-  reply.code(upstreamResponse.status);
+  reply.code(overrides?.statusCode || upstreamResponse.status);
+  const removedHeaders = new Set(overrides?.removeHeaders || []);
 
   upstreamResponse.headers.forEach((value, key) => {
     const normalized = key.toLowerCase();
-    if (!hopByHopResponseHeaders.has(normalized) && normalized !== 'content-length') {
+    if (
+      !hopByHopResponseHeaders.has(normalized) &&
+      normalized !== 'content-length' &&
+      !removedHeaders.has(normalized) &&
+      !overrides?.headers?.[normalized]
+    ) {
       reply.header(key, value);
     }
   });
 
-  if ((isPlainObject(payload) || Array.isArray(payload)) && !isJsonContentType(upstreamResponse.headers.get('content-type'))) {
+  applyReplyHeaderMutations(reply, overrides?.headers || {}, overrides?.removeHeaders);
+
+  if (
+    (isPlainObject(payload) || Array.isArray(payload)) &&
+    !isJsonContentType(upstreamResponse.headers.get('content-type')) &&
+    !overrides?.headers?.['content-type']
+  ) {
     reply.header('content-type', 'application/json');
   }
 
   return reply.send(payload);
+}
+
+function applyReplyHeaderMutations(
+  reply: FastifyReply,
+  headers: Record<string, string>,
+  removeHeaders: string[] = []
+): void {
+  for (const headerName of removeHeaders) {
+    removeReplyHeader(reply, headerName);
+  }
+  for (const [headerName, headerValue] of Object.entries(headers)) {
+    const normalizedName = headerName.trim();
+    if (!normalizedName) {
+      continue;
+    }
+    reply.header(normalizedName, headerValue);
+  }
+}
+
+function removeReplyHeader(reply: FastifyReply, headerName: string): void {
+  const normalizedName = headerName.trim();
+  if (!normalizedName) {
+    return;
+  }
+  const removableReply = reply as unknown as { removeHeader?: (name: string) => void };
+  if (typeof removableReply.removeHeader === 'function') {
+    removableReply.removeHeader(normalizedName);
+    return;
+  }
+  reply.raw.removeHeader(normalizedName);
+}
+
+function responseHeadersToRecord(headers: Headers): Record<string, string> {
+  const record: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    const normalized = key.toLowerCase();
+    if (!hopByHopResponseHeaders.has(normalized) && normalized !== 'content-length') {
+      record[normalized] = value;
+    }
+  });
+  return record;
 }
 
 function isJsonContentType(value: string | null): boolean {
@@ -7810,6 +8712,47 @@ function resolveProviderBillingRate(
   }
 
   return providerConfig.billing.default;
+}
+
+function assertStrictBillingRequirements(
+  config: GatewayConfig,
+  provider: Provider,
+  model: string | undefined,
+  usage: StandardUsage,
+  billing: BillingResult
+): void {
+  if (config.billing.requireUsage && !hasUsageData(usage)) {
+    throw new Error(`Billing usage is required but was not reported for provider ${provider}.`);
+  }
+
+  if (!config.billing.requireRates || !hasBillableUsage(usage) || billing.cost.total > 0) {
+    return;
+  }
+
+  throw new Error(
+    `Billing rates are required but produced zero cost for provider ${provider}${model ? ` model ${model}` : ''}.`
+  );
+}
+
+function assertBillingResponseUsageReported(
+  config: GatewayConfig,
+  provider: Provider,
+  snapshot: BillingResponseSnapshot
+): void {
+  if (config.billing.requireUsage && !snapshot.usageReported) {
+    throw new Error(`Billing usage is required but was not reported for provider ${provider}.`);
+  }
+}
+
+function hasBillableUsage(usage: StandardUsage): boolean {
+  return [
+    usage.input_tokens,
+    usage.output_tokens,
+    usage.cache_read_tokens,
+    usage.cache_write_tokens,
+    usage.total_tokens,
+    usage.video_seconds
+  ].some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0);
 }
 
 function resolveScopedHeaders(providerConfig: ProviderConfig, model: string | undefined): Record<string, string> {
@@ -8336,10 +9279,15 @@ function publishRawTraceCaptureSafe(
     });
   }
 
+  const completedAtMs = Date.now();
+  const startedAtMs = rawTraceRequestStartedAtMs.get(request) ?? completedAtMs;
   enqueueRawTraceCapture({
     requestId: request.id,
     method: request.method,
     url: traceUrl,
+    startedAt: new Date(startedAtMs).toISOString(),
+    completedAt: new Date(completedAtMs).toISOString(),
+    durationMs: Math.max(0, Math.round(completedAtMs - startedAtMs)),
     identity: request.gatewayIdentity,
     clientContext: isObject(request.body)
       ? extractGatewayRequestClientContext(
@@ -8471,7 +9419,7 @@ function resolveAttemptRawTraceCapture(attempt?: ProviderAttemptFailure): Gatewa
   };
 }
 
-function publishBillingEventSafe(
+async function publishBillingEventSafe(
   request: FastifyRequest,
   reply: FastifyReply,
   config: GatewayConfig,
@@ -8540,7 +9488,16 @@ function publishBillingEventSafe(
     billing
   };
 
-  void publishBillingEvent(event)
+  publishRawTraceCaptureSafe(
+    request,
+    config,
+    targetProvider,
+    model,
+    targetProviderConfig,
+    rawTraceCapture
+  );
+
+  const delivery = publishBillingEvent(event)
     .then((published) => {
       if (published) {
         request.log.debug(
@@ -8553,6 +9510,7 @@ function publishBillingEventSafe(
           'Billing event delivered.'
         );
       }
+      return published;
     })
     .catch((error) => {
       request.log.warn(
@@ -8563,16 +9521,18 @@ function publishBillingEventSafe(
         },
         'Failed to deliver billing event.'
       );
+      throw error;
     });
 
-  publishRawTraceCaptureSafe(
-    request,
-    config,
-    targetProvider,
-    model,
-    targetProviderConfig,
-    rawTraceCapture
-  );
+  if (!shouldAwaitBillingDelivery(config)) {
+    void delivery.catch(() => undefined);
+    return;
+  }
+
+  const delivered = await delivery;
+  if (!delivered && (config.billing.delivery?.requirePublisher || config.billing.delivery?.requireOutbox)) {
+    throw new Error('Billing event was not delivered to any configured billing publisher or outbox.');
+  }
 }
 
 function publishRequestFailureEventSafe(

@@ -181,10 +181,9 @@ async function applyWebhookEvent(
   }
 
   if (event.type === 'provider.refresh' || event.type === 'config.refresh') {
-    await hydrateProvidersFromExternalSource(config)
-    if (options.onConfigReload) {
-      await options.onConfigReload(config)
-    }
+    const nextConfig = structuredClone(config)
+    await hydrateProvidersFromExternalSource(nextConfig)
+    await applyWebhookConfigTransaction(options, nextConfig, true)
     return {
       applied: true,
       reason: 'refreshed_from_external_source'
@@ -204,17 +203,44 @@ async function applyWebhookEvent(
   applyPatchOperations(nextRaw, operations)
 
   const nextConfig = parseGatewayConfigFromRaw(nextRaw)
-  applyGatewayConfigInPlace(config, nextConfig)
-
-  if (options.onConfigReload && shouldTriggerConfigReload(operations)) {
-    await options.onConfigReload(config)
-  }
+  await applyWebhookConfigTransaction(options, nextConfig, shouldTriggerConfigReload(operations))
 
   return {
     applied: true,
     reason: 'config_patched',
     operations: operations.length
   }
+}
+
+async function applyWebhookConfigTransaction(
+  options: RegisterProviderWebhookOptions,
+  nextConfig: GatewayConfig,
+  reloadRuntime: boolean
+): Promise<void> {
+  const previousConfig = structuredClone(options.config)
+  let reloadAttempted = false
+  try {
+    if (reloadRuntime && options.onConfigReload) {
+      reloadAttempted = true
+      await options.onConfigReload(nextConfig)
+    }
+    applyGatewayConfigInPlace(options.config, nextConfig)
+  } catch (error) {
+    if (reloadAttempted && options.onConfigReload) {
+      try {
+        await options.onConfigReload(previousConfig)
+      } catch (rollbackError) {
+        throw new Error(
+          `${formatWebhookError(error)} Runtime rollback also failed: ${formatWebhookError(rollbackError)}`
+        )
+      }
+    }
+    throw error
+  }
+}
+
+function formatWebhookError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function parseWebhookEvent(payload: Record<string, unknown>): ParseEventResult | ParseEventError {

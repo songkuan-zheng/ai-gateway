@@ -7,13 +7,18 @@ import {
   GatewayPluginExtensionRegistry,
   type GatewayPluginHealth,
   type GatewayPluginEventPublisher,
-  type GatewayPluginOutbox
+  type GatewayPluginOutbox,
+  type GatewayPluginDeliveryStateStore
 } from '../plugins/events';
 import { syncProviderPluginsFromConfig } from '../provider/plugins';
 import type {
   GatewayConfig,
   GatewayPluginEventHook,
+  GatewayPluginHttpRoute,
   GatewayPluginRequestHook,
+  GatewayPluginRequestTransform,
+  GatewayPluginResponseHook,
+  GatewayPluginRouteResolver,
   GatewayPluginStreamHook,
   VirtualModelProfileConfig
 } from '../types';
@@ -77,13 +82,18 @@ export interface GatewayRuntime {
   targetAdapters: TargetAdapterRegistry;
   providerPlugins: ProviderPluginRegistry;
   requestHooks: GatewayPluginComponentRegistry<GatewayPluginRequestHook>;
+  requestTransforms: GatewayPluginComponentRegistry<GatewayPluginRequestTransform>;
+  routeResolvers: GatewayPluginComponentRegistry<GatewayPluginRouteResolver>;
+  responseHooks: GatewayPluginComponentRegistry<GatewayPluginResponseHook>;
   streamHooks: GatewayPluginComponentRegistry<GatewayPluginStreamHook>;
+  httpRoutes: GatewayPluginComponentRegistry<GatewayPluginHttpRoute>;
   billingEventHooks: GatewayPluginComponentRegistry<GatewayPluginEventHook>;
   agentEventHooks: GatewayPluginComponentRegistry<GatewayPluginEventHook>;
   billingPublishers: GatewayPluginExtensionRegistry<GatewayPluginEventPublisher>;
   billingOutboxes: GatewayPluginExtensionRegistry<GatewayPluginOutbox>;
   agentEventPublishers: GatewayPluginExtensionRegistry<GatewayPluginEventPublisher>;
   agentEventOutboxes: GatewayPluginExtensionRegistry<GatewayPluginOutbox>;
+  deliveryStateStores: GatewayPluginExtensionRegistry<GatewayPluginDeliveryStateStore>;
   virtualModelProfiles: VirtualModelProfileRegistry;
   toolProvider?: AgentToolProvider;
 }
@@ -108,13 +118,18 @@ export function createGatewayRuntime(
   const targetAdapters = new TargetAdapterRegistry();
   const providerPlugins = new ProviderPluginRegistry();
   const requestHooks = new GatewayPluginComponentRegistry<GatewayPluginRequestHook>();
+  const requestTransforms = new GatewayPluginComponentRegistry<GatewayPluginRequestTransform>();
+  const routeResolvers = new GatewayPluginComponentRegistry<GatewayPluginRouteResolver>();
+  const responseHooks = new GatewayPluginComponentRegistry<GatewayPluginResponseHook>();
   const streamHooks = new GatewayPluginComponentRegistry<GatewayPluginStreamHook>();
+  const httpRoutes = new GatewayPluginComponentRegistry<GatewayPluginHttpRoute>();
   const billingEventHooks = new GatewayPluginComponentRegistry<GatewayPluginEventHook>();
   const agentEventHooks = new GatewayPluginComponentRegistry<GatewayPluginEventHook>();
   const billingPublishers = new GatewayPluginExtensionRegistry<GatewayPluginEventPublisher>();
   const billingOutboxes = new GatewayPluginExtensionRegistry<GatewayPluginOutbox>();
   const agentEventPublishers = new GatewayPluginExtensionRegistry<GatewayPluginEventPublisher>();
   const agentEventOutboxes = new GatewayPluginExtensionRegistry<GatewayPluginOutbox>();
+  const deliveryStateStores = new GatewayPluginExtensionRegistry<GatewayPluginDeliveryStateStore>();
   const virtualModelProfiles = new VirtualModelProfileRegistry();
 
   for (const adapter of createBuiltinSourceAdapters()) {
@@ -134,13 +149,18 @@ export function createGatewayRuntime(
     targetAdapters,
     providerPlugins,
     requestHooks,
+    requestTransforms,
+    routeResolvers,
+    responseHooks,
     streamHooks,
+    httpRoutes,
     billingEventHooks,
     agentEventHooks,
     billingPublishers,
     billingOutboxes,
     agentEventPublishers,
     agentEventOutboxes,
+    deliveryStateStores,
     virtualModelProfiles,
     toolProvider
   };
@@ -157,7 +177,7 @@ export function listGatewayVirtualModelProfiles(
 }
 
 export async function collectGatewayRuntimePluginHealth(
-  runtime: Pick<GatewayRuntime, 'billingPublishers' | 'billingOutboxes' | 'agentEventPublishers' | 'agentEventOutboxes'>
+  runtime: Pick<GatewayRuntime, 'billingPublishers' | 'billingOutboxes' | 'agentEventPublishers' | 'agentEventOutboxes' | 'deliveryStateStores'>
 ): Promise<GatewayRuntimePluginHealthGroup[]> {
   return [
     {
@@ -175,6 +195,10 @@ export async function collectGatewayRuntimePluginHealth(
     {
       kind: 'agent_event_outbox',
       extensions: await collectGatewayPluginExtensionHealth(runtime.agentEventOutboxes.list())
+    },
+    {
+      kind: 'delivery_state_store',
+      extensions: await collectGatewayPluginExtensionHealth(runtime.deliveryStateStores.list())
     }
   ];
 }

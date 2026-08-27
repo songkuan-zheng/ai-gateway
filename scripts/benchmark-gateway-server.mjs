@@ -114,6 +114,7 @@ function createBenchmarkConfig(gatewayPort, mockPort) {
   return {
     host: '127.0.0.1',
     port: gatewayPort,
+    upstreamTimeoutMs: 250,
     providers: [
       {
         name: 'openai-responses',
@@ -203,6 +204,21 @@ function createScenarios() {
       body: {
         model: 'openai-chat/gpt-chat-bench',
         messages: [{ role: 'user', content: 'Return a short benchmark response.' }],
+        max_tokens: 64
+      }
+    },
+    {
+      name: 'OpenAI Chat upstream timeout',
+      method: 'POST',
+      path: '/v1/chat/completions',
+      targetProvider: 'openai-chat',
+      expectStatus: 502,
+      body: {
+        model: 'openai-chat/gpt-chat-bench',
+        messages: [{ role: 'user', content: 'Simulate a slow upstream response.' }],
+        metadata: {
+          benchmarkDelayMs: 500
+        },
         max_tokens: 64
       }
     },
@@ -338,8 +354,9 @@ async function sendScenarioRequest(baseUrl, scenario) {
 
   const response = await fetch(`${baseUrl}${scenario.path}`, init);
   const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`${scenario.name} failed with ${response.status}: ${text.slice(0, 500)}`);
+  const expectedStatus = scenario.expectStatus || 200;
+  if (response.status !== expectedStatus) {
+    throw new Error(`${scenario.name} expected ${expectedStatus} but received ${response.status}: ${text.slice(0, 500)}`);
   }
 
   if (text) {
@@ -382,6 +399,10 @@ async function startMockUpstream(port) {
   const server = createServer(async (request, response) => {
     const body = await readJsonBody(request);
     const url = new URL(request.url || '/', `http://${request.headers.host || '127.0.0.1'}`);
+    const delayMs = readBenchmarkDelayMs(body);
+    if (delayMs > 0) {
+      await delay(delayMs);
+    }
     const payload = buildMockPayload(url, body);
     response.writeHead(200, {
       'content-type': 'application/json'
@@ -397,6 +418,16 @@ async function startMockUpstream(port) {
     });
   });
   return server;
+}
+
+function readBenchmarkDelayMs(body) {
+  const raw = body?.metadata?.benchmarkDelayMs ?? body?.benchmarkDelayMs;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
+  }
+
+  return Math.min(5000, Math.trunc(parsed));
 }
 
 async function readJsonBody(request) {

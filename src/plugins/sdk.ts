@@ -2,8 +2,20 @@ import type {
   GatewayConfig,
   GatewayPluginEventHook,
   GatewayPluginConfig,
+  GatewayPluginHttpRoute,
+  GatewayPluginHttpRouteInput,
   GatewayPluginRequestHook,
+  GatewayPluginRequestTransformInput,
+  GatewayPluginRequestTransform,
+  GatewayPluginRequestTransformValue,
+  GatewayPluginResponseHook,
+  GatewayPluginResponseHookInput,
+  GatewayPluginResponseTransformValue,
+  GatewayPluginRouteResolution,
+  GatewayPluginRouteResolver,
+  GatewayPluginTargetRoute,
   GatewayPluginStreamHook,
+  GatewayPluginStreamHookInput,
   GatewayPluginManifest,
   ProviderPlugin,
   ProviderConfig,
@@ -20,7 +32,8 @@ import type {
   GatewayPluginHealthStatus,
   GatewayPluginLifecycleContext,
   GatewayPluginDeadLetter,
-  GatewayPluginOutbox
+  GatewayPluginOutbox,
+  GatewayPluginDeliveryStateStore
 } from './events';
 
 export interface GatewayPluginFactoryInput {
@@ -35,7 +48,11 @@ export interface GatewayPluginModuleResult {
   providerHooks?: ProviderPlugin[];
   providerPlugins?: ProviderPlugin[];
   requestHooks?: GatewayPluginRequestHook[];
+  requestTransforms?: GatewayPluginRequestTransform[];
+  routeResolvers?: GatewayPluginRouteResolver[];
+  responseHooks?: GatewayPluginResponseHook[];
   streamHooks?: GatewayPluginStreamHook[];
+  httpRoutes?: GatewayPluginHttpRoute[];
   billingEventHooks?: GatewayPluginEventHook[];
   eventHooks?: GatewayPluginEventHook[];
   agentEventHooks?: GatewayPluginEventHook[];
@@ -46,6 +63,7 @@ export interface GatewayPluginModuleResult {
   eventOutboxes?: GatewayPluginOutbox[];
   agentEventPublishers?: GatewayPluginEventPublisher[];
   agentEventOutboxes?: GatewayPluginOutbox[];
+  deliveryStateStores?: GatewayPluginDeliveryStateStore[];
 }
 
 export type GatewayPluginFactory = (
@@ -69,6 +87,7 @@ export function defineGatewayPluginManifest(
 export type {
   GatewayConfig,
   GatewayPluginDeadLetter,
+  GatewayPluginDeliveryStateStore,
   GatewayPluginEventHook,
   GatewayPluginConfig,
   GatewayPluginDeliveryContext,
@@ -77,10 +96,22 @@ export type {
   GatewayPluginExtension,
   GatewayPluginHealth,
   GatewayPluginHealthStatus,
+  GatewayPluginHttpRoute,
+  GatewayPluginHttpRouteInput,
   GatewayPluginLifecycleContext,
   GatewayPluginManifest,
   GatewayPluginRequestHook,
+  GatewayPluginRequestTransformInput,
+  GatewayPluginRequestTransform,
+  GatewayPluginRequestTransformValue,
+  GatewayPluginResponseHook,
+  GatewayPluginResponseHookInput,
+  GatewayPluginResponseTransformValue,
+  GatewayPluginRouteResolution,
+  GatewayPluginRouteResolver,
+  GatewayPluginStreamHookInput,
   GatewayPluginStreamHook,
+  GatewayPluginTargetRoute,
   GatewayPluginOutbox,
   ProviderConfig,
   ProviderPlugin,

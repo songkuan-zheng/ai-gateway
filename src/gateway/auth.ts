@@ -59,15 +59,14 @@ export function addGatewayAuthModelCandidate(
 }
 
 export function createGatewayAuthPreHandler(config: GatewayAuthConfig): preHandlerHookHandler {
-  return async function gatewayAuthPreHandler(request, reply): Promise<void> {
+  return async function gatewayAuthPreHandler(request, reply) {
     const result = await authenticateGatewayRequest(request, config);
     if (!result.ok) {
-      reply.code(result.statusCode).send({
+      return reply.code(result.statusCode).send({
         error: {
           message: result.error
         }
       });
-      return;
     }
 
     request.gatewayIdentity = result.identity;

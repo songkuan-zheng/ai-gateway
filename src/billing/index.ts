@@ -7,9 +7,12 @@ export {
 export type { BillingResult } from './calculate';
 export {
   closeBillingPublisher,
+  drainBillingPublisher,
+  hasBillingEventOutbox,
   hasBillingEventPublisher,
   initializeBillingPublisher,
-  publishBillingEvent
+  publishBillingEvent,
+  validateBillingPublisherRequirements
 } from './publisher';
 export type {
   BillingPublisherLogger,

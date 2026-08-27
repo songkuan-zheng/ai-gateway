@@ -10,6 +10,7 @@ import {
 } from './external-config';
 import { encodeGrpcJsonMessage } from './grpc-json';
 import { waitForLoopbackListener } from './__tests__/listener-readiness';
+import type { GatewayConfig } from './types';
 
 describe('gateway external config source', () => {
   const servers: Server[] = [];
@@ -99,7 +100,12 @@ describe('gateway external config source', () => {
     expect(config.billingWebhook.enabled).toBe(true);
     expect(config.billingWebhook.endpoint).toBe('https://billing.example.com/usage');
     expect(config.configExternal?.endpoint).toBe('https://config.example.com/gateway');
-    expect(onConfigReload).toHaveBeenCalledWith(config, 'test_refresh');
+    expect(onConfigReload).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providers: [expect.objectContaining({ name: 'anthropic-main' })]
+      }),
+      'test_refresh'
+    );
   });
 
   it('does not fetch when external config source is disabled', async () => {
@@ -116,6 +122,64 @@ describe('gateway external config source', () => {
 
     expect(refreshed).toBe(false);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the active config and rolls the runtime back when reload fails', async () => {
+    const config = parseGatewayConfigFromRaw({
+      Providers: [
+        {
+          name: 'openai-main',
+          type: 'openai_responses',
+          models: ['gpt-4.1-mini'],
+          apikey: 'openai-key'
+        }
+      ],
+      configExternal: {
+        enabled: true,
+        endpoint: 'https://config.example.com/gateway'
+      }
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            config: {
+              Providers: [
+                {
+                  name: 'anthropic-main',
+                  type: 'anthropic_messages',
+                  models: ['claude-3-7-sonnet'],
+                  apikey: 'anthropic-key'
+                }
+              ]
+            }
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+      )
+    );
+    const reloads: Array<{ provider: string | undefined; reason: string }> = [];
+    const onConfigReload = vi.fn(async (candidate: GatewayConfig, reason: string) => {
+      reloads.push({ provider: candidate.providers[0]?.name, reason });
+      if (candidate.providers[0]?.name === 'anthropic-main') {
+        throw new Error('strict billing validation failed');
+      }
+    });
+
+    await expect(
+      refreshGatewayConfigFromExternalSource({
+        config,
+        onConfigReload,
+        reason: 'test_refresh'
+      })
+    ).rejects.toThrow('strict billing validation failed');
+
+    expect(config.providers[0]?.name).toBe('openai-main');
+    expect(reloads).toEqual([
+      { provider: 'anthropic-main', reason: 'test_refresh' },
+      { provider: 'openai-main', reason: 'test_refresh_rollback' }
+    ]);
   });
 
   it('refreshes gateway config from WebSocket endpoint', async () => {
@@ -256,7 +320,12 @@ describe('gateway external config source', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(config.providers[0]?.name).toBe('openai-poll');
     expect(config.configExternal?.intervalMs).toBe(1000);
-    expect(onConfigReload).toHaveBeenCalledWith(config, 'external_config_poll');
+    expect(onConfigReload).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providers: [expect.objectContaining({ name: 'openai-poll' })]
+      }),
+      'external_config_poll'
+    );
 
     poller?.close();
     await vi.advanceTimersByTimeAsync(1000);

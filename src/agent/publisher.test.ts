@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resetGatewayPluginExecutionStateForTests } from '../plugins/execution';
 import type { GatewayPluginEventPublisher, GatewayPluginOutbox } from '../plugins/events';
 import type { AgentEventQueueConfig, AgentEventWebhookConfig } from '../types';
 import type { AgentEvent } from './types';
@@ -17,6 +18,7 @@ describe('agent event queue publisher', () => {
 
   afterEach(async () => {
     await closeAgentEventPublisher();
+    resetGatewayPluginExecutionStateForTests();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     for (const dir of tempDirs.splice(0)) {
@@ -161,6 +163,39 @@ describe('agent event queue publisher', () => {
     await closeAgentEventPublisher();
     expect(outboxClose).toHaveBeenCalledTimes(1);
     expect(publisherClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails open when an agent event hook times out', async () => {
+    const append = vi.fn(async () => true);
+    const transform = vi.fn(() => new Promise<never>(() => undefined));
+    await initializeAgentEventPublisher(
+      buildQueueConfig(false),
+      buildWebhookConfig(false),
+      undefined,
+      {
+        eventHooks: [
+          {
+            key: 'slow-agent-event-hook',
+            execution: {
+              timeoutMs: 1,
+              failureMode: 'fail_open'
+            },
+            transform
+          }
+        ],
+        outboxes: [
+          {
+            key: 'agent-after-timeout',
+            append
+          }
+        ]
+      }
+    );
+
+    await expect(publishAgentEventToQueue(buildEvent())).resolves.toBe(true);
+
+    expect(transform).toHaveBeenCalledTimes(1);
+    expect(append).toHaveBeenCalledTimes(1);
   });
 });
 

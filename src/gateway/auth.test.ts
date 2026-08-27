@@ -1,8 +1,12 @@
 import { createHmac } from 'node:crypto';
-import type { FastifyRequest } from 'fastify';
+import Fastify, { type FastifyRequest } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GatewayAuthConfig, ProviderConfig } from '../types';
-import { authenticateGatewayRequest, evaluateApiKeyModelRestriction } from './auth';
+import {
+  authenticateGatewayRequest,
+  createGatewayAuthPreHandler,
+  evaluateApiKeyModelRestriction
+} from './auth';
 
 const baseConfig: GatewayAuthConfig = {
   enabled: true,
@@ -82,6 +86,25 @@ describe('gateway auth', () => {
     }
 
     expect(result.statusCode).toBe(401);
+  });
+
+  it('stops route execution after rejecting auth with async response hooks', async () => {
+    const app = Fastify({ logger: false });
+    let handlerRan = false;
+    app.addHook('onSend', async (_request, _reply, payload) => payload);
+    app.addHook('onSend', async (_request, _reply, payload) => payload);
+    app.get('/protected', {
+      preHandler: createGatewayAuthPreHandler(baseConfig)
+    }, async () => {
+      handlerRan = true;
+      return { ok: true };
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/protected' });
+
+    expect(response.statusCode).toBe(401);
+    expect(handlerRan).toBe(false);
+    await app.close();
   });
 
   it('extracts billing identity from trusted headers', async () => {

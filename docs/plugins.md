@@ -52,7 +52,11 @@ A plugin can provide one or more capabilities.
 | `providers` | Register complete provider configs from a module package. | A plugin ships both the upstream protocol/client defaults and one or more provider entries. |
 | `providerHooks` | Patch an existing provider request or response flow. | The upstream is mostly OpenAI, Anthropic, or Gemini compatible, but needs different headers, auth, query params, or small body/response changes. |
 | `requestHooks` | Run code before auth, routing, or precheck decisions. | A plugin needs tenant policy, custom auth gates, request enrichment, or quota vetoes before provider execution. |
+| `requestTransforms` | Mutate gateway request state before routing or before upstream request build. | A plugin needs to rewrite body, headers, source metadata, standard request, or model before provider execution. |
+| `routeResolvers` | Override target provider selection. | A plugin needs custom routing, model aliases, provider fallback order, or traceable route decisions that run before built-in routing. |
+| `responseHooks` | Transform final non-streaming client responses. | A plugin needs to wrap, redact, annotate, or replace the payload/status/headers returned to the client. |
 | `streamHooks` | Transform an upstream streaming `Response` before it is relayed. | A plugin needs to wrap, inspect, or replace live streaming output without buffering the whole response. |
+| `httpRoutes` | Serve arbitrary plugin-owned HTTP endpoints. | A plugin needs management, artifact, health, callback, or local service endpoints that are not LLM source adapter routes. |
 | `targetAdapters` | Define a complete upstream protocol. | The upstream request or response format is not compatible with the built-in protocols. |
 | `sourceAdapters` | Define a client-facing request protocol. | Clients send a custom inbound request format to the gateway. |
 | `virtualModelProfiles` | Register virtual model aliases and tool-loop profiles. | A plugin needs to ship model aliases or internal-tool behavior with its adapter/hook package. |
@@ -62,15 +66,18 @@ A plugin can provide one or more capabilities.
 | `billingPublishers` | Publish billing events through a plugin-managed transport. | Billing can be sent directly to Kafka, Pulsar, NATS, or another external sink. |
 | `eventOutboxes` / `agentEventOutboxes` | Append agent event envelopes to a durable plugin-managed outbox. | Agent events need a reliable external buffer. |
 | `eventPublishers` / `agentEventPublishers` | Publish agent event envelopes through a plugin-managed transport. | Agent events can be sent directly to an external event stream. |
+| `deliveryStateStores` | Store plugin delivery dedupe keys and dead letters. | Multiple gateway instances need shared delivery state in Redis, Postgres, or another plugin-owned backend. |
 
 In other words:
 
-- Hook capability modifies an already-built request or already-read response payload.
+- Provider hooks modify an already-built upstream request or already-read upstream response payload.
+- Request transforms, route resolvers, and response hooks cover the gateway data-plane before target selection and after final client payload construction.
 - Provider package capability registers provider entries together with plugin code.
 - Request/stream/event hooks run at gateway lifecycle points outside the provider adapter.
 - Adapter capability defines the protocol itself.
 - Outbox capability accepts events into durable plugin-managed storage.
 - Publisher capability sends events directly to an external transport.
+- Delivery state store capability moves delivery dedupe and dead-letter retention out of gateway process memory.
 
 ## Provider Hooks
 
@@ -202,6 +209,33 @@ Strict mode can be enabled on a hook:
 With `strict: true`, a missing reference fails the provider attempt instead of being
 silently skipped.
 
+Hooks can also declare execution governance:
+
+```json
+{
+  "providerHooks": {
+    "execution": {
+      "timeoutMs": 1000,
+      "concurrency": 8,
+      "maxQueueSize": 100,
+      "failureThreshold": 5,
+      "cooldownMs": 30000,
+      "failureMode": "fail_closed"
+    },
+    "request": {
+      "headers": {
+        "x-feature": "enabled"
+      }
+    }
+  }
+}
+```
+
+`execution` is supported on declarative provider hooks and module hooks. It provides
+per-plugin, per-hook timeouts, concurrency limits, bounded queues, and circuit
+breaking. `failureMode` defaults to `fail_closed`; set `fail_open` only when skipping
+the plugin operation is acceptable for that hook.
+
 ## Module Plugins
 
 Use `modulePath` when a plugin needs code. Module plugins are local, trusted Node.js
@@ -268,7 +302,11 @@ interface GatewayPluginModuleResult {
   providerHooks?: ProviderPlugin[];
   providerPlugins?: ProviderPlugin[];
   requestHooks?: GatewayPluginRequestHook[];
+  requestTransforms?: GatewayPluginRequestTransform[];
+  routeResolvers?: GatewayPluginRouteResolver[];
+  responseHooks?: GatewayPluginResponseHook[];
   streamHooks?: GatewayPluginStreamHook[];
+  httpRoutes?: GatewayPluginHttpRoute[];
   billingEventHooks?: GatewayPluginEventHook<BillingQueueEvent>[];
   eventHooks?: GatewayPluginEventHook<AgentQueueEvent>[];
   agentEventHooks?: GatewayPluginEventHook<AgentQueueEvent>[];
@@ -279,6 +317,7 @@ interface GatewayPluginModuleResult {
   eventOutboxes?: GatewayPluginOutbox<AgentQueueEvent>[];
   agentEventPublishers?: GatewayPluginEventPublisher<AgentQueueEvent>[];
   agentEventOutboxes?: GatewayPluginOutbox<AgentQueueEvent>[];
+  deliveryStateStores?: GatewayPluginDeliveryStateStore[];
 }
 ```
 
@@ -288,7 +327,7 @@ outboxes.
 Module return values are validated before the old module state is unregistered; a bad
 adapter, hook, extension, or manifest keeps the previous runtime state active.
 
-## Request, Stream, And Event Hooks
+## Request, Route, Response, Stream, And Event Hooks
 
 Module hooks run inside the gateway process and are registered by key. All hook
 executions are recorded in metrics, including matched, skipped, success, blocked, and
@@ -297,6 +336,7 @@ error outcomes.
 ```ts
 interface GatewayPluginRequestHook {
   key: string;
+  execution?: GatewayPluginExecutionConfig;
   provider?: string;
   providerName?: string;
   models?: string[];
@@ -308,8 +348,74 @@ interface GatewayPluginRequestHook {
   afterPrecheck?(input: GatewayPluginRequestHookInput & { result: unknown }): GatewayPluginHookResult | void | Promise<GatewayPluginHookResult | void>;
 }
 
+interface GatewayPluginRequestTransform {
+  key: string;
+  stage?: 'beforeRouting' | 'beforeUpstream';
+  execution?: GatewayPluginExecutionConfig;
+  provider?: string;
+  providerName?: string;
+  models?: string[];
+  sourceAdapters?: string[];
+  sourceRoutes?: string[];
+  transform(input: GatewayPluginRequestTransformInput): GatewayPluginRequestTransformValue | GatewayPluginHookResult<GatewayPluginRequestTransformValue | void> | void | Promise<GatewayPluginRequestTransformValue | GatewayPluginHookResult<GatewayPluginRequestTransformValue | void> | void>;
+}
+
+interface GatewayPluginRequestTransformValue {
+  requestBody?: unknown;
+  standardRequest?: StandardRequest;
+  model?: string | null;
+  source?: GatewaySourceContext;
+  metadata?: Record<string, string | null | undefined>;
+  headers?: {
+    set?: Record<string, string | number | boolean | null | undefined>;
+    remove?: string[];
+  } | Record<string, string | number | boolean | null | undefined>;
+}
+
+interface GatewayPluginRouteResolver {
+  key: string;
+  execution?: GatewayPluginExecutionConfig;
+  provider?: string;
+  providerName?: string;
+  models?: string[];
+  sourceAdapters?: string[];
+  sourceRoutes?: string[];
+  resolve(input: GatewayPluginRequestHookInput): GatewayPluginRouteResolution | GatewayPluginHookResult<GatewayPluginRouteResolution | void> | void | Promise<GatewayPluginRouteResolution | GatewayPluginHookResult<GatewayPluginRouteResolution | void> | void>;
+}
+
+interface GatewayPluginRouteResolution extends GatewayPluginRequestTransformValue {
+  targetProvider?: string;
+  targetProviderName?: string;
+  targetProviderConfig?: ProviderConfig;
+  targetProviders?: Array<{
+    provider?: string;
+    providerName?: string;
+    providerConfig?: ProviderConfig;
+  }>;
+  reason?: string;
+}
+
+interface GatewayPluginResponseHook {
+  key: string;
+  execution?: GatewayPluginExecutionConfig;
+  provider?: string;
+  providerName?: string;
+  models?: string[];
+  sourceAdapters?: string[];
+  sourceRoutes?: string[];
+  transformResponse(input: GatewayPluginResponseHookInput): GatewayPluginResponseTransformValue | GatewayPluginHookResult<GatewayPluginResponseTransformValue | void> | void | Promise<GatewayPluginResponseTransformValue | GatewayPluginHookResult<GatewayPluginResponseTransformValue | void> | void>;
+}
+
+interface GatewayPluginResponseTransformValue {
+  responsePayload?: unknown;
+  statusCode?: number;
+  headers?: Record<string, string | number | boolean | null | undefined>;
+  removeHeaders?: string[];
+}
+
 interface GatewayPluginStreamHook {
   key: string;
+  execution?: GatewayPluginExecutionConfig;
   provider?: string;
   providerName?: string;
   models?: string[];
@@ -318,9 +424,29 @@ interface GatewayPluginStreamHook {
   transformResponse(input: GatewayPluginStreamHookInput): Response | GatewayPluginHookResult<Response> | Promise<Response | GatewayPluginHookResult<Response>>;
 }
 
+interface GatewayPluginHttpRoute {
+  key: string;
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS' | 'ALL';
+  path: string;
+  auth?: 'gateway' | 'none';
+  metadata?: Record<string, string>;
+  execution?: GatewayPluginExecutionConfig;
+  handler(input: GatewayPluginHttpRouteInput): unknown | Promise<unknown>;
+}
+
 interface GatewayPluginEventHook<TEvent> {
   key: string;
+  execution?: GatewayPluginExecutionConfig;
   transform(input: GatewayPluginEventHookInput<TEvent>): TEvent | false | GatewayPluginHookResult<TEvent | false> | Promise<TEvent | false | GatewayPluginHookResult<TEvent | false>>;
+}
+
+interface GatewayPluginExecutionConfig {
+  timeoutMs?: number;
+  concurrency?: number;
+  maxQueueSize?: number;
+  failureThreshold?: number;
+  cooldownMs?: number;
+  failureMode?: 'fail_closed' | 'fail_open';
 }
 ```
 
@@ -331,9 +457,28 @@ Request hook stages:
 - `beforePrecheck`: can return `{ allow: false, statusCode, message, details }` to block before quota/precheck evaluation.
 - `afterPrecheck`: observes the computed precheck result and can fail the request with `{ ok: false, status, error, details }`.
 
+Request transforms run before built-in routing (`beforeRouting`) and, for converted
+standard LLM requests, before target upstream request construction (`beforeUpstream`).
+They may return body/header/source/model changes. If `requestBody.model` changes and
+`model` is not explicitly returned, the gateway re-derives the model selector from the
+new body.
+
+Route resolvers run after `beforeRouting` transforms and hooks. The first resolver
+that returns a value may select one target or an ordered `targetProviders` fallback
+list. When no resolver returns a target, built-in header/model/default routing is used.
+
+Response hooks run on final non-streaming client payloads after provider response
+plugins and protocol conversion. They may replace `responsePayload`, set `statusCode`,
+and add or override response headers.
+
 Stream hooks run on streaming upstream responses before relay. They receive the upstream
 request, upstream response, selected provider, standard request, and route/source
 metadata. Return a replacement `Response` to wrap or transform the stream.
+
+HTTP routes run from the plugin route registry before source-adapter fallback routes.
+`auth` defaults to `gateway`; set `auth: 'none'` only for intentionally public plugin
+endpoints. HTTP routes are matched at request time, so enabled module plugins can expose
+or remove these endpoints on reload without registering Fastify routes directly.
 
 Event hooks run before plugin event outboxes and publishers. Return an event object to
 replace the event, return `false` to intentionally drop it, or return `{ ok: false,
@@ -397,6 +542,19 @@ interface GatewayPluginDeadLetterOptions {
   enabled?: boolean;
   maxEntries?: number;
 }
+
+interface GatewayPluginDeliveryStateStore {
+  key: string;
+  init?(context: GatewayPluginLifecycleContext): void | Promise<void>;
+  ready?(): boolean | Promise<boolean>;
+  health?(): GatewayPluginHealth | Promise<GatewayPluginHealth>;
+  claimDelivery?(key: string, ttlMs: number): boolean | Promise<boolean>;
+  releaseDeliveryClaim?(key: string): void | Promise<void>;
+  writeDeadLetter?(entry: GatewayPluginDeadLetter): void | Promise<void>;
+  listDeadLetters?(extensionKey?: string): GatewayPluginDeadLetter[] | Promise<GatewayPluginDeadLetter[]>;
+  clearDeadLetters?(extensionKey?: string): number | Promise<number>;
+  close?(): void | Promise<void>;
+}
 ```
 
 Return `false` from `publish()` or `append()` when the event was intentionally not
@@ -406,13 +564,24 @@ attempt. `close()` is called when publishers are reloaded or the gateway shuts d
 outbox/publisher calls and provide timeout, retry, per-extension concurrency limiting,
 and bounded queue backpressure.
 When `timeoutMs` fires, `context.signal` is aborted. Plugins that call external
-systems should pass that signal to their client library when possible.
-When `dedupe` is enabled, successful deliveries are remembered by
+systems should pass that signal to their client library when possible. A timed-out
+operation continues to occupy its concurrency slot until its underlying promise
+settles, and the gateway does not overlap a retry with that uncertain operation.
+When `dedupe` is enabled, delivery keys are atomically claimed by
 `extension.key:eventId` for `dedupeTtlMs`. Repeated events are reported as
-`not_delivered` and the plugin operation is not called.
-When `deadLetter` is enabled, failed event deliveries are retained in the in-process
-dead-letter store after retry exhaustion. Extensions can also implement
-`deadLetter(entry)` to forward failed events to plugin-owned storage.
+`not_delivered` and the plugin operation is not called. `claimDelivery()` must use
+the backing store's compare-and-set primitive (for example Redis `SET NX`); a
+successful or timed-out delivery retains the claim, while a known non-delivery or
+failure releases it.
+By default, dedupe keys and failed deliveries are retained in the in-process delivery
+state store. A module can register `deliveryStateStores` to move those records to
+plugin-owned storage. A store can provide dedupe, dead letters, or both; dedupe stores
+must implement both `claimDelivery()` and `releaseDeliveryClaim()`, while dead-letter
+stores must implement `writeDeadLetter()`, `listDeadLetters()`, and
+`clearDeadLetters()`.
+When `deadLetter` is enabled, failed event deliveries are retained after retry
+exhaustion. Extensions can also implement `deadLetter(entry)` to forward failed events
+to plugin-owned storage.
 Billing event publishing keeps the existing asynchronous request path: an outbox
 append is durable after the plugin accepts it, but the gateway response is not blocked
 until that append completes.
@@ -660,6 +829,13 @@ Plugin modules are loaded during runtime config application:
 
 When config reloads, previously loaded module adapters and module provider hooks are
 unregistered and the currently configured modules are loaded again.
+Extension objects that are reused by an unchanged object-style default export remain
+open across the swap; replaced extensions are closed before they are discarded. Billing
+deliveries are drained before billing extensions are replaced. Candidate modules are
+initialized and strict billing capabilities are validated before the active registries
+are swapped; a rejected candidate does not close active extension objects.
+If runtime application fails, manager and external-source reloads reapply the previous
+runtime configuration instead of committing the candidate config.
 
 Inline `providerHooks` are converted to the same runtime provider hook interface as
 legacy `providerPlugins`.
@@ -668,9 +844,10 @@ legacy `providerPlugins`.
 
 Plugin runtime state and extension health are exposed through:
 
-- `GET /health`: returns a plugin summary with total/degraded/unhealthy counts.
+- `GET /health`: liveness endpoint; reports that the gateway process can respond.
+- `GET /ready`: readiness endpoint; returns 503 when no provider is configured, every provider is unavailable, plugins are unhealthy, or an enabled fail-closed Redis dependency is unavailable.
 - `GET /manager/plugins`: returns configured plugin entries and runtime extension summaries.
-- `GET /manager/plugins/catalog`: returns configured plugins plus runtime providers, adapters, hooks, publishers, and outboxes.
+- `GET /manager/plugins/catalog`: returns configured plugins plus runtime providers, adapters, request transforms, route resolvers, response/stream hooks, HTTP routes, publishers, outboxes, and delivery state stores.
 - `GET /manager/plugins/health`: returns grouped extension health.
 - `POST /manager/plugins`: adds or updates a configured plugin entry, then reloads config.
 - `PATCH /manager/plugins/:key`: updates mutable plugin state such as `enabled`.
@@ -693,7 +870,8 @@ Hook executions are exported as:
 
 `kind` identifies provider, request, stream, billing event, or agent event hook
 execution. `hook` identifies the lifecycle method, such as `beforeRouting`,
-`transformResponse`, or `transform`.
+`transformResponse`, or `transform`. Hook outcomes can also include `timeout`,
+`queue_full`, and `circuit_open` when execution governance is configured.
 
 ## Security Model
 

@@ -105,7 +105,16 @@ export interface GatewayPluginHookExecutionMetricInput {
   pluginKey: string;
   kind: string;
   hook: string;
-  outcome: 'matched' | 'skipped' | 'success' | 'error' | 'blocked' | 'dropped';
+  outcome:
+    | 'matched'
+    | 'skipped'
+    | 'success'
+    | 'error'
+    | 'blocked'
+    | 'dropped'
+    | 'timeout'
+    | 'queue_full'
+    | 'circuit_open';
   durationMs?: number;
 }
 

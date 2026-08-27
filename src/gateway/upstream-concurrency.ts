@@ -1,4 +1,11 @@
-import type { GatewayConfig, Provider, ProviderConfig } from '../types';
+import { createHash, randomUUID } from 'node:crypto';
+import { SimpleRedisClient, type RedisReply } from '../redis-client';
+import type {
+  GatewayConfig,
+  GatewayUpstreamConcurrencyRedisStorageConfig,
+  Provider,
+  ProviderConfig
+} from '../types';
 
 interface ProviderConcurrencyQueueItem {
   resolve: (result: ProviderConcurrencyAcquireResult) => void;
@@ -17,7 +24,7 @@ export type ProviderConcurrencyAcquireResult =
   | { ok: true; release: () => void }
   | {
       ok: false;
-      status: 429 | 499;
+      status: 429 | 499 | 503;
       message: string;
       aborted?: boolean;
       details: {
@@ -25,10 +32,55 @@ export type ProviderConcurrencyAcquireResult =
         providerName?: string;
         maxInFlight: number;
         queueTimeoutMs: number;
+        error?: string;
       };
     };
 
 const providerConcurrencyStates = new Map<string, ProviderConcurrencyState>();
+const redisProviderConcurrencyClients = new Map<string, SimpleRedisClient>();
+let redisProviderConcurrencyCommandExecutorForTests:
+  | ((storage: GatewayUpstreamConcurrencyRedisStorageConfig, args: string[]) => Promise<RedisReply>)
+  | undefined;
+
+const redisAcquireProviderConcurrencyScript = `
+local token = ARGV[1]
+local now = tonumber(ARGV[2])
+local leaseTtlMs = tonumber(ARGV[3])
+local limit = tonumber(ARGV[4])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+local current = redis.call('ZCARD', KEYS[1])
+if current < limit then
+  local expiresAt = now + leaseTtlMs
+  redis.call('ZADD', KEYS[1], expiresAt, token)
+  redis.call('PEXPIRE', KEYS[1], leaseTtlMs)
+  return {1, current + 1, expiresAt}
+end
+redis.call('PEXPIRE', KEYS[1], leaseTtlMs)
+return {0, current, 0}
+`;
+
+const redisReleaseProviderConcurrencyScript = `
+local removed = redis.call('ZREM', KEYS[1], ARGV[1])
+if redis.call('ZCARD', KEYS[1]) == 0 then
+  redis.call('DEL', KEYS[1])
+else
+  redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return removed
+`;
+
+const redisRenewProviderConcurrencyScript = `
+local token = ARGV[1]
+local now = tonumber(ARGV[2])
+local leaseTtlMs = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+if not redis.call('ZSCORE', KEYS[1], token) then
+  return 0
+end
+redis.call('ZADD', KEYS[1], now + leaseTtlMs, token)
+redis.call('PEXPIRE', KEYS[1], leaseTtlMs)
+return 1
+`;
 
 export async function acquireProviderConcurrencySlot(
   config: GatewayConfig,
@@ -47,6 +99,17 @@ export async function acquireProviderConcurrencySlot(
   const maxInFlight = normalizePositiveInteger(concurrency.maxInFlightPerProvider, 1);
   const queueTimeoutMs = normalizeNonNegativeInteger(concurrency.queueTimeoutMs, 0);
   const key = providerConcurrencyKey(provider, providerConfig);
+  if (concurrency.storage?.type === 'redis') {
+    return acquireRedisProviderConcurrencySlot(
+      concurrency.storage,
+      key,
+      provider,
+      providerConfig,
+      maxInFlight,
+      queueTimeoutMs,
+      abortSignal
+    );
+  }
   const state = getProviderConcurrencyState(key);
 
   if (abortSignal?.aborted) {
@@ -108,6 +171,184 @@ export function resetProviderConcurrencyForTests(): void {
   }
 
   providerConcurrencyStates.clear();
+  redisProviderConcurrencyCommandExecutorForTests = undefined;
+}
+
+export function setProviderConcurrencyRedisCommandExecutorForTests(
+  executor:
+    | ((storage: GatewayUpstreamConcurrencyRedisStorageConfig, args: string[]) => Promise<RedisReply>)
+    | undefined
+): void {
+  redisProviderConcurrencyCommandExecutorForTests = executor;
+}
+
+export async function closeProviderConcurrencyStore(): Promise<void> {
+  const clients = Array.from(redisProviderConcurrencyClients.values());
+  redisProviderConcurrencyClients.clear();
+  await Promise.allSettled(clients.map((client) => client.close()));
+}
+
+async function acquireRedisProviderConcurrencySlot(
+  storage: GatewayUpstreamConcurrencyRedisStorageConfig,
+  key: string,
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  maxInFlight: number,
+  queueTimeoutMs: number,
+  abortSignal?: AbortSignal
+): Promise<ProviderConcurrencyAcquireResult> {
+  const redisKey = buildRedisProviderConcurrencyKey(storage, key);
+  const deadline = Date.now() + queueTimeoutMs;
+  const leaseTtlMs = normalizePositiveInteger(storage.leaseTtlMs, 60000);
+  const token = randomUUID();
+
+  while (true) {
+    if (abortSignal?.aborted) {
+      return buildProviderConcurrencyAbortResult(provider, providerConfig, maxInFlight, queueTimeoutMs);
+    }
+
+    try {
+      const acquired = parseRedisAcquireResult(
+        await commandRedisProviderConcurrency(storage, [
+          'EVAL',
+          redisAcquireProviderConcurrencyScript,
+          '1',
+          redisKey,
+          token,
+          String(Date.now()),
+          String(leaseTtlMs),
+          String(maxInFlight)
+        ])
+      );
+      if (acquired) {
+        return {
+          ok: true,
+          release: createRedisProviderConcurrencyRelease(storage, redisKey, token, leaseTtlMs)
+        };
+      }
+    } catch (error) {
+      return buildProviderConcurrencyStoreFailureResult(
+        provider,
+        providerConfig,
+        maxInFlight,
+        queueTimeoutMs,
+        error
+      );
+    }
+
+    if (queueTimeoutMs === 0 || Date.now() >= deadline) {
+      return buildProviderConcurrencyTimeoutResult(provider, providerConfig, maxInFlight, queueTimeoutMs);
+    }
+
+    const waitMs = Math.min(
+      normalizePositiveInteger(storage.pollIntervalMs, 25),
+      Math.max(deadline - Date.now(), 1)
+    );
+    const sleepResult = await sleepWithAbort(waitMs, abortSignal);
+    if (sleepResult === 'aborted') {
+      return buildProviderConcurrencyAbortResult(provider, providerConfig, maxInFlight, queueTimeoutMs);
+    }
+  }
+}
+
+function createRedisProviderConcurrencyRelease(
+  storage: GatewayUpstreamConcurrencyRedisStorageConfig,
+  redisKey: string,
+  token: string,
+  leaseTtlMs: number
+): () => void {
+  let released = false;
+  const stopRenewal = startRedisProviderConcurrencyLeaseRenewal(storage, redisKey, token, leaseTtlMs);
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    stopRenewal();
+    void commandRedisProviderConcurrency(storage, [
+      'EVAL',
+      redisReleaseProviderConcurrencyScript,
+      '1',
+      redisKey,
+      token,
+      String(leaseTtlMs)
+    ]).catch(() => undefined);
+  };
+}
+
+function startRedisProviderConcurrencyLeaseRenewal(
+  storage: GatewayUpstreamConcurrencyRedisStorageConfig,
+  redisKey: string,
+  token: string,
+  leaseTtlMs: number
+): () => void {
+  const intervalMs = Math.max(1, Math.min(Math.floor(leaseTtlMs / 2), 30000));
+  const timer = setInterval(() => {
+    void commandRedisProviderConcurrency(storage, [
+      'EVAL',
+      redisRenewProviderConcurrencyScript,
+      '1',
+      redisKey,
+      token,
+      String(Date.now()),
+      String(leaseTtlMs)
+    ])
+      .then((result) => {
+        if (Number(result) !== 1) {
+          clearInterval(timer);
+        }
+      })
+      .catch(() => undefined);
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+function parseRedisAcquireResult(reply: RedisReply): boolean {
+  return Array.isArray(reply) && Number(reply[0]) === 1;
+}
+
+async function commandRedisProviderConcurrency(
+  storage: GatewayUpstreamConcurrencyRedisStorageConfig,
+  args: string[]
+): Promise<RedisReply> {
+  if (redisProviderConcurrencyCommandExecutorForTests) {
+    return redisProviderConcurrencyCommandExecutorForTests(storage, args);
+  }
+
+  return getRedisProviderConcurrencyClient(storage).command(args);
+}
+
+function getRedisProviderConcurrencyClient(
+  storage: GatewayUpstreamConcurrencyRedisStorageConfig
+): SimpleRedisClient {
+  const cacheKey = JSON.stringify({
+    url: storage.url || 'redis://127.0.0.1:6379/0',
+    keyPrefix: storage.keyPrefix || 'next-ai:gateway:upstream-concurrency',
+    connectTimeoutMs: normalizePositiveInteger(storage.connectTimeoutMs, 1000),
+    commandTimeoutMs: normalizePositiveInteger(storage.commandTimeoutMs, 1000)
+  });
+  const existing = redisProviderConcurrencyClients.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+
+  const client = new SimpleRedisClient({
+    url: storage.url || 'redis://127.0.0.1:6379/0',
+    connectTimeoutMs: normalizePositiveInteger(storage.connectTimeoutMs, 1000),
+    commandTimeoutMs: normalizePositiveInteger(storage.commandTimeoutMs, 1000),
+    errorPrefix: 'Redis upstream concurrency'
+  });
+  redisProviderConcurrencyClients.set(cacheKey, client);
+  return client;
+}
+
+function buildRedisProviderConcurrencyKey(
+  storage: GatewayUpstreamConcurrencyRedisStorageConfig,
+  key: string
+): string {
+  const prefix = storage.keyPrefix.replace(/:+$/, '') || 'next-ai:gateway:upstream-concurrency';
+  return `${prefix}:${createHash('sha256').update(key).digest('hex')}`;
 }
 
 function releaseProviderConcurrencySlot(state: ProviderConcurrencyState): void {
@@ -140,17 +381,7 @@ function resolveProviderConcurrencyTimeout(
   item.settled = true;
   cleanupProviderConcurrencyQueueItem(item);
   removeQueueItem(state, item);
-  item.resolve({
-    ok: false,
-    status: 429,
-    message: 'Provider upstream concurrency limit exceeded.',
-    details: {
-      provider,
-      providerName: providerConfig?.name,
-      maxInFlight,
-      queueTimeoutMs
-    }
-  });
+  item.resolve(buildProviderConcurrencyTimeoutResult(provider, providerConfig, maxInFlight, queueTimeoutMs));
 }
 
 function resolveProviderConcurrencyAbort(
@@ -187,6 +418,46 @@ function buildProviderConcurrencyAbortResult(
       providerName: providerConfig?.name,
       maxInFlight,
       queueTimeoutMs
+    }
+  };
+}
+
+function buildProviderConcurrencyTimeoutResult(
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  maxInFlight: number,
+  queueTimeoutMs: number
+): Extract<ProviderConcurrencyAcquireResult, { ok: false }> {
+  return {
+    ok: false,
+    status: 429,
+    message: 'Provider upstream concurrency limit exceeded.',
+    details: {
+      provider,
+      providerName: providerConfig?.name,
+      maxInFlight,
+      queueTimeoutMs
+    }
+  };
+}
+
+function buildProviderConcurrencyStoreFailureResult(
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  maxInFlight: number,
+  queueTimeoutMs: number,
+  error: unknown
+): Extract<ProviderConcurrencyAcquireResult, { ok: false }> {
+  return {
+    ok: false,
+    status: 503,
+    message: 'Provider upstream concurrency store is unavailable.',
+    details: {
+      provider,
+      providerName: providerConfig?.name,
+      maxInFlight,
+      queueTimeoutMs,
+      error: error instanceof Error ? error.message : String(error)
     }
   };
 }
@@ -259,3 +530,26 @@ function normalizeNonNegativeInteger(value: number, fallback: number): number {
 }
 
 function noop(): void {}
+
+function sleepWithAbort(ms: number, abortSignal?: AbortSignal): Promise<'elapsed' | 'aborted'> {
+  if (abortSignal?.aborted) {
+    return Promise.resolve('aborted');
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: 'elapsed' | 'aborted') => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      abortSignal?.removeEventListener('abort', onAbort);
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish('elapsed'), Math.max(ms, 1));
+    timer.unref?.();
+    const onAbort = () => finish('aborted');
+    abortSignal?.addEventListener('abort', onAbort, { once: true });
+  });
+}

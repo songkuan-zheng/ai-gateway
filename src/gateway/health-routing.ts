@@ -1,5 +1,6 @@
 import type { GatewayConfig, Provider, ProviderConfig, ProviderHealthStatus } from '../types';
 import { findDefaultProviderConfig } from '../utils';
+import { hydrateProviderHealthFromStore } from './provider-health';
 
 export interface HealthAwareProviderRoute {
   provider: Provider;
@@ -12,10 +13,10 @@ interface AnnotatedRoute<T extends HealthAwareProviderRoute> {
   providerConfig?: ProviderConfig;
 }
 
-export function applyHealthAwareRouting<T extends HealthAwareProviderRoute>(
+export async function applyHealthAwareRouting<T extends HealthAwareProviderRoute>(
   routes: T[],
   config: GatewayConfig
-): T[] {
+): Promise<T[]> {
   const routingConfig = config.healthAwareRouting;
   if (!routingConfig?.enabled || routes.length <= 1) {
     return routes;
@@ -26,6 +27,12 @@ export function applyHealthAwareRouting<T extends HealthAwareProviderRoute>(
     index,
     providerConfig: route.providerConfig || findProviderConfigByType(config.providers, route.provider)
   }));
+  await hydrateProviderHealthFromStore(
+    config,
+    annotated
+      .map((item) => item.providerConfig)
+      .filter((item): item is ProviderConfig => Boolean(item))
+  );
 
   const filtered =
     routingConfig.skipUnavailable

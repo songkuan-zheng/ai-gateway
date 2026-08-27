@@ -7,6 +7,7 @@ import {
   type GatewayPluginEventPublisher,
   type GatewayPluginOutbox
 } from '../plugins/events';
+import { runGatewayPluginProtectedOperation } from '../plugins/execution';
 import type { AgentEventQueueConfig, AgentEventWebhookConfig, GatewayPluginEventHook } from '../types';
 import type { AgentEvent, AgentEventType } from './types';
 
@@ -266,11 +267,73 @@ async function applyAgentEventHooks(event: AgentQueueEvent): Promise<AgentQueueE
   let nextEvent = event;
   for (const hook of pluginEventHooks) {
     const startedAt = process.hrtime.bigint();
-    try {
-      const result = await hook.transform?.({
+    const executionResult = await runGatewayPluginProtectedOperation({
+      pluginKey: hook.key,
+      kind: 'agent_event',
+      hook: 'transform',
+      execution: hook.execution,
+      operation: () => hook.transform?.({
         event: nextEvent
+      })
+    });
+    if (!executionResult.ok) {
+      recordGatewayPluginHookExecution({
+        pluginKey: hook.key,
+        kind: 'agent_event',
+        hook: 'transform',
+        outcome: executionResult.reason,
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
       });
-      if (result === false) {
+      logger?.warn(
+        {
+          hook: hook.key,
+          details: executionResult.error
+        },
+        'Agent event plugin hook failed.'
+      );
+      throw new Error(executionResult.error);
+    }
+    if ('skipped' in executionResult) {
+      recordGatewayPluginHookExecution({
+        pluginKey: hook.key,
+        kind: 'agent_event',
+        hook: 'transform',
+        outcome: executionResult.reason,
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
+      continue;
+    }
+
+    const result = executionResult.value;
+    if (result === false) {
+      recordGatewayPluginHookExecution({
+        pluginKey: hook.key,
+        kind: 'agent_event',
+        hook: 'transform',
+        outcome: 'dropped',
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
+      return undefined;
+    }
+    if (result && typeof result === 'object' && 'ok' in result) {
+      if (!result.ok) {
+        recordGatewayPluginHookExecution({
+          pluginKey: hook.key,
+          kind: 'agent_event',
+          hook: 'transform',
+          outcome: 'error',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
+        logger?.warn(
+          {
+            hook: hook.key,
+            details: result.error
+          },
+          'Agent event plugin hook failed.'
+        );
+        throw new Error(result.error);
+      }
+      if (result.value === false) {
         recordGatewayPluginHookExecution({
           pluginKey: hook.key,
           kind: 'agent_event',
@@ -280,34 +343,8 @@ async function applyAgentEventHooks(event: AgentQueueEvent): Promise<AgentQueueE
         });
         return undefined;
       }
-      if (result && typeof result === 'object' && 'ok' in result) {
-        if (!result.ok) {
-          throw new Error(result.error);
-        }
-        if (result.value === false) {
-          recordGatewayPluginHookExecution({
-            pluginKey: hook.key,
-            kind: 'agent_event',
-            hook: 'transform',
-            outcome: 'dropped',
-            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-          });
-          return undefined;
-        }
-        if (result.value && typeof result.value === 'object') {
-          nextEvent = result.value as AgentQueueEvent;
-        }
-        recordGatewayPluginHookExecution({
-          pluginKey: hook.key,
-          kind: 'agent_event',
-          hook: 'transform',
-          outcome: 'success',
-          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-        });
-        continue;
-      }
-      if (result && typeof result === 'object') {
-        nextEvent = result as AgentQueueEvent;
+      if (result.value && typeof result.value === 'object') {
+        nextEvent = result.value as AgentQueueEvent;
       }
       recordGatewayPluginHookExecution({
         pluginKey: hook.key,
@@ -316,23 +353,18 @@ async function applyAgentEventHooks(event: AgentQueueEvent): Promise<AgentQueueE
         outcome: 'success',
         durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
       });
-    } catch (error) {
-      recordGatewayPluginHookExecution({
-        pluginKey: hook.key,
-        kind: 'agent_event',
-        hook: 'transform',
-        outcome: 'error',
-        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-      });
-      logger?.warn(
-        {
-          hook: hook.key,
-          details: error instanceof Error ? error.message : String(error)
-        },
-        'Agent event plugin hook failed.'
-      );
-      throw error;
+      continue;
     }
+    if (result && typeof result === 'object') {
+      nextEvent = result as AgentQueueEvent;
+    }
+    recordGatewayPluginHookExecution({
+      pluginKey: hook.key,
+      kind: 'agent_event',
+      hook: 'transform',
+      outcome: 'success',
+      durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+    });
   }
 
   return nextEvent;

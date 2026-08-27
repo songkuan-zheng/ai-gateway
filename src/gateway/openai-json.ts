@@ -5,7 +5,8 @@ import {
   calculateUsageBilling,
   createProviderReportedCostBilling,
   publishBillingEvent,
-  resolveVideoPerSecondUsd
+  resolveVideoPerSecondUsd,
+  type BillingResult
 } from '../billing';
 import { buildOpenAIHeaders } from '../adapters/builtins/common';
 import type {
@@ -63,6 +64,7 @@ import {
   setGatewaySchedulingRequestEstimate
 } from './scheduler';
 import { recordGatewayPluginHookExecution } from './metrics';
+import { runGatewayPluginProtectedOperation } from '../plugins/execution';
 import {
   convertVideoCreateBody,
   claimVideoBillingEvent,
@@ -80,6 +82,11 @@ import {
   type VideoApiProtocol
 } from './video-compat';
 import { shouldRunProviderPlugin } from '../provider/plugins';
+import {
+  shouldAwaitBillingDelivery,
+  shouldBlockLiveStreamingForStrictBilling,
+  strictBillingLiveStreamingUnsupportedMessage
+} from './strict-billing';
 
 interface TargetProviderRoute {
   provider: Provider;
@@ -498,12 +505,12 @@ export async function handleOpenAIVideoContentRequest(
   }
 
   const clientAbortSignal = createClientDisconnectSignal(request, reply);
-  const scheduledTargetProviders = applyGatewayScheduling(targetProvidersResult.value, {
+  const scheduledTargetProviders = await applyGatewayScheduling(targetProvidersResult.value, {
     config,
     request,
     requestModel: reference?.model
   });
-  const targetProviders = applyHealthAwareRouting(scheduledTargetProviders, config);
+  const targetProviders = await applyHealthAwareRouting(scheduledTargetProviders, config);
   const attempts: OpenAIJsonAttemptFailure[] = [];
   for (const target of targetProviders) {
     const targetProvider = target.provider;
@@ -703,7 +710,7 @@ export async function handleOpenAIVideoContentRequest(
           attempts.length,
           targetProviderConfig
         );
-        attachOpenAIJsonBillingHeaders(
+        await attachOpenAIJsonBillingHeaders(
           endpoint,
           request,
           reply,
@@ -748,7 +755,7 @@ export async function handleOpenAIVideoContentRequest(
       attempts.length,
       targetProviderConfig
     );
-    attachOpenAIJsonBillingHeaders(
+    await attachOpenAIJsonBillingHeaders(
       endpoint,
       request,
       reply,
@@ -830,6 +837,12 @@ async function handleOpenAIJsonRequest(
   }
 
   const requestBodyForGovernance = jsonBody ?? multipartMetadata?.fields ?? {};
+  if (
+    isExplicitLiveStreamingRequest(requestBodyForGovernance) &&
+    shouldBlockLiveStreamingForStrictBilling(config)
+  ) {
+    return sendBadRequest(reply, strictBillingLiveStreamingUnsupportedMessage);
+  }
   const endpointImageCount =
     multipartMetadata?.imageCount ??
     countEndpointImageInputs(endpoint, requestBodyForGovernance);
@@ -847,12 +860,12 @@ async function handleOpenAIJsonRequest(
     return sendBadRequest(reply, targetProvidersResult.error);
   }
 
-  const scheduledTargetProviders = applyGatewayScheduling(targetProvidersResult.value, {
+  const scheduledTargetProviders = await applyGatewayScheduling(targetProvidersResult.value, {
     config,
     request,
     requestModel: requestBodyModel
   });
-  const targetProviders = applyHealthAwareRouting(scheduledTargetProviders, config);
+  const targetProviders = await applyHealthAwareRouting(scheduledTargetProviders, config);
   const attempts: OpenAIJsonAttemptFailure[] = [];
   let precheckApplied = false;
 
@@ -1126,6 +1139,10 @@ async function handleOpenAIJsonRequest(
     const { upstreamRequest, upstreamResponse } = dispatchResult;
 
     if (upstreamResponse.ok && isEventStreamResponse(upstreamResponse)) {
+      if (shouldBlockLiveStreamingForStrictBilling(config)) {
+        await cancelResponseBody(upstreamResponse);
+        return sendBadRequest(reply, strictBillingLiveStreamingUnsupportedMessage);
+      }
       const billingResponse =
         config.billing.enabled || config.scheduling?.enabled
           ? upstreamResponse.clone()
@@ -1240,7 +1257,7 @@ async function handleOpenAIJsonRequest(
       attempts.length,
       targetProviderConfig
     );
-    attachOpenAIJsonBillingHeaders(
+    await attachOpenAIJsonBillingHeaders(
       endpoint,
       request,
       reply,
@@ -1976,7 +1993,7 @@ async function callOpenAIJsonUpstream(
       details?: unknown;
     }
 > {
-  const circuit = checkProviderCircuitBreaker(
+  const circuit = await checkProviderCircuitBreaker(
     context.config,
     context.targetProvider,
     context.targetProviderConfig
@@ -2048,9 +2065,11 @@ async function callOpenAIJsonUpstream(
     recordProviderHealthResponse(
       context.targetProviderConfig,
       response.status,
-      Date.now() - startedAt
+      Date.now() - startedAt,
+      new Date(),
+      context.config.providerHealthCheck?.storage
     );
-    recordProviderCircuitBreakerResponse(
+    await recordProviderCircuitBreakerResponse(
       context.config,
       context.targetProvider,
       context.targetProviderConfig,
@@ -2069,8 +2088,13 @@ async function callOpenAIJsonUpstream(
     };
   } catch (error) {
     if (!context.clientAbortSignal?.aborted) {
-      recordProviderHealthFailure(context.targetProviderConfig, Date.now() - startedAt);
-      recordProviderCircuitBreakerFailure(
+      recordProviderHealthFailure(
+        context.targetProviderConfig,
+        Date.now() - startedAt,
+        new Date(),
+        context.config.providerHealthCheck?.storage
+      );
+      await recordProviderCircuitBreakerFailure(
         context.config,
         context.targetProvider,
         context.targetProviderConfig
@@ -2666,32 +2690,37 @@ async function applyProviderRequestPlugins(
 
     if (plugin.authenticate) {
       const startedAt = process.hrtime.bigint();
-      try {
-        const result = await plugin.authenticate(pluginInput);
-        if (!result.ok) {
-          recordGatewayPluginHookExecution({
-            pluginKey: plugin.key,
-            kind: 'provider',
-            hook: 'authenticate',
-            outcome: 'error',
-            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-          });
-          return {
-            ok: false,
-            stage: 'provider_auth',
-            status: 400,
-            message: `Provider plugin "${plugin.key}" auth failed: ${result.error}`
-          };
-        }
-        upstreamRequest = result.value;
+      const executionResult = await runGatewayPluginProtectedOperation({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'authenticate',
+        execution: plugin.execution,
+        operation: () => plugin.authenticate?.(pluginInput)
+      });
+      if (!executionResult.ok) {
         recordGatewayPluginHookExecution({
           pluginKey: plugin.key,
           kind: 'provider',
           hook: 'authenticate',
-          outcome: 'success',
+          outcome: executionResult.reason,
           durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
         });
-      } catch (error) {
+        return {
+          ok: false,
+          stage: 'provider_auth',
+          status: 400,
+          message: `Provider plugin "${plugin.key}" auth failed: ${executionResult.error}`
+        };
+      }
+      if ('skipped' in executionResult) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: executionResult.reason,
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
+      } else if (!executionResult.value?.ok) {
         recordGatewayPluginHookExecution({
           pluginKey: plugin.key,
           kind: 'provider',
@@ -2703,42 +2732,56 @@ async function applyProviderRequestPlugins(
           ok: false,
           stage: 'provider_auth',
           status: 400,
-          message: `Provider plugin "${plugin.key}" auth failed: ${formatPluginExecutionError(error)}`
+          message: `Provider plugin "${plugin.key}" auth failed: ${executionResult.value?.error || 'unknown error'}`
         };
+      } else {
+        upstreamRequest = executionResult.value.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'authenticate',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
       }
     }
 
     if (plugin.transformRequest) {
       const startedAt = process.hrtime.bigint();
-      try {
-        const result = await plugin.transformRequest({
+      const executionResult = await runGatewayPluginProtectedOperation({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformRequest',
+        execution: plugin.execution,
+        operation: () => plugin.transformRequest?.({
           ...pluginInput,
           upstreamRequest
-        });
-        if (!result.ok) {
-          recordGatewayPluginHookExecution({
-            pluginKey: plugin.key,
-            kind: 'provider',
-            hook: 'transformRequest',
-            outcome: 'error',
-            durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-          });
-          return {
-            ok: false,
-            stage: 'provider_request_transform',
-            status: 400,
-            message: `Provider plugin "${plugin.key}" request transform failed: ${result.error}`
-          };
-        }
-        upstreamRequest = result.value;
+        })
+      });
+      if (!executionResult.ok) {
         recordGatewayPluginHookExecution({
           pluginKey: plugin.key,
           kind: 'provider',
           hook: 'transformRequest',
-          outcome: 'success',
+          outcome: executionResult.reason,
           durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
         });
-      } catch (error) {
+        return {
+          ok: false,
+          stage: 'provider_request_transform',
+          status: 400,
+          message: `Provider plugin "${plugin.key}" request transform failed: ${executionResult.error}`
+        };
+      }
+      if ('skipped' in executionResult) {
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: executionResult.reason,
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
+      } else if (!executionResult.value?.ok) {
         recordGatewayPluginHookExecution({
           pluginKey: plugin.key,
           kind: 'provider',
@@ -2750,8 +2793,17 @@ async function applyProviderRequestPlugins(
           ok: false,
           stage: 'provider_request_transform',
           status: 400,
-          message: `Provider plugin "${plugin.key}" request transform failed: ${formatPluginExecutionError(error)}`
+          message: `Provider plugin "${plugin.key}" request transform failed: ${executionResult.value?.error || 'unknown error'}`
         };
+      } else {
+        upstreamRequest = executionResult.value.value;
+        recordGatewayPluginHookExecution({
+          pluginKey: plugin.key,
+          kind: 'provider',
+          hook: 'transformRequest',
+          outcome: 'success',
+          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+        });
       }
     }
   }
@@ -2800,32 +2852,39 @@ async function applyProviderResponsePlugins(
     }
 
     const startedAt = process.hrtime.bigint();
-    try {
-      const result = await plugin.transformResponse(pluginInput);
-      if (!result.ok) {
-        recordGatewayPluginHookExecution({
-          pluginKey: plugin.key,
-          kind: 'provider',
-          hook: 'transformResponse',
-          outcome: 'error',
-          durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
-        });
-        return {
-          ok: false,
-          stage: 'provider_response_transform',
-          status: 502,
-          message: `Provider plugin "${plugin.key}" response transform failed: ${result.error}`
-        };
-      }
-      payload = result.value;
+    const executionResult = await runGatewayPluginProtectedOperation({
+      pluginKey: plugin.key,
+      kind: 'provider',
+      hook: 'transformResponse',
+      execution: plugin.execution,
+      operation: () => plugin.transformResponse?.(pluginInput)
+    });
+    if (!executionResult.ok) {
       recordGatewayPluginHookExecution({
         pluginKey: plugin.key,
         kind: 'provider',
         hook: 'transformResponse',
-        outcome: 'success',
+        outcome: executionResult.reason,
         durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
       });
-    } catch (error) {
+      return {
+        ok: false,
+        stage: 'provider_response_transform',
+        status: 502,
+        message: `Provider plugin "${plugin.key}" response transform failed: ${executionResult.error}`
+      };
+    }
+    if ('skipped' in executionResult) {
+      recordGatewayPluginHookExecution({
+        pluginKey: plugin.key,
+        kind: 'provider',
+        hook: 'transformResponse',
+        outcome: executionResult.reason,
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+      });
+      continue;
+    }
+    if (!executionResult.value?.ok) {
       recordGatewayPluginHookExecution({
         pluginKey: plugin.key,
         kind: 'provider',
@@ -2837,9 +2896,18 @@ async function applyProviderResponsePlugins(
         ok: false,
         stage: 'provider_response_transform',
         status: 502,
-        message: `Provider plugin "${plugin.key}" response transform failed: ${formatPluginExecutionError(error)}`
+        message: `Provider plugin "${plugin.key}" response transform failed: ${executionResult.value?.error || 'unknown error'}`
       };
     }
+
+    payload = executionResult.value.value;
+    recordGatewayPluginHookExecution({
+      pluginKey: plugin.key,
+      kind: 'provider',
+      hook: 'transformResponse',
+      outcome: 'success',
+      durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000
+    });
   }
 
   return { ok: true, value: payload };
@@ -2860,7 +2928,7 @@ async function processOpenAIJsonEventStreamUsage(input: {
 }): Promise<void> {
   try {
     const usagePayload = await readOpenAIJsonEventStreamUsagePayload(input.response);
-    attachOpenAIJsonBillingHeaders(
+    await attachOpenAIJsonBillingHeaders(
       input.endpoint,
       input.request,
       input.reply,
@@ -3083,7 +3151,7 @@ function resolveVideoStatusBillingOptions(
   };
 }
 
-function attachOpenAIJsonBillingHeaders(
+async function attachOpenAIJsonBillingHeaders(
   endpoint: OpenAIJsonEndpointConfig,
   request: FastifyRequest,
   reply: FastifyReply,
@@ -3104,7 +3172,7 @@ function attachOpenAIJsonBillingHeaders(
       errorMessage?: string;
     };
   } = {}
-): void {
+): Promise<void> {
   const reportedCostUsd = extractProviderReportedCostUsd(providerPayload);
   const targetVideoProtocol = endpoint.video
     ? videoProtocolForTarget(
@@ -3147,7 +3215,7 @@ function attachOpenAIJsonBillingHeaders(
     return;
   }
   if (!usage && reportedCostUsd === undefined) {
-    if (endpoint.billingUsageOptional) {
+    if (endpoint.billingUsageOptional && !config.billing.requireUsage) {
       return;
     }
 
@@ -3155,6 +3223,11 @@ function attachOpenAIJsonBillingHeaders(
       { provider: targetProvider, model: billingModel },
       `Failed to parse ${endpoint.displayName.toLowerCase()} usage for billing.`
     );
+    if (config.billing.requireUsage) {
+      throw new Error(
+        `Billing usage is required but could not be parsed for ${endpoint.displayName.toLowerCase()}.`
+      );
+    }
     return;
   }
 
@@ -3162,6 +3235,15 @@ function attachOpenAIJsonBillingHeaders(
     reportedCostUsd !== undefined
       ? createProviderReportedCostBilling(targetProvider, reportedCostUsd, config.billing)
       : calculateUsageBilling(targetProvider, usage || {}, config.billing, rate);
+  assertStrictOpenAIJsonBillingRequirements(
+    endpoint,
+    config,
+    targetProvider,
+    billingModel,
+    usage,
+    billing,
+    reportedCostUsd
+  );
   if (options.attachHeaders !== false) {
     for (const [key, value] of Object.entries(buildBillingHeaders(billing))) {
       reply.header(key, value);
@@ -3191,7 +3273,7 @@ function attachOpenAIJsonBillingHeaders(
     return;
   }
 
-  void publishBillingEvent({
+  const billingEvent = {
     eventId: videoBillingRequestId
       ? buildVideoBillingEventId(targetProviderConfig?.name || targetProvider, videoBillingRequestId)
       : randomUUID(),
@@ -3200,7 +3282,7 @@ function attachOpenAIJsonBillingHeaders(
     clientIp: resolveGatewayClientIp(request, config),
     route: {
       method: request.method,
-      url: request.url
+      url: sanitizeRequestUrlForEvent(request.url)
     },
     source: {
       provider: endpoint.sourceProvider || 'openai',
@@ -3221,16 +3303,18 @@ function attachOpenAIJsonBillingHeaders(
       statusCode: responseStatusCode
     },
     billing
-  })
+  };
+
+  const delivery = publishBillingEvent(billingEvent)
     .then((delivered) => {
-      if (!videoBillingRequestId) {
-        return;
+      if (videoBillingRequestId) {
+        if (delivered) {
+          completeVideoBillingEvent(videoBillingRequestId);
+        } else {
+          releaseVideoBillingEvent(videoBillingRequestId);
+        }
       }
-      if (delivered) {
-        completeVideoBillingEvent(videoBillingRequestId);
-      } else {
-        releaseVideoBillingEvent(videoBillingRequestId);
-      }
+      return delivered;
     })
     .catch((error) => {
       if (videoBillingRequestId) {
@@ -3240,7 +3324,20 @@ function attachOpenAIJsonBillingHeaders(
         { details: error instanceof Error ? error.message : String(error) },
         `Failed to publish ${endpoint.displayName.toLowerCase()} billing event.`
       );
+      throw error;
     });
+
+  if (!shouldAwaitBillingDelivery(config)) {
+    void delivery.catch(() => undefined);
+    return;
+  }
+
+  const delivered = await delivery;
+  if (!delivered && (config.billing.delivery?.requirePublisher || config.billing.delivery?.requireOutbox)) {
+    throw new Error(
+      `${endpoint.displayName} billing event was not delivered to any configured billing publisher or outbox.`
+    );
+  }
 }
 
 function extractProviderReportedCostUsd(payload: unknown): number | undefined {
@@ -3257,6 +3354,57 @@ function buildVideoBillingEventId(providerKey: string, publicRequestId: string):
   return `video_${createHash('sha256')
     .update(`${providerKey}:${publicRequestId}`)
     .digest('hex')}`;
+}
+
+function assertStrictOpenAIJsonBillingRequirements(
+  endpoint: OpenAIJsonEndpointConfig,
+  config: GatewayConfig,
+  provider: Provider,
+  model: string | undefined,
+  usage: StandardUsage | undefined,
+  billing: BillingResult,
+  reportedCostUsd: number | undefined
+): void {
+  if (
+    reportedCostUsd !== undefined ||
+    !config.billing.requireRates ||
+    !usage ||
+    !hasBillableOpenAIJsonUsage(usage) ||
+    billing.cost.total > 0
+  ) {
+    return;
+  }
+
+  throw new Error(
+    `Billing rates are required but produced zero cost for ${endpoint.displayName.toLowerCase()} provider ${provider}${model ? ` model ${model}` : ''}.`
+  );
+}
+
+function hasBillableOpenAIJsonUsage(usage: StandardUsage): boolean {
+  return [
+    usage.input_tokens,
+    usage.output_tokens,
+    usage.cache_read_tokens,
+    usage.cache_write_tokens,
+    usage.total_tokens,
+    usage.video_seconds
+  ].some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0);
+}
+
+function sanitizeRequestUrlForEvent(url: string): string {
+  try {
+    const parsed = new URL(url, 'http://gateway.local');
+    for (const key of ['key', 'api_key', 'apikey', 'token', 'access_token']) {
+      if (parsed.searchParams.has(key)) {
+        parsed.searchParams.set(key, '***');
+      }
+    }
+
+    const query = parsed.searchParams.toString();
+    return query ? `${parsed.pathname}?${query}` : parsed.pathname;
+  } catch {
+    return url;
+  }
 }
 
 function extractOpenAIJsonUsage(payload: unknown): StandardUsage | undefined {
@@ -3542,6 +3690,11 @@ function readBodyModel(body: Record<string, unknown> | undefined): string | unde
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
   return isObject(value) && !Array.isArray(value) && !Buffer.isBuffer(value);
+}
+
+function isExplicitLiveStreamingRequest(body: Record<string, unknown>): boolean {
+  const value = body.stream;
+  return value === true || (typeof value === 'string' && value.trim().toLowerCase() === 'true');
 }
 
 function isMultipartFormDataContentType(value: string | undefined): boolean {

@@ -31,6 +31,20 @@ export ANTHROPIC_API_KEY='replace-with-tool-search-provider-key'
 docker compose up --build
 ```
 
+生产 Docker Compose：
+
+```bash
+cp .env.production.example .env.production
+# 编辑 .env.production
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+```
+
+多实例部署需要共享状态时，开启 Redis profile：
+
+```bash
+docker compose --env-file .env.production -f docker-compose.prod.yml --profile redis up -d --build
+```
+
 ## 主要能力
 
 - OpenAI `chat/completions`、`responses`、`embeddings`、`moderations`、`images/generations`

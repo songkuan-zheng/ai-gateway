@@ -239,6 +239,7 @@ function buildConfiguredProviderPlugin(config: ProviderPluginConfig): ProviderPl
     sourceAdapters: config.sourceAdapters,
     sourceRoutes: config.sourceRoutes,
     when: config.when,
+    execution: config.execution,
     authenticate:
       codexOauthConfig || config.auth
         ? async (input) => {

@@ -50,19 +50,42 @@ export async function refreshGatewayConfigFromExternalSource(
   if (!hasGatewayConfigExternalSource(configPayload)) {
     nextConfig.configExternal = cloneGatewayConfigExternalSource(source);
   }
-  applyGatewayConfigInPlace(options.config, nextConfig);
-  await options.onConfigReload?.(options.config, options.reason || 'external_config_refresh');
+  const reason = options.reason || 'external_config_refresh';
+  const previousConfig = structuredClone(options.config);
+  let reloadAttempted = false;
+  try {
+    if (options.onConfigReload) {
+      reloadAttempted = true;
+      await options.onConfigReload(nextConfig, reason);
+    }
+    applyGatewayConfigInPlace(options.config, nextConfig);
+  } catch (error) {
+    if (reloadAttempted && options.onConfigReload) {
+      try {
+        await options.onConfigReload(previousConfig, `${reason}_rollback`);
+      } catch (rollbackError) {
+        throw new Error(
+          `${formatExternalConfigError(error)} Runtime rollback also failed: ${formatExternalConfigError(rollbackError)}`
+        );
+      }
+    }
+    throw error;
+  }
   options.logger?.info?.(
     {
       endpoint: source.endpoint,
       command: source.command,
       transport: source.transport,
       method: source.method,
-      reason: options.reason || 'external_config_refresh'
+      reason
     },
     'Loaded gateway config from external endpoint.'
   );
   return true;
+}
+
+function formatExternalConfigError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function cloneGatewayConfigExternalSource(

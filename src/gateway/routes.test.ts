@@ -23,6 +23,10 @@ import { syncGatewayPluginModulesFromConfig } from '../plugins/loader';
 import type { GatewayPluginOutbox } from '../plugins/events';
 import type {
   GatewayConfig,
+  GatewayPluginHttpRoute,
+  GatewayPluginRequestTransform,
+  GatewayPluginResponseHook,
+  GatewayPluginRouteResolver,
   ProviderConfig,
   ProviderPluginConfig,
   SourceAdapter,
@@ -1053,7 +1057,14 @@ describe('gateway routes protocol conversion', () => {
       headerName: 'idempotency-key',
       ttlMs: 60000,
       maxEntries: 100,
-      cacheErrorResponses: false
+      maxResponseBytes: 4 * 1024 * 1024,
+      maxTotalBytes: 256 * 1024 * 1024,
+      cacheErrorResponses: false,
+      pendingWaitTimeoutMs: 30000,
+      pollIntervalMs: 100,
+      storage: {
+        type: 'memory'
+      }
     };
     const app = Fastify({ logger: false });
     registerGatewayIdempotencyHooks(app, config);
@@ -1119,7 +1130,14 @@ describe('gateway routes protocol conversion', () => {
       headerName: 'idempotency-key',
       ttlMs: 60000,
       maxEntries: 100,
-      cacheErrorResponses: false
+      maxResponseBytes: 4 * 1024 * 1024,
+      maxTotalBytes: 256 * 1024 * 1024,
+      cacheErrorResponses: false,
+      pendingWaitTimeoutMs: 30000,
+      pollIntervalMs: 100,
+      storage: {
+        type: 'memory'
+      }
     };
     const app = Fastify({ logger: false });
     registerGatewayIdempotencyHooks(app, config);
@@ -1174,7 +1192,10 @@ describe('gateway routes protocol conversion', () => {
     config.upstreamConcurrency = {
       enabled: true,
       maxInFlightPerProvider: 1,
-      queueTimeoutMs: 1
+      queueTimeoutMs: 1,
+      storage: {
+        type: 'memory'
+      }
     };
     const app = Fastify({ logger: false });
     registerGatewayRoutes(app, config, createGatewayRuntime());
@@ -1306,7 +1327,10 @@ describe('gateway routes protocol conversion', () => {
       enabled: true,
       failureThreshold: 1,
       cooldownMs: 60000,
-      failureStatusCodes: [500]
+      failureStatusCodes: [500],
+      storage: {
+        type: 'memory'
+      }
     };
     const app = Fastify({ logger: false });
     registerGatewayRoutes(app, config, createGatewayRuntime());
@@ -2922,6 +2946,109 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('rejects live streaming requests before upstream dispatch when strict billing requires usage', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5']);
+    const config = createConfig([provider]);
+    config.billing = {
+      ...config.billing,
+      enabled: true,
+      delivery: {
+        mode: 'async',
+        requirePublisher: false,
+        requireOutbox: false,
+        shutdownDrainTimeoutMs: 100
+      },
+      requireUsage: true,
+      requireRates: false
+    };
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          stream: true,
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).error.message).toContain('strict billing enforcement');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects successful non-streaming responses without reported usage when strict billing requires usage', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({
+        id: 'chatcmpl_missing_usage',
+        object: 'chat.completion',
+        model: 'glm-5',
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: 'ok' },
+            finish_reason: 'stop'
+          }
+        ]
+      }),
+      { headers: { 'content-type': 'application/json' } }
+    ));
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5']);
+    const config = createConfig([provider]);
+    config.billing = {
+      ...config.billing,
+      enabled: true,
+      delivery: {
+        mode: 'async',
+        requirePublisher: false,
+        requireOutbox: false,
+        shutdownDrainTimeoutMs: 100
+      },
+      requireUsage: true,
+      requireRates: false
+    };
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(500);
+      expect(response.body).toContain('Billing usage is required but was not reported');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('can strip thinking options for incompatible passthrough chat/completions targets', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
@@ -3037,6 +3164,9 @@ describe('gateway routes protocol conversion', () => {
       const { bundleDir, manifest } = await waitForRawTraceManifest(spoolDir);
       await waitForCondition(() => syncedManifests.length === 1);
       await closeRawTraceManager();
+      expect(Number.isFinite(Date.parse(manifest.startedAt ?? ''))).toBe(true);
+      expect(Number.isFinite(Date.parse(manifest.completedAt ?? ''))).toBe(true);
+      expect(manifest.durationMs).toBeGreaterThanOrEqual(0);
       expect(manifest.parts.map((part: { partType: string }) => part.partType)).toContain('response_stream');
       expect(manifest.parts.map((part: { partType: string }) => part.partType)).toContain('upstream_response_metadata');
       expect((syncedManifests[0] as { parts: Array<{ storageBackend: string }> }).parts[0]?.storageBackend).toBe('local');
@@ -7077,6 +7207,490 @@ export function createGatewayPlugin() {
       expect(JSON.parse(response.body)).toEqual({
         reply: 'hello from upstream',
         model: 'glm-5'
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('allows gateway plugins to transform requests and resolve target routes before built-in routing', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>;
+      const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          id: 'resp_plugin_routed',
+          object: 'response',
+          status: 'completed',
+          model: body.model,
+          input: body.input,
+          authorization: headers.authorization
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const mainProvider = {
+      ...createProviderConfig('openai-main', 'openai_responses', ['glm-5']),
+      apikey: 'main-key',
+      baseurl: 'https://main.example/v1'
+    };
+    const altProvider = {
+      ...createProviderConfig('openai-alt', 'openai_responses', ['alt-model']),
+      apikey: 'alt-key',
+      baseurl: 'https://alt.example/v1'
+    };
+    const config = createConfig([mainProvider, altProvider]);
+    const runtime = createGatewayRuntime(config);
+    const transform: GatewayPluginRequestTransform = {
+      key: 'alias-transform',
+      stage: 'beforeRouting',
+      transform(input) {
+        const body = input.requestBody as Record<string, unknown>;
+        if (body.model !== 'alias-model') {
+          return;
+        }
+        return {
+          requestBody: {
+            ...body,
+            model: 'alt-model',
+            input: 'rewritten by plugin'
+          },
+          headers: {
+            set: {
+              'x-plugin-transform': 'yes'
+            }
+          }
+        };
+      }
+    };
+    const resolver: GatewayPluginRouteResolver = {
+      key: 'alias-router',
+      resolve(input) {
+        expect(input.request.headers['x-plugin-transform']).toBe('yes');
+        if (input.model !== 'alt-model') {
+          return;
+        }
+        return {
+          targetProviderName: 'openai-alt',
+          reason: 'alias route'
+        };
+      }
+    };
+    runtime.requestTransforms.register(transform);
+    runtime.routeResolvers.register(resolver);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'alias-model',
+          input: 'original'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://alt.example/v1/responses');
+      expect((upstreamInit.headers as Record<string, string>).authorization).toBe('Bearer alt-key');
+      expect(JSON.parse(String(upstreamInit.body))).toMatchObject({
+        model: 'alt-model',
+        input: 'rewritten by plugin'
+      });
+      expect(JSON.parse(response.body)).toMatchObject({
+        model: 'alt-model',
+        input: 'rewritten by plugin',
+        authorization: 'Bearer alt-key'
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('applies beforeUpstream request transforms to same-protocol passthrough requests', async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          id: 'resp_passthrough_transform',
+          object: 'response',
+          status: 'completed',
+          model: requestBody.model,
+          output: [
+            {
+              id: 'msg_passthrough_transform',
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [{ type: 'output_text', text: 'ok', annotations: [] }]
+            }
+          ],
+          usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 }
+        }),
+        { headers: { 'content-type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-main', 'openai_responses', ['glm-5']);
+    const config = createConfig([provider]);
+    const runtime = createGatewayRuntime(config);
+    runtime.requestTransforms.register({
+      key: 'passthrough-before-upstream',
+      stage: 'beforeUpstream',
+      providerName: 'openai-main',
+      transform(input) {
+        return {
+          requestBody: {
+            ...(input.requestBody as Record<string, unknown>),
+            input: 'rewritten before passthrough'
+          },
+          headers: {
+            set: {
+              'openai-project': 'plugin-project'
+            }
+          }
+        };
+      }
+    });
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'original input'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(JSON.parse(String(upstreamInit.body))).toMatchObject({
+        model: 'glm-5',
+        input: 'rewritten before passthrough'
+      });
+      expect(new Headers(upstreamInit.headers).get('openai-project')).toBe('plugin-project');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('isolates beforeUpstream request transforms between fallback providers', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('https://primary.example/v1/')) {
+        return new Response(JSON.stringify({ error: { message: 'bad gateway' } }), {
+          status: 502,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_fallback_transform',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: { role: 'assistant', content: 'backup' }
+            }
+          ],
+          usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 }
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const primary = createProviderConfig('openai-primary', 'openai_chat_completions', ['glm-5']);
+    primary.baseurl = 'https://primary.example/v1';
+    const backup = createProviderConfig('openai-backup', 'openai_chat_completions', ['glm-5']);
+    backup.baseurl = 'https://backup.example/v1';
+    const config = createConfig([primary, backup]);
+    config.scheduling.enabled = true;
+    config.scheduling.fallback = {
+      ...config.scheduling.fallback,
+      retryStatusCodes: [502],
+      crossProviderStatusCodes: [502]
+    };
+    const runtime = createGatewayRuntime(config);
+    const backupTransformInputs: Array<{
+      requestBody: unknown;
+      primaryHeader: string | string[] | undefined;
+    }> = [];
+    runtime.requestTransforms.register({
+      key: 'primary-only-transform',
+      stage: 'beforeUpstream',
+      providerName: 'openai-primary',
+      transform(input) {
+        const requestBody = input.requestBody as Record<string, unknown>;
+        return {
+          requestBody: {
+            ...requestBody,
+            input: 'primary-only input'
+          },
+          headers: {
+            set: {
+              'x-primary-only': 'true'
+            }
+          }
+        };
+      }
+    });
+    runtime.requestTransforms.register({
+      key: 'backup-observer-transform',
+      stage: 'beforeUpstream',
+      providerName: 'openai-backup',
+      transform(input) {
+        backupTransformInputs.push({
+          requestBody: input.requestBody,
+          primaryHeader: input.request.headers['x-primary-only']
+        });
+      }
+    });
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-providers': 'openai-primary,openai-backup'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'original input'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(backupTransformInputs).toEqual([
+        {
+          requestBody: {
+            model: 'glm-5',
+            input: 'original input'
+          },
+          primaryHeader: undefined
+        }
+      ]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('allows gateway plugins to transform final non-streaming responses', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'resp_plugin_response',
+          object: 'response',
+          status: 'completed',
+          model: 'glm-5',
+          output: [
+            {
+              id: 'msg_plugin_response',
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'hello from upstream',
+                  annotations: []
+                }
+              ]
+            }
+          ],
+          usage: {
+            input_tokens: 2,
+            output_tokens: 3,
+            total_tokens: 5
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([
+      createProviderConfig('openai-main', 'openai_responses', ['glm-5'])
+    ]);
+    const runtime = createGatewayRuntime(config);
+    const hook: GatewayPluginResponseHook = {
+      key: 'decorate-response',
+      sourceAdapters: ['anthropic_messages'],
+      transformResponse(input) {
+        return {
+          statusCode: 201,
+          headers: {
+            'x-plugin-response': 'decorated'
+          },
+          responsePayload: {
+            decorated: true,
+            original: input.responsePayload
+          }
+        };
+      }
+    };
+    runtime.responseHooks.register(hook);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          max_tokens: 64,
+          messages: [
+            {
+              role: 'user',
+              content: 'hello'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(201);
+      expect(response.headers['x-plugin-response']).toBe('decorated');
+      expect(JSON.parse(response.body)).toMatchObject({
+        decorated: true,
+        original: {
+          type: 'message',
+          role: 'assistant',
+          model: 'glm-5'
+        }
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('dispatches plugin HTTP routes before plugin source adapter fallback routes', async () => {
+    const config = createConfig([
+      createProviderConfig('openai-main', 'openai_responses', ['glm-5'])
+    ]);
+    const runtime = createGatewayRuntime(config);
+    const route: GatewayPluginHttpRoute = {
+      key: 'plugin-status',
+      method: 'GET',
+      path: '/__plugin/status',
+      auth: 'none',
+      handler(input) {
+        return {
+          ok: true,
+          method: input.request.method,
+          url: input.request.url
+        };
+      }
+    };
+    runtime.httpRoutes.register(route);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/__plugin/status'
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        ok: true,
+        method: 'GET',
+        url: '/__plugin/status'
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('parses form URL encoded bodies for plugin HTTP routes', async () => {
+    const config = createConfig([
+      createProviderConfig('openai-main', 'openai_responses', ['glm-5'])
+    ]);
+    const runtime = createGatewayRuntime(config);
+    const route: GatewayPluginHttpRoute = {
+      key: 'plugin-form',
+      method: 'POST',
+      path: '/__plugin/form',
+      auth: 'none',
+      priority: 'pre',
+      handler(input) {
+        return {
+          body: input.request.body
+        };
+      }
+    };
+    runtime.httpRoutes.register(route);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/__plugin/form',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded'
+        },
+        payload: 'grant_type=jwt-bearer&assertion=token'
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        body: {
+          assertion: 'token',
+          grant_type: 'jwt-bearer'
+        }
       });
     } finally {
       await app.close();
@@ -12043,13 +12657,19 @@ function createConfig(
         crossProviderStatusCodes: [401, 403, 404, 429, 500, 502, 503, 504],
         preserveCache: 'prefer',
         maxCacheWaitMs: 3000
+      },
+      storage: {
+        type: 'memory'
       }
     },
     providerHealthCheck: {
       enabled: false,
       intervalMs: 60000,
       timeoutMs: 5000,
-      initialDelayMs: 0
+      initialDelayMs: 0,
+      storage: {
+        type: 'memory'
+      }
     },
     metrics: {
       enabled: false,
@@ -12258,6 +12878,9 @@ async function waitForRawTraceManifest(
 ): Promise<{
   bundleDir: string;
   manifest: {
+    completedAt?: string;
+    durationMs?: number;
+    startedAt?: string;
     target?: {
       providerName?: string;
     };
