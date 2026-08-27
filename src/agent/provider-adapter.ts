@@ -335,9 +335,11 @@ function resolveScopedHeaders(providerConfig: ProviderConfig | undefined, model:
     return {};
   }
 
-  const modelHeaders = providerConfig.extraHeaders.byModel[model];
+  const scoped = providerConfig.extraHeaders;
+  const defaults = scoped?.default ?? {};
+  const modelHeaders = scoped?.byModel?.[model];
   return {
-    ...providerConfig.extraHeaders.default,
+    ...defaults,
     ...(modelHeaders || {})
   };
 }
@@ -347,9 +349,11 @@ function resolveScopedBody(providerConfig: ProviderConfig | undefined, model: st
     return {};
   }
 
-  const modelBody = providerConfig.extraBody.byModel[model];
+  const scoped = providerConfig.extraBody;
+  const defaults = scoped?.default ?? {};
+  const modelBody = scoped?.byModel?.[model];
   return {
-    ...providerConfig.extraBody.default,
+    ...defaults,
     ...(modelBody || {})
   };
 }

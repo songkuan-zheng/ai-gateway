@@ -7445,32 +7445,36 @@ function resolveProviderBillingRate(
 }
 
 function resolveScopedHeaders(providerConfig: ProviderConfig, model: string | undefined): Record<string, string> {
+  const scoped = providerConfig.extraHeaders;
+  const defaults = scoped?.default ?? {};
   if (!model) {
-    return providerConfig.extraHeaders.default;
+    return defaults;
   }
 
-  const modelHeaders = providerConfig.extraHeaders.byModel[model];
+  const modelHeaders = scoped?.byModel?.[model];
   if (!modelHeaders) {
-    return providerConfig.extraHeaders.default;
+    return defaults;
   }
 
   return {
-    ...providerConfig.extraHeaders.default,
+    ...defaults,
     ...modelHeaders
   };
 }
 
 function resolveScopedBody(providerConfig: ProviderConfig, model: string | undefined): Record<string, unknown> {
+  const scoped = providerConfig.extraBody;
+  const defaults = scoped?.default ?? {};
   if (!model) {
-    return providerConfig.extraBody.default;
+    return defaults;
   }
 
-  const modelBody = providerConfig.extraBody.byModel[model];
+  const modelBody = scoped?.byModel?.[model];
   if (!modelBody) {
-    return providerConfig.extraBody.default;
+    return defaults;
   }
 
-  return mergeJsonObjects(providerConfig.extraBody.default, modelBody);
+  return mergeJsonObjects(defaults, modelBody);
 }
 
 function resolveProviderConfig(config: GatewayConfig, target: TargetProviderRoute): ProviderConfig | undefined {
