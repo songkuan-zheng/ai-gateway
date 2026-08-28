@@ -1038,6 +1038,12 @@ function countContentCharacters(item: StandardRequestInputContent): number {
     return item.text.length;
   }
 
+
+  // Images are not text; their cost is counted separately via countImageInputs.
+  if (item.type === 'input_image') {
+    return 0;
+  }
+
   if (item.type === 'tool_result') {
     return item.content.length;
   }

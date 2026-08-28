@@ -1382,6 +1382,24 @@ function extractAnthropicMessageContent(
       continue;
     }
 
+    if (blockType === 'image' && role === 'user') {
+      // Claude Code and other Anthropic-protocol clients attach screenshots and
+      // photos as image blocks; dropping them here makes the upstream see a
+      // text-only conversation and answer "there is no image".
+      const source = isObject(block.source) ? block.source : undefined;
+      const url = asString(source?.url);
+      const data = asString(source?.data);
+      if (!url && !data) {
+        continue;
+      }
+      const mediaType = asString(source?.media_type) || 'image/png';
+      normalized.push({
+        type: 'input_image',
+        image_url: url || `data:${mediaType};base64,${data}`
+      });
+      continue;
+    }
+
     const text = extractTextFromPart(block);
     if (text) {
       normalized.push({ type: 'input_text', text });

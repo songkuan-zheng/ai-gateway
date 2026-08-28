@@ -7,6 +7,92 @@ import {
 } from './openai-responses';
 
 describe('openAIResponsesTargetAdapter', () => {
+  it('serializes standard input_image content for chat-completions and responses targets', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: 'What color is this image?'
+            },
+            {
+              type: 'input_image',
+              image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const chatBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(chatBuilt.ok).toBe(true);
+    if (!chatBuilt.ok) {
+      return;
+    }
+
+    const chatBody = chatBuilt.value.body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const userMessage = chatBody.messages.at(-1);
+    expect(userMessage?.role).toBe('user');
+    expect(userMessage?.content).toEqual([
+      {
+        type: 'text',
+        text: 'What color is this image?'
+      },
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+        }
+      }
+    ]);
+
+    const responsesBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(responsesBuilt.ok).toBe(true);
+    if (!responsesBuilt.ok) {
+      return;
+    }
+
+    const responsesBody = responsesBuilt.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    const inputItems = responsesBody.input;
+    const imageItem = inputItems.find((item) => item.type === 'input_image');
+    expect(imageItem).toEqual({
+      type: 'input_image',
+      image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+    });
+  });
+
   it('preserves OpenAI server tool usage counters in standard responses', () => {
     const parsed = openAIResponsesTargetAdapter.toStandardResponse({
       id: 'resp_server_tools',

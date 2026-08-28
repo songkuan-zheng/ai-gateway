@@ -981,6 +981,11 @@ export type StandardRequestInputContent =
       status?: string;
     }
   | {
+      type: 'input_image';
+      /** HTTP(S) URL or a data URL. */
+      image_url: string;
+    }
+  | {
       type: 'reasoning';
       id?: string;
       text?: string;

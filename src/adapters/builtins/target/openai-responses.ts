@@ -455,10 +455,26 @@ function standardInputToOpenAIChatMessages(
               )
       });
     }
-    if (text) {
+    const imageParts = collectUserImageParts(message.content);
+    if (text && imageParts.length === 0) {
       messages.push({
         role: 'user',
         content: text
+      });
+    } else if (text || imageParts.length > 0) {
+      const parts: Array<Record<string, unknown>> = [];
+      if (text) {
+        parts.push({ type: 'text', text });
+      }
+      for (const imagePart of imageParts) {
+        parts.push({
+          type: 'image_url',
+          image_url: { url: imagePart }
+        });
+      }
+      messages.push({
+        role: 'user',
+        content: parts
       });
     }
   }
@@ -579,6 +595,13 @@ function standardInputToOpenAIResponsesInput(
     }
 
     for (const item of message.content) {
+      if (item.type === 'input_image') {
+        items.push({
+          type: 'input_image',
+          image_url: item.image_url
+        });
+        continue;
+      }
       if (item.type !== 'tool_search_output') {
         continue;
       }
@@ -648,6 +671,12 @@ function standardInputToOpenAIResponsesInput(
   }
 
   return items;
+}
+
+function collectUserImageParts(content: StandardRequestInputContent[]): string[] {
+  return content
+    .filter((item) => item.type === 'input_image')
+    .map((item) => item.image_url);
 }
 
 function extractStandardInputTextContent(content: StandardRequestInputContent[]): string {
