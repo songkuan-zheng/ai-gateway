@@ -404,8 +404,8 @@ function standardInputToOpenAIChatMessages(
   }
 
   for (const message of collectStandardInputMessages(input)) {
-    const text = extractStandardInputTextContent(message.content);
     if (message.role === 'assistant') {
+      const text = extractStandardInputTextContent(message.content);
       const toolCalls = collectAssistantToolCalls(message.content, tools);
       const reasoning = includeReasoningFields ? collectAssistantReasoning(message.content) : undefined;
       if (!text && toolCalls.length === 0 && !reasoning) {
@@ -455,26 +455,16 @@ function standardInputToOpenAIChatMessages(
               )
       });
     }
-    const imageParts = collectUserImageParts(message.content);
-    if (text && imageParts.length === 0) {
+    const contentParts = buildOrderedUserChatContentParts(message.content);
+    if (contentParts.length === 1 && contentParts[0].type === 'text') {
       messages.push({
         role: 'user',
-        content: text
+        content: contentParts[0].text
       });
-    } else if (text || imageParts.length > 0) {
-      const parts: Array<Record<string, unknown>> = [];
-      if (text) {
-        parts.push({ type: 'text', text });
-      }
-      for (const imagePart of imageParts) {
-        parts.push({
-          type: 'image_url',
-          image_url: { url: imagePart }
-        });
-      }
+    } else if (contentParts.length > 0) {
       messages.push({
         role: 'user',
-        content: parts
+        content: contentParts
       });
     }
   }
@@ -494,9 +484,9 @@ function standardInputToOpenAIResponsesInput(
   const items: Array<Record<string, unknown>> = [];
   for (const message of collectStandardInputMessages(input)) {
     const role = message.role === 'assistant' ? 'assistant' : 'user';
-    const text = extractStandardInputTextContent(message.content);
 
     if (message.role === 'assistant') {
+      const text = extractStandardInputTextContent(message.content);
       const reasoning = collectAssistantReasoning(message.content);
       const replayableEncryptedContent =
         reasoning?.encrypted_content && reasoning.id ? reasoning.encrypted_content : undefined;
@@ -581,22 +571,42 @@ function standardInputToOpenAIResponsesInput(
       continue;
     }
 
-    if (text) {
-      items.push({
-        type: 'message',
-        role,
-        content: [
-          {
-            type: 'input_text',
-            text
-          }
-        ]
-      });
-    }
+    // `input_image` is a message content part in the Responses schema, not a
+    // top-level input item — text and images must share one user message in
+    // their original order.
+    let pendingContent: Array<Record<string, unknown>> | undefined;
+    const flushPendingUserMessage = () => {
+      if (pendingContent && pendingContent.length > 0) {
+        items.push({
+          type: 'message',
+          role,
+          content: pendingContent
+        });
+      }
+      pendingContent = undefined;
+    };
 
     for (const item of message.content) {
+      if (item.type === 'input_text') {
+        const text = item.text.trim();
+        if (!text) {
+          continue;
+        }
+        const previous = pendingContent?.at(-1);
+        if (previous?.type === 'input_text') {
+          previous.text = `${previous.text}\n${text}`;
+          continue;
+        }
+        pendingContent ??= [];
+        pendingContent.push({
+          type: 'input_text',
+          text
+        });
+        continue;
+      }
       if (item.type === 'input_image') {
-        items.push({
+        pendingContent ??= [];
+        pendingContent.push({
           type: 'input_image',
           image_url: item.image_url
         });
@@ -605,6 +615,7 @@ function standardInputToOpenAIResponsesInput(
       if (item.type !== 'tool_search_output') {
         continue;
       }
+      flushPendingUserMessage();
       items.push({
         type: 'tool_search_output',
         execution: item.execution,
@@ -613,6 +624,7 @@ function standardInputToOpenAIResponsesInput(
         tools: item.tools
       });
     }
+    flushPendingUserMessage();
 
     const toolResults = collectUserToolResults(message.content);
     for (const toolResult of toolResults) {
@@ -673,10 +685,32 @@ function standardInputToOpenAIResponsesInput(
   return items;
 }
 
-function collectUserImageParts(content: StandardRequestInputContent[]): string[] {
-  return content
-    .filter((item) => item.type === 'input_image')
-    .map((item) => item.image_url);
+function buildOrderedUserChatContentParts(
+  content: StandardRequestInputContent[]
+): Array<Record<string, unknown>> {
+  const parts: Array<Record<string, unknown>> = [];
+  for (const item of content) {
+    if (item.type === 'input_text') {
+      const text = item.text.trim();
+      if (!text) {
+        continue;
+      }
+      const previous = parts.at(-1);
+      if (previous?.type === 'text') {
+        previous.text = `${previous.text}\n${text}`;
+        continue;
+      }
+      parts.push({ type: 'text', text });
+      continue;
+    }
+    if (item.type === 'input_image') {
+      parts.push({
+        type: 'image_url',
+        image_url: { url: item.image_url }
+      });
+    }
+  }
+  return parts;
 }
 
 function extractStandardInputTextContent(content: StandardRequestInputContent[]): string {
