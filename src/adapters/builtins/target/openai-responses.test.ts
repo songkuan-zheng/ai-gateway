@@ -242,6 +242,119 @@ describe('openAIResponsesTargetAdapter', () => {
     ]);
   });
 
+  it('merges consecutive text blocks after trimming each block', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'A ' },
+            { type: 'input_text', text: ' B' }
+          ]
+        }
+      ]
+    } as never;
+
+    const chatBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+    expect(chatBuilt.ok).toBe(true);
+    if (!chatBuilt.ok) {
+      return;
+    }
+    const chatBody = chatBuilt.value.body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const chatUserMessage = chatBody.messages.at(-1);
+    // text-only messages keep the plain-string content shape
+    expect(chatUserMessage?.role).toBe('user');
+    expect(chatUserMessage?.content).toBe('A\nB');
+
+    const responsesBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+    expect(responsesBuilt.ok).toBe(true);
+    if (!responsesBuilt.ok) {
+      return;
+    }
+    const responsesBody = responsesBuilt.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'A\nB' }]
+      }
+    ]);
+  });
+
+  it('splits the user message around tool_search_output items in content order', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'before' },
+            { type: 'tool_search_output', call_id: 'c1', execution: 'client', tools: [] },
+            { type: 'input_text', text: 'after' }
+          ]
+        }
+      ]
+    } as never;
+
+    const responsesBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+    expect(responsesBuilt.ok).toBe(true);
+    if (!responsesBuilt.ok) {
+      return;
+    }
+    const responsesBody = responsesBuilt.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'before' }]
+      },
+      {
+        type: 'tool_search_output',
+        execution: 'client',
+        call_id: 'c1',
+        tools: []
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'after' }]
+      }
+    ]);
+  });
+
   it('preserves OpenAI server tool usage counters in standard responses', () => {
     const parsed = openAIResponsesTargetAdapter.toStandardResponse({
       id: 'resp_server_tools',
