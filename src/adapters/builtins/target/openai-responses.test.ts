@@ -7,6 +7,354 @@ import {
 } from './openai-responses';
 
 describe('openAIResponsesTargetAdapter', () => {
+  it('serializes standard input_image content for chat-completions and responses targets', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: 'What color is this image?'
+            },
+            {
+              type: 'input_image',
+              image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const chatBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(chatBuilt.ok).toBe(true);
+    if (!chatBuilt.ok) {
+      return;
+    }
+
+    const chatBody = chatBuilt.value.body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const userMessage = chatBody.messages.at(-1);
+    expect(userMessage?.role).toBe('user');
+    expect(userMessage?.content).toEqual([
+      {
+        type: 'text',
+        text: 'What color is this image?'
+      },
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+        }
+      }
+    ]);
+
+    const responsesBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(responsesBuilt.ok).toBe(true);
+    if (!responsesBuilt.ok) {
+      return;
+    }
+
+    const responsesBody = responsesBuilt.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    const inputItems = responsesBody.input;
+    // `input_image` is a message content part in the Responses schema — it
+    // must stay inside the user message, never at the top level of `input`.
+    expect(inputItems.some((item) => item.type === 'input_image')).toBe(false);
+    const responsesUserMessage = inputItems.at(-1);
+    expect(responsesUserMessage).toEqual({
+      type: 'message',
+      role: 'user',
+      content: [
+        {
+          type: 'input_text',
+          text: 'What color is this image?'
+        },
+        {
+          type: 'input_image',
+          image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+        }
+      ]
+    });
+  });
+
+  it('preserves interleaved text and image order for chat-completions and responses targets', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_image', image_url: 'https://example.test/image-1.png' },
+            { type: 'input_text', text: 'text A' },
+            { type: 'input_image', image_url: 'https://example.test/image-2.png' },
+            { type: 'input_text', text: 'text B' }
+          ]
+        }
+      ]
+    } as never;
+
+    const chatBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+    expect(chatBuilt.ok).toBe(true);
+    if (!chatBuilt.ok) {
+      return;
+    }
+    const chatBody = chatBuilt.value.body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const chatUserMessage = chatBody.messages.find((message) => message.role === 'user');
+    expect(chatUserMessage?.content).toEqual([
+      { type: 'image_url', image_url: { url: 'https://example.test/image-1.png' } },
+      { type: 'text', text: 'text A' },
+      { type: 'image_url', image_url: { url: 'https://example.test/image-2.png' } },
+      { type: 'text', text: 'text B' }
+    ]);
+
+    const responsesBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+    expect(responsesBuilt.ok).toBe(true);
+    if (!responsesBuilt.ok) {
+      return;
+    }
+    const responsesBody = responsesBuilt.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'https://example.test/image-1.png' },
+          { type: 'input_text', text: 'text A' },
+          { type: 'input_image', image_url: 'https://example.test/image-2.png' },
+          { type: 'input_text', text: 'text B' }
+        ]
+      }
+    ]);
+  });
+
+  it('serializes image-only user messages without inventing text parts', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_image', image_url: 'https://example.test/image-1.png' },
+            { type: 'input_image', image_url: 'https://example.test/image-2.png' }
+          ]
+        }
+      ]
+    } as never;
+
+    const chatBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+    expect(chatBuilt.ok).toBe(true);
+    if (!chatBuilt.ok) {
+      return;
+    }
+    const chatBody = chatBuilt.value.body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const chatUserMessage = chatBody.messages.find((message) => message.role === 'user');
+    expect(chatUserMessage?.content).toEqual([
+      { type: 'image_url', image_url: { url: 'https://example.test/image-1.png' } },
+      { type: 'image_url', image_url: { url: 'https://example.test/image-2.png' } }
+    ]);
+
+    const responsesBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+    expect(responsesBuilt.ok).toBe(true);
+    if (!responsesBuilt.ok) {
+      return;
+    }
+    const responsesBody = responsesBuilt.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'https://example.test/image-1.png' },
+          { type: 'input_image', image_url: 'https://example.test/image-2.png' }
+        ]
+      }
+    ]);
+  });
+
+  it('merges consecutive text blocks after trimming each block', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'A ' },
+            { type: 'input_text', text: ' B' }
+          ]
+        }
+      ]
+    } as never;
+
+    const chatBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+    expect(chatBuilt.ok).toBe(true);
+    if (!chatBuilt.ok) {
+      return;
+    }
+    const chatBody = chatBuilt.value.body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const chatUserMessage = chatBody.messages.at(-1);
+    // text-only messages keep the plain-string content shape
+    expect(chatUserMessage?.role).toBe('user');
+    expect(chatUserMessage?.content).toBe('A\nB');
+
+    const responsesBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+    expect(responsesBuilt.ok).toBe(true);
+    if (!responsesBuilt.ok) {
+      return;
+    }
+    const responsesBody = responsesBuilt.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'A\nB' }]
+      }
+    ]);
+  });
+
+  it('splits the user message around tool_search_output items in content order', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'before' },
+            { type: 'tool_search_output', call_id: 'c1', execution: 'client', tools: [] },
+            { type: 'input_text', text: 'after' }
+          ]
+        }
+      ]
+    } as never;
+
+    const responsesBuilt = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+    expect(responsesBuilt.ok).toBe(true);
+    if (!responsesBuilt.ok) {
+      return;
+    }
+    const responsesBody = responsesBuilt.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'before' }]
+      },
+      {
+        type: 'tool_search_output',
+        execution: 'client',
+        call_id: 'c1',
+        tools: []
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'after' }]
+      }
+    ]);
+  });
+
   it('preserves OpenAI server tool usage counters in standard responses', () => {
     const parsed = openAIResponsesTargetAdapter.toStandardResponse({
       id: 'resp_server_tools',

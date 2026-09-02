@@ -320,6 +320,73 @@ describe('parseOpenAIResponsesRequest', () => {
 });
 
 describe('parseAnthropicMessagesRequest', () => {
+  it('converts anthropic image blocks into standard input_image content', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'What color is this image?'
+            },
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: 'iVBORw0KGgoAAAANSUhEUg=='
+              }
+            },
+            {
+              type: 'image',
+              source: {
+                type: 'url',
+                url: 'https://example.test/pixel.png'
+              }
+            },
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: null
+              }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'What color is this image?'
+          },
+          {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+          },
+          {
+            type: 'input_image',
+            image_url: 'https://example.test/pixel.png'
+          }
+        ]
+      }
+    ]);
+  });
+
   it('parses thinking blocks into standard reasoning content', () => {
     const result = parseAnthropicMessagesRequest({
       model: 'claude-sonnet-4-5',
