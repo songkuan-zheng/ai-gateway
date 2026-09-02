@@ -2159,6 +2159,148 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('does not duplicate a named provider base url that the target adapter already used', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json'
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-versioned', 'openai_chat_completions', ['glm-5']);
+    provider.baseurl = 'https://vendor.example/api';
+    const config = createConfig([provider]);
+    const runtime = createGatewayRuntime(config);
+    runtime.targetAdapters.register(
+      createFixedOpenAITargetAdapter('https://vendor.example/api/v1/chat/completions?trace=1'),
+      { overwrite: true }
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-versioned'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://vendor.example/api/v1/chat/completions?trace=1');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not duplicate nested provider base paths when both bases match the adapter url', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json'
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-versioned', 'openai_chat_completions', ['glm-5']);
+    provider.baseurl = 'https://vendor.example/api/v1';
+    const config = createConfig([provider]);
+    config.openaiBaseUrl = 'https://vendor.example/api';
+    const runtime = createGatewayRuntime(config);
+    runtime.targetAdapters.register(
+      createFixedOpenAITargetAdapter('https://vendor.example/api/v1/chat/completions?trace=1'),
+      { overwrite: true }
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-versioned'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://vendor.example/api/v1/chat/completions?trace=1');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not treat default base path prefixes as base url descendants', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json'
+        }
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-versioned', 'openai_chat_completions', ['glm-5']);
+    provider.baseurl = 'https://vendor.example/api';
+    const config = createConfig([provider]);
+    const runtime = createGatewayRuntime(config);
+    runtime.targetAdapters.register(
+      createFixedOpenAITargetAdapter('https://api.openai.com/v10/chat/completions?trace=1'),
+      { overwrite: true }
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, runtime);
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-versioned'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://vendor.example/api/v10/chat/completions?trace=1');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('applies tenant gateway policy before upstream dispatch and falls back to an allowed provider', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
@@ -4857,6 +4999,70 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('uses Google Gemini environment fallbacks when building Gemini upstream URLs', async () => {
+    const previousGeminiApiKey = process.env.GEMINI_API_KEY;
+    const previousGoogleAiKey = process.env.GOOGLE_AI_KEY;
+    const previousGoogleApiKey = process.env.GOOGLE_API_KEY;
+    process.env.GEMINI_API_KEY = '   ';
+    process.env.GOOGLE_AI_KEY = 'google-ai-env-key';
+    delete process.env.GOOGLE_API_KEY;
+
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'int_env_key_1',
+          object: 'interaction',
+          status: 'completed',
+          model: 'gemini-2.5-flash',
+          steps: [
+            {
+              type: 'model_output',
+              content: [{ type: 'text', text: 'ok' }]
+            }
+          ]
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemini-2.5-flash'])]);
+    config.geminiApiKey = undefined;
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main'
+        },
+        payload: {
+          model: 'gemini-2.5-flash',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://generativelanguage.googleapis.com/v1beta/interactions?key=google-ai-env-key');
+    } finally {
+      await app.close();
+      restoreEnvValue('GEMINI_API_KEY', previousGeminiApiKey);
+      restoreEnvValue('GOOGLE_AI_KEY', previousGoogleAiKey);
+      restoreEnvValue('GOOGLE_API_KEY', previousGoogleApiKey);
+    }
+  });
+
   it('maps OpenAI Responses reasoning history to Gemini Interactions thought summary arrays', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
@@ -6321,6 +6527,193 @@ describe('gateway routes protocol conversion', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://zhipu.example/v1/chat/completions');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('treats google-prefixed model names as literals for explicit non-Gemini targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_google_prefixed_literal',
+          model: 'google/gemini-2.5-pro',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'ok'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('router-main', 'openai_chat_completions', [
+      'google/gemini-2.5-pro'
+    ]);
+    provider.baseurl = 'https://router.example/v1';
+    const config = createConfig([provider]);
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'router-main'
+        },
+        payload: {
+          model: 'google/gemini-2.5-pro',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://router.example/v1/chat/completions');
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.model).toBe('google/gemini-2.5-pro');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('routes google-prefixed model selectors to Gemini when no target provider is explicit', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              index: 0,
+              finishReason: 'STOP',
+              content: {
+                role: 'model',
+                parts: [{ text: 'ok' }]
+              }
+            }
+          ],
+          usageMetadata: {
+            promptTokenCount: 2,
+            candidatesTokenCount: 1,
+            totalTokenCount: 3
+          },
+          modelVersion: 'gemini-2.5-pro'
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([]);
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'google/gemini-2.5-pro',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=gemini-test-key'
+      );
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('keeps built-in OpenAI model selectors available without configured providers', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_builtin_selector',
+          model: 'gpt-4.1-mini',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'ok'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([]);
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'openai/gpt-4.1-mini',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://api.openai.com/v1/chat/completions');
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.model).toBe('gpt-4.1-mini');
     } finally {
       await app.close();
     }
@@ -12529,6 +12922,64 @@ export function createGatewayPlugin() {
     }
   });
 });
+
+function restoreEnvValue(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+    return;
+  }
+  process.env[name] = value;
+}
+
+function createFixedOpenAITargetAdapter(url: string): TargetAdapter {
+  return {
+    provider: 'openai',
+    buildRequestFromStandard(input) {
+      return {
+        ok: true,
+        value: {
+          url,
+          headers: {
+            'content-type': 'application/json',
+            authorization: 'Bearer adapter-key'
+          },
+          body: {
+            model: input.standardRequest.model,
+            input: input.standardRequest.input
+          }
+        }
+      };
+    },
+    toStandardResponse() {
+      return {
+        ok: true,
+        value: {
+          id: 'resp_fixed_target_adapter',
+          object: 'response',
+          status: 'completed',
+          model: 'glm-5',
+          output_text: 'ok',
+          output: [
+            {
+              id: 'msg_fixed_target_adapter',
+              type: 'message',
+              role: 'assistant',
+              status: 'completed',
+              content: [
+                {
+                  type: 'output_text',
+                  text: 'ok',
+                  annotations: []
+                }
+              ]
+            }
+          ],
+          usage: {}
+        }
+      };
+    }
+  };
+}
 
 function createConfig(
   providers: ProviderConfig[],

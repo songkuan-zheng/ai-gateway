@@ -2151,7 +2151,10 @@ function resolveTargetProviders(
     if (routes.length === 0) {
       return { ok: false, error: 'x-target-providers must include at least one valid provider.' };
     }
-    if (providerRefFromModel && !routes.some((route) => routeMatchesModelReference(route, providerRefFromModel))) {
+    if (
+      providerRefFromModel &&
+      !routes.some((route) => routeMatchesExplicitModelReference(route, providerRefFromModel))
+    ) {
       return { ok: false, error: `Model selector "${providerRefFromModel.raw}" conflicts with x-target-providers.` };
     }
     return {
@@ -2166,7 +2169,7 @@ function resolveTargetProviders(
     if (!route) {
       return { ok: false, error: 'x-target-provider must be a configured provider type or provider name.' };
     }
-    if (providerRefFromModel && !routeMatchesModelReference(route, providerRefFromModel)) {
+    if (providerRefFromModel && !routeMatchesExplicitModelReference(route, providerRefFromModel)) {
       return { ok: false, error: `Model selector "${providerRefFromModel.raw}" conflicts with x-target-provider.` };
     }
     return {
@@ -2281,12 +2284,14 @@ function expandEndpointProviderRoutes(
     return routes;
   }
 
-  const parsedModel = parseModelReference(requestModel, providerConfigs);
-  const model = parsedModel?.model;
   const expanded = routes.flatMap((route) => {
     if (route.providerConfig) {
       return [route];
     }
+
+    const model = parseModelReference(requestModel, providerConfigs, {
+      googleAsLiteral: route.provider !== 'gemini'
+    })?.model;
 
     const candidates = resolveEndpointProviderConfigs(
       providerConfigs,
@@ -2363,7 +2368,11 @@ function resolveTargetModel(
   config: GatewayConfig,
   endpoint: OpenAIJsonEndpointConfig
 ): { ok: true; value: string | undefined } | { ok: false; error: string } {
-  const fromHeader = parseModelReference(readHeader(request.headers['x-target-model']), config.providers);
+  const fromHeader = parseModelReference(
+    readHeader(request.headers['x-target-model']),
+    config.providers,
+    { googleAsLiteral: target.provider !== 'gemini' }
+  );
   if (fromHeader) {
     const referenceModel = endpoint.video?.reference?.model;
     if (referenceModel && fromHeader.model !== referenceModel) {
@@ -2381,7 +2390,9 @@ function resolveTargetModel(
     return validateModelForTarget(fromHeader.model, target, config);
   }
 
-  const fromBody = parseModelReference(bodyModel, config.providers);
+  const fromBody = parseModelReference(bodyModel, config.providers, {
+    googleAsLiteral: target.provider !== 'gemini'
+  });
   if (fromBody) {
     if (fromBody.provider && !routeMatchesModelReference(target, fromBody)) {
       return {
@@ -2561,7 +2572,8 @@ function parseProviderRoute(
 
 function parseModelReference(
   value: string | undefined,
-  providerConfigs: ProviderConfig[]
+  providerConfigs: ProviderConfig[],
+  options: { googleAsLiteral?: boolean } = {}
 ): ParsedModelReference | undefined {
   const raw = value?.trim();
   if (!raw) {
@@ -2583,6 +2595,10 @@ function parseModelReference(
       provider: providerFromProviderType(providerConfig.type),
       providerConfig
     };
+  }
+
+  if (options.googleAsLiteral === true && providerHint.toLowerCase() === 'google') {
+    return { raw, model: raw };
   }
 
   const provider = parseConfiguredModelReferenceProvider(providerHint, providerConfigs);
@@ -2637,6 +2653,26 @@ function routeMatchesModelReference(route: TargetProviderRoute, reference: Parse
   }
 
   return route.provider === reference.provider;
+}
+
+function routeMatchesExplicitModelReference(
+  route: TargetProviderRoute,
+  reference: ParsedModelReference
+): boolean {
+  if (routeMatchesModelReference(route, reference)) {
+    return true;
+  }
+
+  return route.provider !== 'gemini' && isUnconfiguredGoogleModelReference(reference);
+}
+
+function isUnconfiguredGoogleModelReference(reference: ParsedModelReference): boolean {
+  if (reference.providerConfig || reference.provider !== 'gemini') {
+    return false;
+  }
+
+  const slashIndex = reference.raw.indexOf('/');
+  return slashIndex > 0 && reference.raw.slice(0, slashIndex).trim().toLowerCase() === 'google';
 }
 
 function routeFromModelReference(reference: ParsedModelReference): TargetProviderRoute {

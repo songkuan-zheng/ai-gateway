@@ -6125,7 +6125,10 @@ function resolveTargetProviders(
       };
     }
 
-    if (providerRefFromModel && !fromHeaderList.some((route) => routeMatchesModelReference(route, providerRefFromModel))) {
+    if (
+      providerRefFromModel &&
+      !fromHeaderList.some((route) => routeMatchesExplicitModelReference(route, providerRefFromModel))
+    ) {
       return {
         ok: false,
         error: `Model selector "${providerRefFromModel.raw}" conflicts with x-target-providers.`
@@ -6145,7 +6148,7 @@ function resolveTargetProviders(
       };
     }
 
-    if (providerRefFromModel && !routeMatchesModelReference(fromHeader, providerRefFromModel)) {
+    if (providerRefFromModel && !routeMatchesExplicitModelReference(fromHeader, providerRefFromModel)) {
       return {
         ok: false,
         error: `Model selector "${providerRefFromModel.raw}" conflicts with x-target-provider.`
@@ -6201,7 +6204,11 @@ function resolveTargetModel(
   bodyModel: string | undefined,
   config: GatewayConfig
 ): { ok: true; value: string | undefined } | { ok: false; error: string } {
-  const fromHeader = parseModelReference(readHeader(request.headers['x-target-model']), config.providers);
+  const fromHeader = parseModelReference(
+    readHeader(request.headers['x-target-model']),
+    config.providers,
+    { googleAsLiteral: target.provider !== 'gemini' }
+  );
   if (fromHeader) {
     if (fromHeader.provider && !routeMatchesModelReference(target, fromHeader)) {
       return {
@@ -6213,7 +6220,9 @@ function resolveTargetModel(
     return validateModelForTarget(fromHeader.model, target, config);
   }
 
-  const fromBody = parseModelReference(bodyModel, config.providers);
+  const fromBody = parseModelReference(bodyModel, config.providers, {
+    googleAsLiteral: target.provider !== 'gemini'
+  });
   if (fromBody) {
     if (fromBody.provider && !routeMatchesModelReference(target, fromBody)) {
       return {
@@ -6421,6 +6430,26 @@ function routeMatchesModelReference(route: TargetProviderRoute, reference: Parse
   return route.provider === reference.provider;
 }
 
+function routeMatchesExplicitModelReference(
+  route: TargetProviderRoute,
+  reference: ParsedModelReference
+): boolean {
+  if (routeMatchesModelReference(route, reference)) {
+    return true;
+  }
+
+  return route.provider !== 'gemini' && isUnconfiguredGoogleModelReference(reference);
+}
+
+function isUnconfiguredGoogleModelReference(reference: ParsedModelReference): boolean {
+  if (reference.providerConfig || reference.provider !== 'gemini') {
+    return false;
+  }
+
+  const slashIndex = reference.raw.indexOf('/');
+  return slashIndex > 0 && reference.raw.slice(0, slashIndex).trim().toLowerCase() === 'google';
+}
+
 function routeFromModelReference(reference: ParsedModelReference): TargetProviderRoute {
   return {
     provider: reference.provider as Provider,
@@ -6434,7 +6463,8 @@ function formatTargetProviderLabel(route: TargetProviderRoute): string {
 
 function parseModelReference(
   value: string | undefined,
-  providerConfigs: ProviderConfig[]
+  providerConfigs: ProviderConfig[],
+  options: { googleAsLiteral?: boolean } = {}
 ): ParsedModelReference | undefined {
   if (!value) {
     return undefined;
@@ -6469,6 +6499,13 @@ function parseModelReference(
       model,
       provider: providerFromProviderType(providerConfig.type),
       providerConfig
+    };
+  }
+
+  if (options.googleAsLiteral === true && providerHint.toLowerCase() === 'google') {
+    return {
+      raw,
+      model: raw
     };
   }
 
@@ -8822,20 +8859,90 @@ function overrideUpstreamBaseUrl(
     return url;
   }
 
-  if (url.startsWith(defaultBaseUrl)) {
-    return `${overriddenBaseUrl}${url.slice(defaultBaseUrl.length)}`;
-  }
-
   try {
     const parsedUrl = new URL(url);
+    const parsedDefaultBase = new URL(defaultBaseUrl);
     const parsedOverrideBase = new URL(overriddenBaseUrl);
-    const overridePath = trimRightSlash(parsedOverrideBase.pathname);
-    parsedOverrideBase.pathname = `${overridePath}${parsedUrl.pathname}`;
-    parsedOverrideBase.search = parsedUrl.search;
-    return parsedOverrideBase.toString();
+    const matchesDefaultBase = isUrlUnderBaseUrl(parsedUrl, parsedDefaultBase);
+    const matchesOverrideBase = isUrlUnderBaseUrl(parsedUrl, parsedOverrideBase);
+
+    if (
+      matchesOverrideBase &&
+      (!matchesDefaultBase || isMoreSpecificBaseUrl(parsedOverrideBase, parsedDefaultBase))
+    ) {
+      return parsedUrl.toString();
+    }
+
+    if (matchesDefaultBase) {
+      return rewriteUrlToBase(
+        parsedUrl,
+        parsedOverrideBase,
+        suffixPathForBase(parsedUrl.pathname, parsedDefaultBase.pathname)
+      );
+    }
+
+    if (matchesOverrideBase) {
+      return parsedUrl.toString();
+    }
+
+    return rewriteUrlToBase(parsedUrl, parsedOverrideBase, parsedUrl.pathname);
   } catch {
     return url;
   }
+}
+
+function isMoreSpecificBaseUrl(candidate: URL, other: URL): boolean {
+  return normalizeBasePath(candidate.pathname).length > normalizeBasePath(other.pathname).length;
+}
+
+function isUrlUnderBaseUrl(url: URL, baseUrl: URL): boolean {
+  if (url.origin !== baseUrl.origin) {
+    return false;
+  }
+
+  const basePath = normalizeBasePath(baseUrl.pathname);
+  if (!basePath) {
+    return true;
+  }
+
+  return url.pathname === basePath || url.pathname.startsWith(`${basePath}/`);
+}
+
+function suffixPathForBase(pathname: string, basePathname: string): string {
+  const basePath = normalizeBasePath(basePathname);
+  if (!basePath) {
+    return pathname;
+  }
+
+  return pathname === basePath ? '' : pathname.slice(basePath.length);
+}
+
+function rewriteUrlToBase(url: URL, baseUrl: URL, suffixPath: string): string {
+  const rewritten = new URL(baseUrl.toString());
+  rewritten.pathname = joinBasePath(baseUrl.pathname, suffixPath);
+  rewritten.search = url.search;
+  rewritten.hash = url.hash;
+  return rewritten.toString();
+}
+
+function joinBasePath(basePathname: string, suffixPath: string): string {
+  const basePath = normalizeBasePath(basePathname);
+  const suffix = suffixPath ? (suffixPath.startsWith('/') ? suffixPath : `/${suffixPath}`) : '';
+
+  if (!basePath) {
+    return suffix || '/';
+  }
+
+  if (!suffix || suffix === '/') {
+    return basePath;
+  }
+
+  return `${basePath}${suffix}`;
+}
+
+function normalizeBasePath(pathname: string): string {
+  const normalized = trimRightSlash(pathname);
+  return normalized === '/' ? '' : normalized;
 }
 
 function providerBaseUrlForType(provider: Provider, config: GatewayConfig): string | undefined {

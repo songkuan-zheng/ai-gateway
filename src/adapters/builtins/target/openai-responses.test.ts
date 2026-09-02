@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { formatAnthropicMessagesResponse } from '../source/formatters';
-import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../source/parsers';
+import {
+  parseAnthropicMessagesRequest,
+  parseOpenAIChatCompletionsRequest,
+  parseOpenAIResponsesRequest
+} from '../source/parsers';
 import {
   buildOpenAIResponsesBodyFromStandardRequest,
   openAIResponsesTargetAdapter
@@ -681,6 +685,82 @@ describe('openAIResponsesTargetAdapter', () => {
       role: 'assistant',
       content: [{ type: 'output_text', text: 'done' }]
     });
+  });
+
+  it('replays indexed chat reasoning_details as separate Responses reasoning items', () => {
+    const parsed = parseOpenAIChatCompletionsRequest({
+      model: 'gpt-5.6-sol',
+      messages: [
+        {
+          role: 'assistant',
+          content: '',
+          reasoning_content: 'visible reasoning summary',
+          reasoning_details: [
+            {
+              type: 'reasoning.encrypted',
+              data: 'encrypted-reasoning-1',
+              id: 'rs_reasoning_1',
+              format: 'openai-responses-v1',
+              index: 0
+            },
+            {
+              type: 'reasoning.encrypted',
+              data: 'encrypted-reasoning-2',
+              id: 'rs_reasoning_2',
+              format: 'openai-responses-v1',
+              index: 1
+            }
+          ]
+        },
+        {
+          role: 'user',
+          content: 'continue'
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const body = buildOpenAIResponsesBodyFromStandardRequest(parsed.value, {
+      name: 'codex-api',
+      type: 'openai_responses',
+      models: ['gpt-5.6-sol']
+    } as never);
+    const input = body.input as Array<Record<string, unknown>>;
+
+    expect(input.slice(0, 3)).toEqual([
+      {
+        type: 'reasoning',
+        id: 'rs_reasoning_1',
+        summary: [],
+        content: [
+          {
+            type: 'reasoning_text',
+            text: 'visible reasoning summary'
+          }
+        ],
+        encrypted_content: 'encrypted-reasoning-1'
+      },
+      {
+        type: 'reasoning',
+        id: 'rs_reasoning_2',
+        summary: [],
+        encrypted_content: 'encrypted-reasoning-2'
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'continue'
+          }
+        ]
+      }
+    ]);
   });
 
   it('keeps supported reasoning efforts and selects the closest supported fallback', () => {

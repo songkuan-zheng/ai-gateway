@@ -487,33 +487,12 @@ function standardInputToOpenAIResponsesInput(
 
     if (message.role === 'assistant') {
       const text = extractStandardInputTextContent(message.content);
-      const reasoning = collectAssistantReasoning(message.content);
-      const replayableEncryptedContent =
-        reasoning?.encrypted_content && reasoning.id ? reasoning.encrypted_content : undefined;
-      if (reasoning && (reasoning.text || reasoning.summary || replayableEncryptedContent)) {
-        items.push({
-          type: 'reasoning',
-          id: reasoning.id || `rs_${randomUUID().replace(/-/g, '')}`,
-          summary: reasoning.summary
-            ? [
-                {
-                  type: 'summary_text',
-                  text: reasoning.summary
-                }
-              ]
-            : [],
-          ...(reasoning.text
-            ? {
-                content: [
-                  {
-                    type: 'reasoning_text',
-                    text: reasoning.text
-                  }
-                ]
-              }
-            : {}),
-          ...(replayableEncryptedContent ? { encrypted_content: replayableEncryptedContent } : {})
-        });
+      const reasoningItems = collectAssistantReasoningItemsForOpenAIResponses(message.content);
+      for (const reasoning of reasoningItems) {
+        const reasoningInputItem = buildOpenAIResponsesReasoningInputItem(reasoning);
+        if (reasoningInputItem) {
+          items.push(reasoningInputItem);
+        }
       }
 
       if (text) {
@@ -683,6 +662,166 @@ function standardInputToOpenAIResponsesInput(
   }
 
   return items;
+}
+
+interface AssistantReasoningState {
+  id?: string;
+  text?: string;
+  summary?: string;
+  encrypted_content?: string;
+}
+
+function buildOpenAIResponsesReasoningInputItem(
+  reasoning: AssistantReasoningState
+): Record<string, unknown> | undefined {
+  const replayableEncryptedContent =
+    reasoning.encrypted_content && reasoning.id ? reasoning.encrypted_content : undefined;
+  if (!reasoning.text && !reasoning.summary && !replayableEncryptedContent) {
+    return undefined;
+  }
+
+  return {
+    type: 'reasoning',
+    id: reasoning.id || `rs_${randomUUID().replace(/-/g, '')}`,
+    summary: reasoning.summary
+      ? [
+          {
+            type: 'summary_text',
+            text: reasoning.summary
+          }
+        ]
+      : [],
+    ...(reasoning.text
+      ? {
+          content: [
+            {
+              type: 'reasoning_text',
+              text: reasoning.text
+            }
+          ]
+        }
+      : {}),
+    ...(replayableEncryptedContent ? { encrypted_content: replayableEncryptedContent } : {})
+  };
+}
+
+function collectAssistantReasoningItemsForOpenAIResponses(
+  content: StandardRequestInputContent[]
+): AssistantReasoningState[] {
+  const reasoningItems = content.filter((item) => item.type === 'reasoning');
+  const collected: AssistantReasoningState[] = [];
+
+  for (const item of reasoningItems) {
+    const splitItems = collectOpenAIResponsesReasoningDetails(item);
+    if (splitItems.length > 0) {
+      const text = normalizeOptionalText(item.text);
+      const summary = normalizeOptionalText(item.summary);
+      if (text && !splitItems.some((splitItem) => splitItem.text)) {
+        splitItems[0].text = text;
+      }
+      if (summary && !splitItems.some((splitItem) => splitItem.summary)) {
+        splitItems[0].summary = summary;
+      }
+      collected.push(...splitItems);
+      continue;
+    }
+
+    const normalized = normalizeAssistantReasoningState(item);
+    if (normalized) {
+      collected.push(normalized);
+    }
+  }
+
+  return collected;
+}
+
+function collectOpenAIResponsesReasoningDetails(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): AssistantReasoningState[] {
+  if (!Array.isArray(item.reasoning_details)) {
+    return [];
+  }
+
+  const collected: AssistantReasoningState[] = [];
+  const byId = new Map<string, AssistantReasoningState>();
+  for (const detail of item.reasoning_details) {
+    if (!isObject(detail) || asString(detail.format) !== 'openai-responses-v1') {
+      continue;
+    }
+
+    const id = normalizeOptionalText(asString(detail.id) || item.id);
+    if (!id) {
+      continue;
+    }
+
+    let reasoning = byId.get(id);
+    if (!reasoning) {
+      reasoning = { id };
+      byId.set(id, reasoning);
+      collected.push(reasoning);
+    }
+
+    const type = asString(detail.type);
+    const text = normalizeOptionalText(
+      asString(detail.text) || asString(detail.reasoning) || asString(detail.thinking)
+    );
+    const summary = normalizeOptionalText(asString(detail.summary));
+    const encryptedContent = asString(detail.encrypted_content) || asString(detail.data);
+
+    if (type === 'reasoning.summary' || (summary && !text)) {
+      reasoning.summary = mergeReasoningText(reasoning.summary, summary || text);
+      continue;
+    }
+
+    if (text) {
+      reasoning.text = mergeReasoningText(reasoning.text, text);
+    }
+    if (encryptedContent && !reasoning.encrypted_content) {
+      reasoning.encrypted_content = encryptedContent;
+    }
+  }
+
+  return collected;
+}
+
+function normalizeAssistantReasoningState(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): AssistantReasoningState | undefined {
+  const text = normalizeOptionalText(item.text);
+  const summary = normalizeOptionalText(item.summary);
+  const encryptedContent = asString(item.encrypted_content);
+  if (!text && !summary && !encryptedContent) {
+    return undefined;
+  }
+
+  return {
+    ...(item.id ? { id: item.id } : {}),
+    ...(text ? { text } : {}),
+    ...(summary ? { summary } : {}),
+    ...(encryptedContent ? { encrypted_content: encryptedContent } : {})
+  };
+}
+
+function mergeReasoningText(existing: string | undefined, next: string | undefined): string | undefined {
+  const normalizedNext = normalizeOptionalText(next);
+  if (!normalizedNext) {
+    return existing;
+  }
+
+  const normalizedExisting = normalizeOptionalText(existing);
+  if (!normalizedExisting) {
+    return normalizedNext;
+  }
+
+  if (normalizedExisting === normalizedNext) {
+    return normalizedExisting;
+  }
+
+  return `${normalizedExisting}\n${normalizedNext}`;
+}
+
+function normalizeOptionalText(value: unknown): string | undefined {
+  return typeof value === 'string' ? value.trim() || undefined : undefined;
 }
 
 function buildOrderedUserChatContentParts(

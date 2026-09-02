@@ -52,6 +52,21 @@ export function parseProviderList(value: string | undefined): Provider[] {
   return deduped;
 }
 
+export function readFirstNonEmptyString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== 'string') {
+      continue;
+    }
+
+    const normalized = value.trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return undefined;
+}
+
 export function providerFromProviderType(type: ProviderType): Provider {
   if (
     type === 'openai_chat_completions' ||

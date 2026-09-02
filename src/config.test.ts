@@ -100,6 +100,10 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_IDEMPOTENCY_REDIS_CONNECT_TIMEOUT_SECONDS;
     delete process.env.GATEWAY_IDEMPOTENCY_REDIS_COMMAND_TIMEOUT_MS;
     delete process.env.GATEWAY_IDEMPOTENCY_REDIS_COMMAND_TIMEOUT_SECONDS;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.GOOGLE_AI_KEY;
+    delete process.env.GOOGLE_API_KEY;
+    delete process.env.TEST_PROVIDER_API_KEY;
     delete process.env.GATEWAY_PUBLIC_BASE_URL;
     delete process.env.GATEWAY_VIDEO_ID_SIGNING_SECRET;
     delete process.env.GATEWAY_VIDEO_ID_TTL_MS;
@@ -498,6 +502,26 @@ describe('Gateway config providerPlugins', () => {
       'gemini_interactions',
       'gemini_interactions'
     ]);
+  });
+
+  it('uses non-empty Google Gemini environment fallbacks when GEMINI_API_KEY is empty', () => {
+    process.env.GEMINI_API_KEY = '   ';
+    process.env.GOOGLE_AI_KEY = 'google-ai-secret';
+    process.env.GOOGLE_API_KEY = 'google-api-secret';
+
+    const config = parseGatewayConfigFromRaw({});
+
+    expect(config.geminiApiKey).toBe('google-ai-secret');
+  });
+
+  it('uses GOOGLE_API_KEY when higher-priority Gemini environment keys are empty', () => {
+    process.env.GEMINI_API_KEY = '';
+    process.env.GOOGLE_AI_KEY = ' \t ';
+    process.env.GOOGLE_API_KEY = 'google-api-secret';
+
+    const config = parseGatewayConfigFromRaw({});
+
+    expect(config.geminiApiKey).toBe('google-api-secret');
   });
 
   it('parses OpenAI and xAI video provider protocol types', () => {

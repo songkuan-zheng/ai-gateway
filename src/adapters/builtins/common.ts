@@ -1,7 +1,7 @@
 import type { FastifyRequest } from 'fastify';
 import type { GatewayConfig, HeaderBag, Result } from '../../types';
 import { err, ok } from '../../types';
-import { asNumber, isObject, readBearerToken, readHeader } from '../../utils';
+import { asNumber, isObject, readBearerToken, readFirstNonEmptyString, readHeader } from '../../utils';
 
 const defaultAnthropicVersion = '2023-06-01';
 const geminiPassthroughQueryParams = new Set(['alt', 'fields', 'prettyPrint', 'quotaUser', 'userIp']);
@@ -96,8 +96,13 @@ export function buildGeminiUrl(
   const incomingQuery = new URLSearchParams(incomingUrl.search);
   const query = new URLSearchParams();
 
-  const keyFromQuery = incomingQuery.get('key');
-  const key = keyFromQuery || config.geminiApiKey || process.env.GEMINI_API_KEY;
+  const key = readFirstNonEmptyString(
+    incomingQuery.get('key'),
+    config.geminiApiKey,
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_AI_KEY,
+    process.env.GOOGLE_API_KEY
+  );
   if (!key) {
     return err('GEMINI_API_KEY is missing.');
   }
@@ -123,8 +128,13 @@ export function buildGeminiInteractionsUrl(
   const incomingQuery = new URLSearchParams(incomingUrl.search);
   const query = new URLSearchParams();
 
-  const keyFromQuery = incomingQuery.get('key');
-  const key = keyFromQuery || config.geminiApiKey || process.env.GEMINI_API_KEY;
+  const key = readFirstNonEmptyString(
+    incomingQuery.get('key'),
+    config.geminiApiKey,
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_AI_KEY,
+    process.env.GOOGLE_API_KEY
+  );
   if (!key) {
     return err('GEMINI_API_KEY is missing.');
   }

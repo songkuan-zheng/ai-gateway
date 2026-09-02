@@ -1,5 +1,5 @@
 import type { GatewayConfig, Provider, ProviderConfig } from '../types';
-import { providerFromProviderType, trimTrailingSlash } from '../utils';
+import { providerFromProviderType, readFirstNonEmptyString, trimTrailingSlash } from '../utils';
 import { recordProviderHealthFailure, recordProviderHealthResponse } from './provider-health';
 
 export interface ProviderHealthCheckResult {
@@ -145,7 +145,13 @@ function buildHealthCheckRequest(
     };
   }
 
-  const apiKey = providerConfig.apikey || config.geminiApiKey || process.env.GEMINI_API_KEY;
+  const apiKey = readFirstNonEmptyString(
+    providerConfig.apikey,
+    config.geminiApiKey,
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_AI_KEY,
+    process.env.GOOGLE_API_KEY
+  );
   if (!apiKey) {
     return { ok: false, error: 'GEMINI_API_KEY is missing.' };
   }

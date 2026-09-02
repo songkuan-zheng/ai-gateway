@@ -6,7 +6,7 @@ import type {
 } from '../types';
 import { parseSseChunks } from '../sse';
 import { callUpstream, readUpstreamPayload, type UpstreamCallLogContext } from '../upstream/client';
-import { asString, isObject } from '../utils';
+import { asString, isObject, readFirstNonEmptyString } from '../utils';
 import type { ProviderRoute } from './provider-router';
 import type { AgentModelOutput, AgentModelStreamChunk, AgentRuntimeLogger, AgentToolDefinition } from './types';
 
@@ -256,7 +256,13 @@ function buildGeminiRequest(
     return { ok: false, error: 'gemini model is missing' };
   }
 
-  const apiKey = providerConfig?.apikey || config.geminiApiKey || process.env.GEMINI_API_KEY;
+  const apiKey = readFirstNonEmptyString(
+    providerConfig?.apikey,
+    config.geminiApiKey,
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_AI_KEY,
+    process.env.GOOGLE_API_KEY
+  );
   if (!apiKey) {
     return { ok: false, error: 'GEMINI_API_KEY is missing' };
   }

@@ -6,7 +6,8 @@ import {
   isObject,
   parseProvider,
   parseProviderList,
-  providerFromProviderType
+  providerFromProviderType,
+  readFirstNonEmptyString
 } from '../utils';
 import {
   parseGatewayPluginsFromRaw,
@@ -313,7 +314,11 @@ function syncProviderDerivedFields(
     nextAnthropic?.apikey
   );
   config.geminiApiKey = deriveProviderCredentialValue(
-    process.env.GEMINI_API_KEY,
+    readFirstNonEmptyString(
+      process.env.GEMINI_API_KEY,
+      process.env.GOOGLE_AI_KEY,
+      process.env.GOOGLE_API_KEY
+    ),
     config.geminiApiKey,
     previousGemini?.apikey,
     nextGemini?.apikey

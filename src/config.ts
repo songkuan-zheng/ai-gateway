@@ -94,6 +94,7 @@ import {
   parseProvider,
   parseProviderList,
   providerFromProviderType,
+  readFirstNonEmptyString,
   trimTrailingSlash
 } from './utils';
 
@@ -1157,7 +1158,11 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
       anthropicProviderConfig?.apikey ||
       readString(jsonConfig.anthropicApiKey),
     geminiApiKey:
-      readString(process.env.GEMINI_API_KEY) ||
+      readFirstNonEmptyString(
+        process.env.GEMINI_API_KEY,
+        process.env.GOOGLE_AI_KEY,
+        process.env.GOOGLE_API_KEY
+      ) ||
       geminiProviderConfig?.apikey ||
       readString(jsonConfig.geminiApiKey),
     openaiBaseUrl: trimTrailingSlash(
