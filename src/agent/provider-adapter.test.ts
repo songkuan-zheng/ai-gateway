@@ -162,6 +162,51 @@ describe('parseProviderStreamChunks', () => {
 });
 
 describe('buildProviderRequest', () => {
+  it('keeps extraHeaders when byModel is omitted on providerConfig', () => {
+    const config = {
+      openaiApiKey: 'provider-openai-key',
+      defaultOpenAIModel: 'gpt-4o-mini'
+    } as unknown as GatewayConfig;
+
+    const prepared = buildProviderRequest(
+      {
+        provider: 'openai',
+        providerConfig: {
+          name: 'openai-main',
+          type: 'openai',
+          apikey: 'provider-openai-key',
+          models: ['gpt-4o-mini'],
+          // Runtime/plugin configs may omit byModel; must not TypeError.
+          extraHeaders: {
+            default: {
+              'x-custom-auth': 'Bearer scoped-token'
+            }
+          },
+          extraBody: {
+            default: {}
+          },
+          billing: {
+            byModel: {}
+          }
+        } as any
+      },
+      'system',
+      'hello',
+      [],
+      'gpt-4o-mini',
+      config,
+      'http://127.0.0.1:3000'
+    );
+
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) {
+      return;
+    }
+
+    expect(prepared.request.headers['x-custom-auth']).toBe('Bearer scoped-token');
+    expect(prepared.request.headers.authorization).toBe('Bearer provider-openai-key');
+  });
+
   it('propagates gateway identity headers for internal agent model calls', () => {
     const config = {
       openaiApiKey: 'provider-openai-key',

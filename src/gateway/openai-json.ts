@@ -3630,9 +3630,11 @@ function resolveScopedHeaders(
     return {};
   }
 
-  const modelHeaders = model ? providerConfig.extraHeaders.byModel[model] : undefined;
+  const scoped = providerConfig.extraHeaders;
+  const defaults = scoped?.default ?? {};
+  const modelHeaders = model ? scoped?.byModel?.[model] : undefined;
   return {
-    ...providerConfig.extraHeaders.default,
+    ...defaults,
     ...(modelHeaders || {})
   };
 }
@@ -3645,9 +3647,11 @@ function resolveScopedBody(
     return {};
   }
 
-  const modelBody = model ? providerConfig.extraBody.byModel[model] : undefined;
+  const scoped = providerConfig.extraBody;
+  const defaults = scoped?.default ?? {};
+  const modelBody = model ? scoped?.byModel?.[model] : undefined;
   return {
-    ...providerConfig.extraBody.default,
+    ...defaults,
     ...(modelBody || {})
   };
 }
