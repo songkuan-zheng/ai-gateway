@@ -352,6 +352,103 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('forwards Anthropic image blocks to an OpenAI-compatible vision model', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_vision',
+          model: 'qwen3.7-flash',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'The image contains a red square.'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 12,
+            completion_tokens: 8,
+            total_tokens: 20
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig(
+      'deepseek-qwen',
+      'openai_chat_completions',
+      ['qwen3.7-flash']
+    );
+    provider.baseurl = 'https://api.deepseek.com';
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, createConfig([provider]), createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01',
+          'x-target-provider': 'deepseek-qwen'
+        },
+        payload: {
+          model: 'qwen3.7-flash',
+          max_tokens: 128,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: 'What is in this image?' },
+                {
+                  type: 'image',
+                  source: {
+                    type: 'base64',
+                    media_type: 'image/png',
+                    data: 'iVBORw0KGgoAAAANSUhEUg=='
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://api.deepseek.com/chat/completions');
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.messages).toEqual([
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What is in this image?' },
+            {
+              type: 'image_url',
+              image_url: {
+                url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+              }
+            }
+          ]
+        }
+      ]);
+    } finally {
+      await app.close();
+    }
+  });
+
   it('omits Anthropic stop_sequences from OpenAI Responses upstream requests', async () => {
     let upstreamUrl = '';
     let upstreamBody: Record<string, unknown> = {};

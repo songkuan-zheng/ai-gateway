@@ -7,6 +7,106 @@ import {
 import { anthropicMessagesTargetAdapter } from './anthropic-messages';
 
 describe('anthropicMessagesTargetAdapter', () => {
+  it('rejects unsupported image references instead of sending a text-only request', () => {
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: {
+        model: 'claude-sonnet-4-5',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'Inspect this image.' },
+              { type: 'input_image', image_url: 'ftp://example.test/pixel.png' }
+            ]
+          }
+        ]
+      },
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built).toEqual({
+      ok: false,
+      error: 'Unsupported image input. Expected an HTTP(S) URL or base64 image data URL.'
+    });
+  });
+
+  it('serializes OpenAI image inputs as Anthropic image blocks without changing order', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'claude-sonnet-4-5',
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'Compare these images:' },
+            {
+              type: 'input_image',
+              image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+            },
+            { type: 'input_text', text: 'and this one:' },
+            {
+              type: 'input_image',
+              image_url: 'https://example.test/pixel.jpg'
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).messages).toEqual([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Compare these images:' },
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/png',
+              data: 'iVBORw0KGgoAAAANSUhEUg=='
+            }
+          },
+          { type: 'text', text: 'and this one:' },
+          {
+            type: 'image',
+            source: {
+              type: 'url',
+              url: 'https://example.test/pixel.jpg'
+            }
+          }
+        ]
+      }
+    ]);
+  });
+
   it('sets a default max_tokens when converted request does not provide one', () => {
     const parsed = parseOpenAIChatCompletionsRequest({
       model: 'glm-5',

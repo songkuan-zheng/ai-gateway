@@ -1,7 +1,8 @@
 import type { StandardRequestInputContent, StandardRequestInputMessage, TargetAdapter } from '../../../types';
-import { ok } from '../../../types';
+import { err, ok } from '../../../types';
 import { asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildAnthropicHeaders } from '../common';
+import { findInvalidStandardImageInput, parseStandardImageReference } from '../image-input';
 import { parseAnthropicToStandardResponse } from './shared';
 import {
   anthropicWebSearchToolType,
@@ -39,6 +40,11 @@ export const anthropicMessagesTargetAdapter: TargetAdapter = {
   providerTypes: ['anthropic_messages'],
   providerFallback: true,
   buildRequestFromStandard(input) {
+    const invalidImageUrl = findInvalidStandardImageInput(input.standardRequest.input);
+    if (invalidImageUrl !== undefined) {
+      return err('Unsupported image input. Expected an HTTP(S) URL or base64 image data URL.');
+    }
+
     const headersResult = buildAnthropicHeaders(input.request.headers, {
       ...input.config,
       anthropicApiKey: input.targetProviderConfig?.apikey || input.config.anthropicApiKey
@@ -323,6 +329,29 @@ function standardContentToAnthropicBlocks(
       blocks.push({
         type: 'text',
         text
+      });
+      continue;
+    }
+
+    if (item.type === 'input_image') {
+      const image = parseStandardImageReference(item.image_url);
+      if (!image) {
+        continue;
+      }
+
+      blocks.push({
+        type: 'image',
+        source:
+          image.type === 'base64'
+            ? {
+                type: 'base64',
+                media_type: image.mediaType,
+                data: image.data
+              }
+            : {
+                type: 'url',
+                url: image.url
+              }
       });
       continue;
     }

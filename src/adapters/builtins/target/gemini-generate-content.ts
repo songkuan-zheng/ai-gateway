@@ -14,6 +14,7 @@ import type {
 import { err, ok } from '../../../types';
 import { asBoolean, asNumber, asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildGeminiInteractionsUrl, buildGeminiUrl } from '../common';
+import { findInvalidStandardImageInput, parseStandardImageReference } from '../image-input';
 import { parseGeminiToStandardResponse } from './shared';
 import {
   appendToolReferencesToResultContent,
@@ -43,6 +44,11 @@ export const geminiGenerateContentTargetAdapter: TargetAdapter = {
   providerTypes: ['gemini_generate_content', 'gemini_interactions'],
   providerFallback: true,
   buildRequestFromStandard(input) {
+    const invalidImageUrl = findInvalidStandardImageInput(input.standardRequest.input);
+    if (invalidImageUrl !== undefined) {
+      return err('Unsupported image input. Expected an HTTP(S) URL or base64 image data URL.');
+    }
+
     if (input.targetProviderConfig?.type === 'gemini_interactions') {
       return buildGeminiInteractionsRequestFromStandard(input);
     }
@@ -234,34 +240,41 @@ function standardInputToGeminiInteractionsInput(
   const toolNamesById = new Map<string, string>();
 
   for (const message of collectStandardInputMessages(input)) {
-    const pendingText: string[] = [];
-    const flushText = () => {
-      const text = pendingText.join('\n').trim();
-      pendingText.length = 0;
-      if (!text) {
+    const pendingContent: Array<Record<string, unknown>> = [];
+    const flushContent = () => {
+      if (pendingContent.length === 0) {
         return;
       }
 
       steps.push({
         type: message.role === 'assistant' ? 'model_output' : 'user_input',
-        content: [
-          {
-            type: 'text',
-            text
-          }
-        ]
+        content: pendingContent.splice(0)
       });
     };
 
     for (const item of message.content) {
       if (item.type === 'input_text') {
-        if (item.text.trim()) {
-          pendingText.push(item.text);
+        const text = item.text.trim();
+        if (text) {
+          const previous = pendingContent.at(-1);
+          if (previous?.type === 'text') {
+            previous.text = `${previous.text}\n${text}`;
+          } else {
+            pendingContent.push({ type: 'text', text });
+          }
         }
         continue;
       }
 
-      flushText();
+      if (item.type === 'input_image') {
+        const imageContent = standardImageToGeminiInteractionContent(item.image_url);
+        if (imageContent) {
+          pendingContent.push(imageContent);
+        }
+        continue;
+      }
+
+      flushContent();
 
       if (item.type === 'reasoning' && message.role === 'assistant') {
         const summary = standardReasoningText(item);
@@ -333,7 +346,7 @@ function standardInputToGeminiInteractionsInput(
       }
     }
 
-    flushText();
+    flushContent();
   }
 
   return steps.length > 0
@@ -581,6 +594,14 @@ function standardContentToGeminiParts(
 
     flushText();
 
+    if (item.type === 'input_image') {
+      const imagePart = standardImageToGeminiPart(item.image_url);
+      if (imagePart) {
+        parts.push(imagePart);
+      }
+      continue;
+    }
+
     if (item.type === 'reasoning') {
       const reasoningPart = standardReasoningToGeminiThoughtPart(item);
       if (reasoningPart) {
@@ -690,6 +711,46 @@ function standardContentToGeminiParts(
   state.pendingThoughtPart = undefined;
 
   return parts.length > 0 ? parts : [{ text: '' }];
+}
+
+function standardImageToGeminiPart(imageUrl: string): Record<string, unknown> | undefined {
+  const image = parseStandardImageReference(imageUrl);
+  if (!image) {
+    return undefined;
+  }
+
+  return image.type === 'base64'
+    ? {
+        inlineData: {
+          mimeType: image.mediaType,
+          data: image.data
+        }
+      }
+    : {
+        fileData: {
+          fileUri: image.url
+        }
+      };
+}
+
+function standardImageToGeminiInteractionContent(
+  imageUrl: string
+): Record<string, unknown> | undefined {
+  const image = parseStandardImageReference(imageUrl);
+  if (!image) {
+    return undefined;
+  }
+
+  return image.type === 'base64'
+    ? {
+        type: 'image',
+        mime_type: image.mediaType,
+        data: image.data
+      }
+    : {
+        type: 'image',
+        uri: image.url
+      };
 }
 
 function rememberGeminiThoughtSignatures(response: StandardResponse, thoughtSignatureCacheScope: string): void {

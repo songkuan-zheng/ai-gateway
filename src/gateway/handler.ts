@@ -3983,7 +3983,10 @@ function rewriteVirtualStandardRequestMediaReferences(
     ...request,
     input: request.input.map((message) => ({
       ...message,
-      content: message.content.map((item) => rewriteVirtualStandardInputContentMediaReferences(item, references))
+      content: message.content.flatMap((item) => {
+        const rewritten = rewriteVirtualStandardInputContentMediaReferences(item, references);
+        return rewritten ? [rewritten] : [];
+      })
     }))
   };
 }
@@ -3991,7 +3994,14 @@ function rewriteVirtualStandardRequestMediaReferences(
 function rewriteVirtualStandardInputContentMediaReferences(
   item: StandardRequestInputContent,
   references: VirtualMultimodalReference[]
-): StandardRequestInputContent {
+): StandardRequestInputContent | undefined {
+  if (
+    item.type === 'input_image' &&
+    references.some((reference) => standardImageMatchesVirtualReference(item.image_url, reference))
+  ) {
+    return undefined;
+  }
+
   if (item.type === 'input_text') {
     return {
       ...item,
@@ -4014,6 +4024,22 @@ function rewriteVirtualStandardInputContentMediaReferences(
   }
 
   return item;
+}
+
+function standardImageMatchesVirtualReference(
+  imageUrl: string,
+  reference: VirtualMultimodalReference
+): boolean {
+  if (imageUrl === reference.value) {
+    return true;
+  }
+
+  const dataSeparatorIndex = imageUrl.indexOf(',');
+  return (
+    imageUrl.toLowerCase().startsWith('data:') &&
+    dataSeparatorIndex >= 0 &&
+    imageUrl.slice(dataSeparatorIndex + 1) === reference.value
+  );
 }
 
 function replaceVirtualMultimodalReferenceValue(

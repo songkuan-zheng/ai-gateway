@@ -5,6 +5,192 @@ import { parseAnthropicMessagesRequest, parseOpenAIResponsesRequest } from '../s
 import { geminiGenerateContentTargetAdapter } from './gemini-generate-content';
 
 describe('geminiGenerateContentTargetAdapter', () => {
+  it('rejects unsupported image references instead of sending a text-only request', () => {
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-flash:generateContent'
+      } as never,
+      standardRequest: {
+        model: 'gemini-2.5-flash',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'Inspect this image.' },
+              { type: 'input_image', image_url: 'ftp://example.test/pixel.png' }
+            ]
+          }
+        ]
+      },
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built).toEqual({
+      ok: false,
+      error: 'Unsupported image input. Expected an HTTP(S) URL or base64 image data URL.'
+    });
+  });
+
+  it('serializes Anthropic image blocks for Gemini GenerateContent without changing order', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'gemini-2.5-flash',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Compare these images:' },
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: 'iVBORw0KGgoAAAANSUhEUg=='
+              }
+            },
+            { type: 'text', text: 'and this one:' },
+            {
+              type: 'image',
+              source: {
+                type: 'url',
+                url: 'https://example.test/pixel.jpg'
+              }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/models/gemini-2.5-flash:generateContent'
+      } as never,
+      standardRequest: parsed.value,
+      targetProviderConfig: {
+        type: 'gemini_generate_content'
+      } as never,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).contents).toEqual([
+      {
+        role: 'user',
+        parts: [
+          { text: 'Compare these images:' },
+          {
+            inlineData: {
+              mimeType: 'image/png',
+              data: 'iVBORw0KGgoAAAANSUhEUg=='
+            }
+          },
+          { text: 'and this one:' },
+          {
+            fileData: {
+              fileUri: 'https://example.test/pixel.jpg'
+            }
+          }
+        ]
+      }
+    ]);
+  });
+
+  it('serializes Anthropic image blocks for Gemini Interactions without changing order', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'gemini-3.7-flash',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Compare these images:' },
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: 'iVBORw0KGgoAAAANSUhEUg=='
+              }
+            },
+            { type: 'text', text: 'and this one:' },
+            {
+              type: 'image',
+              source: {
+                type: 'url',
+                url: 'https://example.test/pixel.jpg'
+              }
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {},
+        url: '/v1beta/interactions'
+      } as never,
+      standardRequest: parsed.value,
+      targetProviderConfig: {
+        type: 'gemini_interactions'
+      } as never,
+      config: {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local',
+        geminiApiVersion: 'v1beta'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    expect((built.value.body as Record<string, unknown>).input).toEqual([
+      {
+        type: 'user_input',
+        content: [
+          { type: 'text', text: 'Compare these images:' },
+          {
+            type: 'image',
+            mime_type: 'image/png',
+            data: 'iVBORw0KGgoAAAANSUhEUg=='
+          },
+          { type: 'text', text: 'and this one:' },
+          {
+            type: 'image',
+            uri: 'https://example.test/pixel.jpg'
+          }
+        ]
+      }
+    ]);
+  });
+
   it('flattens OpenAI Responses namespace tools when targeting Gemini', () => {
     const parsed = parseOpenAIResponsesRequest({
       model: 'gemini-2.5-pro',

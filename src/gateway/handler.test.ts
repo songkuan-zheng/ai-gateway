@@ -766,7 +766,10 @@ describe('virtual model multimodal reference rewriting', () => {
           {
             type: 'message',
             role: 'user',
-            content: [{ type: 'input_text', text: 'inspect this image' }]
+            content: [
+              { type: 'input_text', text: 'inspect this image' },
+              { type: 'input_image', image_url: imageUrl }
+            ]
           }
         ]
       },

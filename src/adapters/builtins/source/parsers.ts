@@ -20,6 +20,7 @@ import {
   decodeOpenAIResponsesReasoningEnvelope,
   OPENAI_RESPONSES_REASONING_FORMAT
 } from '../reasoning-envelope';
+import { buildStandardImageDataUrl } from '../image-input';
 import { normalizeNamespacedToolName } from '../target/tools';
 
 export function parseOpenAIResponsesRequest(body: Record<string, unknown>): Result<StandardRequest> {
@@ -337,6 +338,21 @@ function normalizeGeminiInteractionsInput(input: unknown): Result<string | Stand
     return err('Gemini interactions request requires input.');
   }
 
+  if (input.every(isGeminiInteractionDirectContent)) {
+    const content = normalizeGeminiInteractionContent(input);
+    return ok(
+      content.length > 0
+        ? [
+            {
+              type: 'message',
+              role: 'user',
+              content
+            }
+          ]
+        : []
+    );
+  }
+
   const messages: StandardRequestInputMessage[] = [];
   const toolNamesById = new Map<string, string>();
   for (const item of input) {
@@ -369,6 +385,15 @@ function normalizeGeminiInteractionInputItem(
   }
 
   const type = asString(item.type);
+  const imageContent = normalizeGeminiInteractionImageContent(item);
+  if (imageContent) {
+    return {
+      type: 'message',
+      role: 'user',
+      content: [imageContent]
+    };
+  }
+
   if (type === 'function_call') {
     const name = asString(item.name);
     if (!name) {
@@ -525,6 +550,14 @@ function normalizeGeminiInteractionContent(content: unknown): StandardRequestInp
   const items = Array.isArray(content) ? content : content !== undefined ? [content] : [];
   const normalized: StandardRequestInputContent[] = [];
   for (const item of items) {
+    if (isObject(item) && asString(item.type) === 'image') {
+      const imageContent = normalizeGeminiInteractionImageContent(item);
+      if (imageContent) {
+        normalized.push(imageContent);
+      }
+      continue;
+    }
+
     const text = extractTextFromPart(item);
     if (text) {
       normalized.push({
@@ -546,6 +579,42 @@ function normalizeGeminiInteractionContent(content: unknown): StandardRequestInp
   }
 
   return normalized;
+}
+
+function isGeminiInteractionDirectContent(item: unknown): boolean {
+  if (typeof item === 'string') {
+    return true;
+  }
+  if (!isObject(item)) {
+    return false;
+  }
+
+  const type = asString(item.type);
+  return type === 'text' || type === 'input_text' || type === 'image';
+}
+
+function normalizeGeminiInteractionImageContent(
+  item: Record<string, unknown>
+): StandardRequestInputContent | null {
+  if (asString(item.type) !== 'image') {
+    return null;
+  }
+
+  const imageUrl = buildStandardImageDataUrl(item.data, item.mime_type ?? item.mimeType);
+  if (imageUrl) {
+    return {
+      type: 'input_image',
+      image_url: imageUrl
+    };
+  }
+
+  const uri = asString(item.uri)?.trim();
+  return uri
+    ? {
+        type: 'input_image',
+        image_url: uri
+      }
+    : null;
 }
 
 function normalizeGeminiInteractionThoughtSummary(value: unknown): string {
@@ -690,6 +759,15 @@ function normalizeResponsesInputItem(item: unknown): StandardRequestInputMessage
       type: 'message',
       role: 'user',
       content: [functionCallOutputContent]
+    };
+  }
+
+  const imageContent = normalizeOpenAIImageContent(item, 'input_image');
+  if (imageContent) {
+    return {
+      type: 'message',
+      role: 'user',
+      content: [imageContent]
     };
   }
 
@@ -848,6 +926,12 @@ function normalizeOpenAIResponsesMessageContent(
       const functionCallOutputContent = normalizeOpenAIResponsesFunctionCallOutputItem(block);
       if (functionCallOutputContent) {
         normalized.push(functionCallOutputContent);
+        continue;
+      }
+
+      const imageContent = normalizeOpenAIImageContent(block, 'input_image');
+      if (imageContent) {
+        normalized.push(imageContent);
         continue;
       }
     }
@@ -1086,13 +1170,10 @@ function extractOpenAIChatMessageContent(message: Record<string, unknown>): Stan
     return normalizeOpenAIChatToolResultMessage(message);
   }
 
-  const normalized: StandardRequestInputContent[] = [];
-  const text = extractMessageText(message.content);
-  if (text) {
-    normalized.push({ type: 'input_text', text });
-  }
+  const role = normalizeMessageRole(message.role);
+  const normalized = normalizeOpenAIChatContent(message.content, role !== 'assistant');
 
-  if (normalizeMessageRole(message.role) !== 'assistant') {
+  if (role !== 'assistant') {
     return normalized;
   }
 
@@ -1108,6 +1189,57 @@ function extractOpenAIChatMessageContent(message: Record<string, unknown>): Stan
   }
 
   return normalized;
+}
+
+function normalizeOpenAIChatContent(
+  content: unknown,
+  allowImages: boolean
+): StandardRequestInputContent[] {
+  const normalized: StandardRequestInputContent[] = [];
+  const parts = Array.isArray(content) ? content : [content];
+  for (const part of parts) {
+    if (allowImages && isObject(part)) {
+      const imageContent = normalizeOpenAIImageContent(part, 'image_url');
+      if (imageContent) {
+        normalized.push(imageContent);
+        continue;
+      }
+    }
+
+    const text = extractTextFromPart(part);
+    if (!text) {
+      continue;
+    }
+
+    const previous = normalized.at(-1);
+    if (previous?.type === 'input_text') {
+      previous.text = `${previous.text}\n${text}`;
+    } else {
+      normalized.push({ type: 'input_text', text });
+    }
+  }
+
+  return normalized;
+}
+
+function normalizeOpenAIImageContent(
+  block: Record<string, unknown>,
+  expectedType: 'image_url' | 'input_image'
+): StandardRequestInputContent | null {
+  if (asString(block.type) !== expectedType) {
+    return null;
+  }
+
+  const rawImageUrl = block.image_url;
+  const imageUrl = isObject(rawImageUrl)
+    ? asString(rawImageUrl.url)?.trim()
+    : asString(rawImageUrl)?.trim();
+  return imageUrl
+    ? {
+        type: 'input_image',
+        image_url: imageUrl
+      }
+    : null;
 }
 
 function normalizeOpenAIChatAssistantReasoning(message: Record<string, unknown>): StandardRequestInputContent | null {
@@ -1392,10 +1524,14 @@ function extractAnthropicMessageContent(
       if (!url && !data) {
         continue;
       }
-      const mediaType = asString(source?.media_type) || 'image/png';
+      const dataUrl = buildStandardImageDataUrl(data, source?.media_type);
+      const imageUrl = url || dataUrl;
+      if (!imageUrl) {
+        continue;
+      }
       normalized.push({
         type: 'input_image',
-        image_url: url || `data:${mediaType};base64,${data}`
+        image_url: imageUrl
       });
       continue;
     }
@@ -1585,6 +1721,12 @@ function extractGeminiMessageContent(
       continue;
     }
 
+    const imageContent = normalizeGeminiGenerateContentImagePart(part);
+    if (imageContent && role === 'user') {
+      normalized.push(imageContent);
+      continue;
+    }
+
     const functionCall = readGeminiFunctionCall(part);
     if (functionCall && role === 'assistant') {
       const name = asString(functionCall.name);
@@ -1665,6 +1807,41 @@ function extractGeminiMessageContent(
   }
 
   return normalized;
+}
+
+function normalizeGeminiGenerateContentImagePart(
+  part: Record<string, unknown>
+): StandardRequestInputContent | null {
+  const inlineData = isObject(part.inlineData)
+    ? part.inlineData
+    : isObject(part.inline_data)
+      ? part.inline_data
+      : undefined;
+  if (inlineData) {
+    const imageUrl = buildStandardImageDataUrl(
+      inlineData.data,
+      inlineData.mimeType ?? inlineData.mime_type
+    );
+    return imageUrl
+      ? {
+          type: 'input_image',
+          image_url: imageUrl
+        }
+      : null;
+  }
+
+  const fileData = isObject(part.fileData)
+    ? part.fileData
+    : isObject(part.file_data)
+      ? part.file_data
+      : undefined;
+  const fileUri = asString(fileData?.fileUri ?? fileData?.file_uri)?.trim();
+  return fileUri
+    ? {
+        type: 'input_image',
+        image_url: fileUri
+      }
+    : null;
 }
 
 function normalizeGeminiThoughtPart(

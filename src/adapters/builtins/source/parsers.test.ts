@@ -2,11 +2,60 @@ import { describe, expect, it } from 'vitest';
 import {
   parseAnthropicMessagesRequest,
   parseGeminiGenerateContentRequest,
+  parseGeminiInteractionsRequest,
   parseOpenAIChatCompletionsRequest,
   parseOpenAIResponsesRequest
 } from './parsers';
 
 describe('parseOpenAIResponsesRequest', () => {
+  it('preserves image content and its order within user messages', () => {
+    const result = parseOpenAIResponsesRequest({
+      model: 'gpt-4.1-mini',
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'Compare these images:' },
+            {
+              type: 'input_image',
+              image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+            },
+            { type: 'input_text', text: 'and this one:' },
+            {
+              type: 'input_image',
+              image_url: 'https://example.test/pixel.jpg'
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Compare these images:' },
+          {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+          },
+          { type: 'input_text', text: 'and this one:' },
+          {
+            type: 'input_image',
+            image_url: 'https://example.test/pixel.jpg'
+          }
+        ]
+      }
+    ]);
+  });
+
   it('parses function_call_output as tool_result content', () => {
     const result = parseOpenAIResponsesRequest({
       input: {
@@ -553,6 +602,55 @@ describe('parseAnthropicMessagesRequest', () => {
 });
 
 describe('parseOpenAIChatCompletionsRequest', () => {
+  it('preserves image_url content and its order within user messages', () => {
+    const result = parseOpenAIChatCompletionsRequest({
+      model: 'gpt-4.1-mini',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Compare these images:' },
+            {
+              type: 'image_url',
+              image_url: {
+                url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+              }
+            },
+            { type: 'text', text: 'and this one:' },
+            {
+              type: 'image_url',
+              image_url: 'https://example.test/pixel.jpg'
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Compare these images:' },
+          {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+          },
+          { type: 'input_text', text: 'and this one:' },
+          {
+            type: 'input_image',
+            image_url: 'https://example.test/pixel.jpg'
+          }
+        ]
+      }
+    ]);
+  });
+
   it('keeps reasoning_split and de-duplicates equivalent chat reasoning fields', () => {
     const result = parseOpenAIChatCompletionsRequest({
       model: 'MiniMax-M2.7',
@@ -753,6 +851,59 @@ describe('parseOpenAIChatCompletionsRequest', () => {
 });
 
 describe('parseGeminiGenerateContentRequest', () => {
+  it('preserves inline and URI image parts in their original order', () => {
+    const result = parseGeminiGenerateContentRequest(
+      {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: 'Compare these images:' },
+              {
+                inlineData: {
+                  mimeType: 'image/png',
+                  data: 'iVBORw0KGgoAAAANSUhEUg=='
+                }
+              },
+              { text: 'and this one:' },
+              {
+                file_data: {
+                  mime_type: 'image/jpeg',
+                  file_uri: 'https://example.test/pixel.jpg'
+                }
+              }
+            ]
+          }
+        ]
+      },
+      'gemini-2.5-flash'
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Compare these images:' },
+          {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+          },
+          { type: 'input_text', text: 'and this one:' },
+          {
+            type: 'input_image',
+            image_url: 'https://example.test/pixel.jpg'
+          }
+        ]
+      }
+    ]);
+  });
+
   it('keeps thinking config and maps thought parts into standard reasoning content', () => {
     const result = parseGeminiGenerateContentRequest(
       {
@@ -857,6 +1008,52 @@ describe('parseGeminiGenerateContentRequest', () => {
           {
             type: 'input_text',
             text: 'continue'
+          }
+        ]
+      }
+    ]);
+  });
+});
+
+describe('parseGeminiInteractionsRequest', () => {
+  it('preserves inline and URI image content in their original order', () => {
+    const result = parseGeminiInteractionsRequest({
+      model: 'gemini-3.7-flash',
+      input: [
+        { type: 'text', text: 'Compare these images:' },
+        {
+          type: 'image',
+          mime_type: 'image/png',
+          data: 'iVBORw0KGgoAAAANSUhEUg=='
+        },
+        { type: 'text', text: 'and this one:' },
+        {
+          type: 'image',
+          uri: 'https://example.test/pixel.jpg',
+          mime_type: 'image/jpeg'
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Compare these images:' },
+          {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=='
+          },
+          { type: 'input_text', text: 'and this one:' },
+          {
+            type: 'input_image',
+            image_url: 'https://example.test/pixel.jpg'
           }
         ]
       }
