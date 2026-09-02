@@ -118,6 +118,15 @@ const maxLoggedPayloadLength = 32768;
 const maxUpstreamConnectAttempts = 2;
 const upstreamRetryDelayMs = 150;
 const upstreamProxyAgentCache = new Map<string, Dispatcher>();
+const upstreamHttpsAcceptEncoding = 'br, gzip, deflate';
+const upstreamHttpAcceptEncoding = 'gzip, deflate';
+const supportedUpstreamContentEncodings = new Set([
+  'br',
+  'gzip',
+  'x-gzip',
+  'deflate',
+  'identity'
+]);
 
 export async function callUpstream(
   url: string,
@@ -130,13 +139,14 @@ export async function callUpstream(
   requestOptions?: UpstreamRequestOptions
 ): Promise<Response> {
   const retry = normalizeUpstreamRetryOptions(retryOptions);
+  const requestHeaders = normalizeUpstreamRequestHeaders(url, headers);
   const shouldLog = Boolean(logContext?.logger);
   const shouldSkipResponseBodyLog =
-    requestOptions?.skipResponseBodyLog === true || isStreamingRequestPayload(body, headers);
+    requestOptions?.skipResponseBodyLog === true || isStreamingRequestPayload(body, requestHeaders);
   const requestLogPayload = shouldLog
     ? {
         url: sanitizeUrlForLog(url),
-        headers: sanitizeHeadersForLog(headers),
+        headers: sanitizeHeadersForLog(requestHeaders),
         body: sanitizePayloadForLog(body)
       }
     : undefined;
@@ -188,7 +198,7 @@ export async function callUpstream(
         const method = normalizeUpstreamMethod(requestOptions?.method);
         const fetchInit: FetchInitWithDispatcher = {
           method,
-          headers,
+          headers: requestHeaders,
           body: serializeUpstreamRequestBody(body, requestOptions?.bodyEncoding, method),
           signal: controller.signal,
           ...(dispatcher ? { dispatcher: dispatcher as unknown as FetchDispatcher } : {})
@@ -306,6 +316,50 @@ export async function callUpstream(
   }
 
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function normalizeUpstreamRequestHeaders(
+  url: string,
+  headers: Record<string, string>
+): Record<string, string> {
+  const normalizedHeaders = { ...headers };
+  const acceptEncodingKeys = findHeaderKeysCaseInsensitive(normalizedHeaders, 'accept-encoding');
+  const fallback = defaultUpstreamAcceptEncoding(url);
+
+  if (acceptEncodingKeys.length === 0) {
+    normalizedHeaders['accept-encoding'] = fallback;
+    return normalizedHeaders;
+  }
+
+  const nextAcceptEncoding = normalizeUpstreamAcceptEncoding(
+    acceptEncodingKeys.map((key) => normalizedHeaders[key]).join(','),
+    fallback
+  );
+  for (const key of acceptEncodingKeys) {
+    delete normalizedHeaders[key];
+  }
+  normalizedHeaders['accept-encoding'] = nextAcceptEncoding;
+  return normalizedHeaders;
+}
+
+function defaultUpstreamAcceptEncoding(url: string): string {
+  try {
+    return new URL(url).protocol === 'https:' ? upstreamHttpsAcceptEncoding : upstreamHttpAcceptEncoding;
+  } catch {
+    return upstreamHttpsAcceptEncoding;
+  }
+}
+
+function normalizeUpstreamAcceptEncoding(value: string, fallback: string): string {
+  const supportedEncodings = value
+    .split(',')
+    .map((encoding) => encoding.trim())
+    .filter((encoding) => {
+      const token = encoding.split(';', 1)[0]?.trim().toLowerCase();
+      return Boolean(token && supportedUpstreamContentEncodings.has(token));
+    });
+
+  return supportedEncodings.length > 0 ? supportedEncodings.join(', ') : fallback;
 }
 
 function upstreamFetchDispatcher(timeoutMs: number): FetchDispatcher | undefined {
@@ -840,13 +894,13 @@ function isStreamingRequestPayload(body: unknown, headers: Record<string, string
 }
 
 function findHeaderValueCaseInsensitive(headers: Record<string, string>, name: string): string | undefined {
+  const key = findHeaderKeysCaseInsensitive(headers, name)[0];
+  return key ? headers[key] : undefined;
+}
+
+function findHeaderKeysCaseInsensitive(headers: Record<string, string>, name: string): string[] {
   const target = name.toLowerCase();
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === target) {
-      return value;
-    }
-  }
-  return undefined;
+  return Object.keys(headers).filter((key) => key.toLowerCase() === target);
 }
 
 async function readResponseBodyForLog(response: Response): Promise<unknown> {

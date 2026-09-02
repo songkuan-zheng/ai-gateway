@@ -191,11 +191,13 @@ describe('callUpstream', () => {
       );
 
       const fetchInit = undiciMock.fetch.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const sentHeaders = fetchInit?.headers as Record<string, string> | undefined;
 
       expect(response.status).toBe(200);
       expect(undiciMock.fetch).toHaveBeenCalledTimes(1);
       expect(globalFetchMock).not.toHaveBeenCalled();
       expect(fetchInit?.dispatcher).toBeTruthy();
+      expect(sentHeaders?.['accept-encoding']).toBe('br, gzip, deflate');
     } finally {
       global.fetch = originalFetch;
     }
@@ -493,6 +495,64 @@ describe('callUpstream', () => {
       expect(fetchInit?.dispatcher).toBeUndefined();
       expect(undiciMock.fetch).not.toHaveBeenCalled();
       expect(undiciMock.getGlobalDispatcher).not.toHaveBeenCalled();
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('sets a supported upstream accept-encoding header when callers do not provide one', async () => {
+    const originalFetch = global.fetch;
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        { 'content-type': 'application/json' },
+        { model: 'test-model', input: 'hello' },
+        0
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const sentHeaders = fetchInit?.headers as Record<string, string> | undefined;
+
+      expect(response.status).toBe(200);
+      expect(sentHeaders?.['accept-encoding']).toBe('br, gzip, deflate');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('removes zstd from caller-provided upstream accept-encoding values', async () => {
+    const originalFetch = global.fetch;
+    const headers = {
+      'content-type': 'application/json',
+      'Accept-Encoding': 'gzip, zstd, br, x-zstd, *;q=0.5'
+    };
+
+    try {
+      const fetchMock = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+        new Response('{}', { status: 200 })
+      );
+      global.fetch = fetchMock as typeof fetch;
+
+      const response = await callUpstream(
+        'https://example.test/v1/responses',
+        headers,
+        { model: 'test-model', input: 'hello' },
+        0
+      );
+
+      const fetchInit = fetchMock.mock.calls[0]?.[1] as FetchInitWithDispatcherForTest | undefined;
+      const sentHeaders = fetchInit?.headers as Record<string, string> | undefined;
+
+      expect(response.status).toBe(200);
+      expect(sentHeaders?.['accept-encoding']).toBe('gzip, br');
+      expect(sentHeaders?.['Accept-Encoding']).toBeUndefined();
+      expect(headers['Accept-Encoding']).toBe('gzip, zstd, br, x-zstd, *;q=0.5');
     } finally {
       global.fetch = originalFetch;
     }
