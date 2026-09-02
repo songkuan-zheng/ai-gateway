@@ -69,6 +69,10 @@ const sensitiveHeaderNames = new Set([
   'proxy-authorization',
   'x-api-key',
   'api-key',
+  'x-goog-api-key',
+  'x-mcp-key',
+  'x-codex-access-token',
+  'x-manager-key',
   'x-auth-signature',
   'cookie',
   'set-cookie'
@@ -808,7 +812,7 @@ export function sanitizeHeadersForLog(
   const sanitized: Record<string, string> = {};
   const entries = headers instanceof Headers ? Array.from(headers.entries()) : Object.entries(headers);
   for (const [key, value] of entries) {
-    sanitized[key] = isSensitiveKey(key) ? '***' : truncateStringForLog(String(value));
+    sanitized[key] = isSensitiveHeaderKey(key) ? '***' : truncateStringForLog(String(value));
   }
   return sanitized;
 }
@@ -1044,10 +1048,30 @@ function truncateStringForLog(value: string): string {
   return value.length > maxLoggedStringLength ? `${value.slice(0, maxLoggedStringLength)}...` : value;
 }
 
-function isSensitiveKey(key: string): boolean {
+function compactSensitiveKey(key: string): string {
+  return key.replace(/[^a-z0-9]/g, '');
+}
+
+function isSensitiveHeaderKey(key: string): boolean {
   const normalized = key.trim().toLowerCase();
+  const compact = compactSensitiveKey(normalized);
   return (
     sensitiveHeaderNames.has(normalized) ||
+    compact.includes('apikey') ||
+    compact.includes('auth') ||
+    normalized.includes('token') ||
+    normalized.includes('secret') ||
+    normalized.includes('password') ||
+    normalized.includes('signature')
+  );
+}
+
+function isSensitiveKey(key: string): boolean {
+  const normalized = key.trim().toLowerCase();
+  const compact = compactSensitiveKey(normalized);
+  return (
+    sensitiveHeaderNames.has(normalized) ||
+    compact.includes('apikey') ||
     normalized.includes('token') ||
     normalized.includes('secret') ||
     normalized.includes('password')
@@ -1056,12 +1080,14 @@ function isSensitiveKey(key: string): boolean {
 
 function shouldRedactPayloadKey(key: string, value: unknown): boolean {
   const normalized = key.trim().toLowerCase();
+  const compact = compactSensitiveKey(normalized);
   if (!isSensitiveKey(normalized)) {
     return false;
   }
 
   if (
     !sensitiveHeaderNames.has(normalized) &&
+    !compact.includes('apikey') &&
     !normalized.includes('secret') &&
     !normalized.includes('password') &&
     normalized.includes('token') &&

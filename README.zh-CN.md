@@ -39,7 +39,19 @@ cp .env.production.example .env.production
 docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
 ```
 
-多实例部署需要共享状态时，开启 Redis profile：
+多实例部署需要共享状态时，先把 `.env.production` 中的共享状态后端从
+`memory` 改成 `redis`：
+
+```dotenv
+GATEWAY_IDEMPOTENCY_STORAGE_TYPE=redis
+GATEWAY_UPSTREAM_CONCURRENCY_STORAGE_TYPE=redis
+GATEWAY_UPSTREAM_CIRCUIT_BREAKER_STORAGE_TYPE=redis
+GATEWAY_SCHEDULING_STORAGE_TYPE=redis
+PROVIDER_HEALTH_CHECK_STORAGE_TYPE=redis
+PRECHECK_STORAGE_TYPE=redis
+```
+
+然后开启 Redis profile：
 
 ```bash
 docker compose --env-file .env.production -f docker-compose.prod.yml --profile redis up -d --build

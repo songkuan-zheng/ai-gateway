@@ -39,7 +39,19 @@ cp .env.production.example .env.production
 docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
 ```
 
-For multi-instance deployments, enable Redis-backed shared state:
+For multi-instance deployments, enable Redis-backed shared state by changing the
+shared state backends in `.env.production` from `memory` to `redis`:
+
+```dotenv
+GATEWAY_IDEMPOTENCY_STORAGE_TYPE=redis
+GATEWAY_UPSTREAM_CONCURRENCY_STORAGE_TYPE=redis
+GATEWAY_UPSTREAM_CIRCUIT_BREAKER_STORAGE_TYPE=redis
+GATEWAY_SCHEDULING_STORAGE_TYPE=redis
+PROVIDER_HEALTH_CHECK_STORAGE_TYPE=redis
+PRECHECK_STORAGE_TYPE=redis
+```
+
+Then start the Redis profile:
 
 ```bash
 docker compose --env-file .env.production -f docker-compose.prod.yml --profile redis up -d --build

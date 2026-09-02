@@ -30,6 +30,7 @@ toolhub.config.compose.json
 # Runtime and local configuration
 .env
 .env.*
+!.env.production.example
 gateway.config.json
 .agent-data/
 

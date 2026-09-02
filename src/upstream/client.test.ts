@@ -69,6 +69,7 @@ import {
   callUpstream,
   cancelResponseBodyOnAbort,
   readUpstreamPayload,
+  sanitizeHeadersForLog,
   sanitizePayloadForLog
 } from './client';
 
@@ -719,6 +720,34 @@ describe('upstream response abort handling', () => {
   });
 });
 
+describe('sanitizeHeadersForLog', () => {
+  it('redacts gateway-compatible credential headers', () => {
+    expect(
+      sanitizeHeadersForLog({
+        authorization: 'Bearer client-secret',
+        'x-api-key': 'openai-secret',
+        'api-key': 'anthropic-secret',
+        'X-Goog-Api-Key': 'gemini-secret',
+        'x-mcp-key': 'mcp-secret',
+        'x-codex-access-token': 'codex-secret',
+        'x-auth-signature': 'signature-secret',
+        'x-manager-key': 'manager-secret',
+        'content-type': 'application/json'
+      })
+    ).toEqual({
+      authorization: '***',
+      'x-api-key': '***',
+      'api-key': '***',
+      'X-Goog-Api-Key': '***',
+      'x-mcp-key': '***',
+      'x-codex-access-token': '***',
+      'x-auth-signature': '***',
+      'x-manager-key': '***',
+      'content-type': 'application/json'
+    });
+  });
+});
+
 describe('sanitizePayloadForLog', () => {
   it('summarizes binary payloads without exposing or expanding their bytes', () => {
     const sanitized = sanitizePayloadForLog(Buffer.alloc(4 * 1024 * 1024, 7));
@@ -760,6 +789,8 @@ describe('sanitizePayloadForLog', () => {
 
   it('continues to redact credential token fields', () => {
     const sanitized = sanitizePayloadForLog({
+      apiKey: 'camel-secret',
+      api_key: 'snake-secret',
       access_token: 'access-secret',
       refreshToken: 'refresh-secret',
       nested: {
@@ -774,6 +805,8 @@ describe('sanitizePayloadForLog', () => {
     });
 
     expect(sanitized).toEqual({
+      apiKey: '***',
+      api_key: '***',
       access_token: '***',
       refreshToken: '***',
       nested: {
