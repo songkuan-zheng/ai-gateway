@@ -24,12 +24,16 @@ import { buildStandardImageDataUrl } from '../image-input';
 import { normalizeNamespacedToolName } from '../target/tools';
 
 export function parseOpenAIResponsesRequest(body: Record<string, unknown>): Result<StandardRequest> {
-  const inputResult = normalizeResponsesInput(body.input);
+  const instructionExtraction = extractOpenAIResponsesInstructionMessages(body.input);
+  const inputResult = normalizeResponsesInput(instructionExtraction.input);
   if (!inputResult.ok) {
     return inputResult;
   }
 
-  const instructions = asString(body.instructions);
+  const instructions = mergeInstructionText(
+    asString(body.instructions),
+    instructionExtraction.instructions
+  );
   const input = ensureInputWithInstructions(inputResult.value, instructions);
   if (!input) {
     return err('OpenAI responses request requires non-empty input.');
@@ -319,6 +323,76 @@ function normalizeResponsesInput(input: unknown): Result<string | StandardReques
   }
 
   return ok(coalesceResponsesInputMessages(messages));
+}
+
+function extractOpenAIResponsesInstructionMessages(input: unknown): {
+  input: unknown;
+  instructions?: string;
+} {
+  if (Array.isArray(input)) {
+    const remaining: unknown[] = [];
+    const instructions: string[] = [];
+    for (const item of input) {
+      const instructionMessage = readOpenAIResponsesInstructionMessage(item);
+      if (instructionMessage) {
+        if (instructionMessage.text) {
+          instructions.push(instructionMessage.text);
+        }
+        continue;
+      }
+      remaining.push(item);
+    }
+
+    return {
+      input: remaining,
+      instructions: instructions.join('\n').trim() || undefined
+    };
+  }
+
+  const instructionMessage = readOpenAIResponsesInstructionMessage(input);
+  if (instructionMessage) {
+    return {
+      input: [],
+      instructions: instructionMessage.text
+    };
+  }
+
+  return { input };
+}
+
+function readOpenAIResponsesInstructionMessage(item: unknown):
+  | {
+      text?: string;
+    }
+  | undefined {
+  if (!isObject(item)) {
+    return undefined;
+  }
+
+  const type = asString(item.type);
+  if (type && type !== 'message') {
+    return undefined;
+  }
+
+  if (normalizeMessageRole(item.role) !== 'system') {
+    return undefined;
+  }
+
+  return {
+    text: extractMessageText(item.content) || undefined
+  };
+}
+
+function mergeInstructionText(...values: Array<string | undefined>): string | undefined {
+  const parts: string[] = [];
+  for (const value of values) {
+    const text = value?.trim();
+    if (text) {
+      parts.push(text);
+    }
+  }
+
+  return parts.join('\n').trim() || undefined;
 }
 
 function normalizeGeminiInteractionsInput(input: unknown): Result<string | StandardRequestInputMessage[]> {

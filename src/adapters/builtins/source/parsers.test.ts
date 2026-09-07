@@ -8,6 +8,70 @@ import {
 } from './parsers';
 
 describe('parseOpenAIResponsesRequest', () => {
+  it('lifts developer and system messages into instructions', () => {
+    const result = parseOpenAIResponsesRequest({
+      model: 'gpt-5.5',
+      instructions: 'You are Codex, a coding agent.',
+      input: [
+        {
+          type: 'message',
+          role: 'developer',
+          content: [
+            {
+              type: 'input_text',
+              text: 'Send progress updates before calling tools.'
+            },
+            {
+              type: 'input_text',
+              text: 'Finish with a concise user-facing answer.'
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'system',
+          content: 'Keep policy instructions high priority.'
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'input_text',
+              text: 'Analyze the local logs.'
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.instructions).toBe(
+      [
+        'You are Codex, a coding agent.',
+        'Send progress updates before calling tools.',
+        'Finish with a concise user-facing answer.',
+        'Keep policy instructions high priority.'
+      ].join('\n')
+    );
+    expect(result.value.input).toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'Analyze the local logs.'
+          }
+        ]
+      }
+    ]);
+  });
+
   it('preserves image content and its order within user messages', () => {
     const result = parseOpenAIResponsesRequest({
       model: 'gpt-4.1-mini',
