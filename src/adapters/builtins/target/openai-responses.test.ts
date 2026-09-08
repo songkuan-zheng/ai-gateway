@@ -3748,6 +3748,107 @@ describe('openAIResponsesTargetAdapter', () => {
       }
     ]);
   });
+
+  it('emits tool_result images as image_url parts on chat tool messages', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_shot',
+              content: 'screenshot captured',
+              images: ['data:image/png;base64,c2hvdA==']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const chatBody = built.value.body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const toolMessage = chatBody.messages.find((message) => message.role === 'tool');
+    expect(toolMessage?.content).toEqual([
+      { type: 'text', text: 'screenshot captured' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,c2hvdA==' } }
+    ]);
+  });
+
+  it('emits tool_result images in an adjacent user message for responses targets', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_shot',
+              content: '',
+              images: ['data:image/png;base64,c2hvdA==']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const responsesBody = built.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_shot',
+        output: ''
+      },
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,c2hvdA=='
+          }
+        ]
+      }
+    ]);
+  });
 });
 
 function buildAnthropicOpenAITargetBody(

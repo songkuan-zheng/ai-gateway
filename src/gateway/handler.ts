@@ -3911,6 +3911,14 @@ function extractVirtualStandardToolResultMultimodalMessages(
         item.content,
         rewriteState
       );
+      for (const image of item.images ?? []) {
+        addVirtualMultimodalDescription(
+          descriptions,
+          messageIndex,
+          [{ type: 'input_image', image_url: image }],
+          rewriteState
+        );
+      }
     }
   }
   return descriptions;
@@ -4010,9 +4018,13 @@ function rewriteVirtualStandardInputContentMediaReferences(
   }
 
   if (item.type === 'tool_result') {
+    const images = (item.images ?? []).filter(
+      (image) => !references.some((reference) => standardImageMatchesVirtualReference(image, reference))
+    );
     return {
       ...item,
-      content: replaceVirtualMultimodalReferenceString(item.content, references)
+      content: replaceVirtualMultimodalReferenceString(item.content, references),
+      ...(images.length > 0 ? { images } : {})
     };
   }
 

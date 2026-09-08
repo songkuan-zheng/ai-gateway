@@ -194,6 +194,50 @@ export function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+/**
+ * Pull the image URL out of a content part, across the source dialects that
+ * carry images: anthropic `{type:'image',source:{type:'base64'|'url',...}}`,
+ * OpenAI chat `{type:'image_url',image_url:{url}|string}` and Responses
+ * `{type:'input_image',image_url}`. Returns an HTTP(S) URL or a data URL, or
+ * undefined when the part is not an image.
+ */
+export function extractImageUrlFromPart(part: unknown): string | undefined {
+  if (!isObject(part)) {
+    return undefined;
+  }
+
+  const type = asString(part.type);
+  // The type guard must run before the `source` lookup: anthropic document
+  // blocks ({type:'document',source:{type:'base64',media_type:'application/pdf',
+  // ...}}) would otherwise be misclassified as images.
+  if (type && type !== 'image' && type !== 'image_url' && type !== 'input_image') {
+    return undefined;
+  }
+
+  const source = isObject(part.source) ? part.source : undefined;
+  if (source) {
+    const url = asString(source.url);
+    if (url) {
+      return url;
+    }
+    const data = asString(source.data);
+    if (data) {
+      return `data:${asString(source.media_type) || 'image/png'};base64,${data}`;
+    }
+    return undefined;
+  }
+
+  const imageField = part.image_url ?? part.image;
+  if (typeof imageField === 'string') {
+    return imageField;
+  }
+  if (isObject(imageField)) {
+    return asString(imageField.url);
+  }
+
+  return undefined;
+}
+
 export function formatErrorWithCause(error: unknown): string {
   if (!(error instanceof Error)) {
     return String(error);
