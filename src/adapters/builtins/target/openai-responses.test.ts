@@ -3882,7 +3882,124 @@ describe('openAIResponsesTargetAdapter', () => {
     });
   });
 
-  it('emits tool_result images in an adjacent user message for responses targets', () => {
+  it('emits tool_result images inside the native function_call_output content list', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_shot',
+              content: 'screenshot captured',
+              images: ['data:image/png;base64,c2hvdA==']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const responsesBody = built.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    // The image stays attached to its call_id instead of being re-attributed
+    // to a user turn.
+    expect(responsesBody.input).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_shot',
+        output: [
+          { type: 'input_text', text: 'screenshot captured' },
+          { type: 'input_image', image_url: 'data:image/png;base64,c2hvdA==' }
+        ]
+      }
+    ]);
+  });
+
+  it('keeps each parallel tool_result image with its own call_id', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: '',
+              images: ['data:image/png;base64,Zmlyc3Q=']
+            },
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: '',
+              images: ['data:image/png;base64,c2Vjb25k']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const responsesBody = built.value.body as {
+      input: Array<Record<string, unknown>>;
+    };
+    const outputs = responsesBody.input.filter((item) => item.type === 'function_call_output');
+    expect(outputs).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_one',
+        output: [{ type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }]
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_two',
+        output: [{ type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }]
+      }
+    ]);
+  });
+
+  it('falls back to an adjacent user message when the provider is text-only', () => {
     const standardRequest = {
       model: 'target-model',
       max_output_tokens: 128,
@@ -3908,7 +4025,8 @@ describe('openAIResponsesTargetAdapter', () => {
       config: {
         openaiApiKey: 'sk-test',
         openaiBaseUrl: 'https://mock.local/v1'
-      } as never
+      } as never,
+      targetProviderConfig: { openaiResponsesToolOutputFormat: 'text' } as never
     });
 
     expect(built.ok).toBe(true);

@@ -8,6 +8,116 @@ import {
 } from './parsers';
 
 describe('parseOpenAIResponsesRequest', () => {
+  // Collapsing a mixed function output to its text would drop the file block;
+  // before tool_result images were split out, the whole array was serialized.
+  it('keeps non-text blocks of a mixed function_call_output instead of collapsing to text', () => {
+    const result = parseOpenAIResponsesRequest({
+      model: 'gpt-5.5',
+      input: [
+        {
+          type: 'function_call',
+          call_id: 'call_report',
+          name: 'build_report',
+          arguments: '{}'
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_report',
+          output: [
+            { type: 'input_text', text: 'report' },
+            { type: 'input_file', file_id: 'file_123' }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    const toolResult = result.value.input
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .find((item) => item.type === 'tool_result');
+    expect(toolResult).toMatchObject({
+      type: 'tool_result',
+      tool_use_id: 'call_report',
+      content: '[{"type":"input_text","text":"report"},{"type":"input_file","file_id":"file_123"}]'
+    });
+  });
+
+  it('keeps the non-text remainder when a function output also carries an image', () => {
+    const result = parseOpenAIResponsesRequest({
+      model: 'gpt-5.5',
+      input: [
+        {
+          type: 'function_call',
+          call_id: 'call_report',
+          name: 'build_report',
+          arguments: '{}'
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_report',
+          output: [
+            { type: 'input_text', text: 'report' },
+            { type: 'input_image', image_url: 'data:image/png;base64,c2hvdA==' },
+            { type: 'input_file', file_id: 'file_123' }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    const toolResult = result.value.input
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .find((item) => item.type === 'tool_result');
+    expect(toolResult).toMatchObject({
+      type: 'tool_result',
+      tool_use_id: 'call_report',
+      images: ['data:image/png;base64,c2hvdA==']
+    });
+    // The image is lifted out, the file block still has to survive in the text.
+    expect((toolResult as { content: string }).content).toContain('file_123');
+    expect((toolResult as { content: string }).content).not.toContain('c2hvdA==');
+  });
+
+  // An all-text array still collapses to text even when one block is blank:
+  // "empty text" must not be mistaken for "not a text block".
+  it('still collapses an all-text function output containing a blank block', () => {
+    const result = parseOpenAIResponsesRequest({
+      model: 'gpt-5.5',
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_report',
+          output: [
+            { type: 'input_text', text: '   ' },
+            { type: 'input_text', text: 'report' }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    const toolResult = result.value.input
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .find((item) => item.type === 'tool_result');
+    expect(toolResult).toMatchObject({
+      type: 'tool_result',
+      tool_use_id: 'call_report',
+      content: 'report'
+    });
+  });
+
   it('lifts developer and system messages into instructions', () => {
     const result = parseOpenAIResponsesRequest({
       model: 'gpt-5.5',

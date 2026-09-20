@@ -14,6 +14,7 @@ import {
   extractImageUrlFromPart,
   extractTextFromPart,
   isObject,
+  isTextPart,
   normalizeConversationRole,
   normalizeMessageRole
 } from '../../../utils';
@@ -1253,8 +1254,13 @@ function normalizeToolResultContent(value: unknown): NormalizedToolResultContent
       residual.push(item);
     }
 
-    const text = residual.map(extractTextFromPart).filter(Boolean).join('\n').trim();
-    let content = text || serializeToolResultWithoutImages(residual);
+    // Collapsing to the extracted text is only lossless when *every* remaining
+    // item is text-extractable. A mixed array — text plus a file block, say —
+    // has to keep the JSON serialization, otherwise the non-text blocks are
+    // silently dropped.
+    const text = residual.map((item) => extractTextFromPart(item)).filter(Boolean).join('\n').trim();
+    let content =
+      text && residual.every(isTextPart) ? text : serializeToolResultWithoutImages(residual);
     if (images.length === 0) {
       return { content };
     }
@@ -1781,8 +1787,11 @@ function normalizeAnthropicToolResultContent(content: unknown): NormalizedToolRe
       remainder.push(item);
     }
 
-    const text = remainder.map(extractTextFromPart).filter(Boolean).join('\n').trim();
-    if (text) {
+    // Same rule as the openai normalizer: collapsing to the extracted text is
+    // only lossless when every remaining block is text-extractable, otherwise
+    // a mixed array loses its non-text blocks.
+    const text = remainder.map((item) => extractTextFromPart(item)).filter(Boolean).join('\n').trim();
+    if (text && remainder.every(isTextPart)) {
       return images.length > 0 ? { content: text, images } : { content: text };
     }
 

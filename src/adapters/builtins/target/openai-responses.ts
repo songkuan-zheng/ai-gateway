@@ -211,7 +211,8 @@ export function buildOpenAIResponsesBodyFromStandardRequest(
     input: standardInputToOpenAIResponsesInput(
       standardRequest.input,
       standardRequest.tools,
-      deferredToolSearch
+      deferredToolSearch,
+      targetProviderConfig?.openaiResponsesToolOutputFormat ?? 'native'
     ),
     temperature: standardRequest.temperature,
     top_p: standardRequest.top_p,
@@ -492,7 +493,8 @@ function standardInputToOpenAIChatMessages(
 function standardInputToOpenAIResponsesInput(
   input: string | StandardRequestInputMessage[],
   tools?: unknown[],
-  deferredToolSearch?: DeferredToolSearchPlan
+  deferredToolSearch?: DeferredToolSearchPlan,
+  toolOutputFormat: NonNullable<ProviderConfig['openaiResponsesToolOutputFormat']> = 'native'
 ): string | Array<Record<string, unknown>> {
   if (typeof input === 'string') {
     return input;
@@ -666,19 +668,39 @@ function standardInputToOpenAIResponsesInput(
         continue;
       }
 
+      const outputText = appendToolReferencesToResultContent(
+        toolResult.content,
+        toolResult.tool_references,
+        tools
+      );
+      const toolImages = toolResult.images ?? [];
+      if (toolImages.length > 0 && toolOutputFormat === 'native') {
+        // `function_call_output.output` accepts a content list, so the images
+        // stay attached to their call_id instead of being re-attributed to the
+        // user turn — which also keeps parallel calls unambiguous.
+        items.push({
+          type: 'function_call_output',
+          call_id: toolResult.tool_call_id,
+          output: [
+            ...(outputText ? [{ type: 'input_text', text: outputText }] : []),
+            ...toolImages.map((url) => ({
+              type: 'input_image',
+              image_url: url
+            }))
+          ]
+        });
+        continue;
+      }
+
       items.push({
         type: 'function_call_output',
         call_id: toolResult.tool_call_id,
-        output: appendToolReferencesToResultContent(
-          toolResult.content,
-          toolResult.tool_references,
-          tools
-        )
+        output: outputText
       });
-      const toolImages = toolResult.images ?? [];
       if (toolImages.length > 0) {
-        // function_call_output only accepts a string, so images ride in an
-        // adjacent user message — the same shape used for deferred-tool text.
+        // Text-only fallback for providers whose Responses implementation
+        // rejects a content list: the images ride in an adjacent user message,
+        // the same shape used for deferred-tool text.
         items.push({
           type: 'message',
           role: 'user',

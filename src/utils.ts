@@ -302,6 +302,31 @@ export function extractTextFromPart(part: unknown): string {
   return '';
 }
 
+/**
+ * Whether a content part is a pure text part, across the same dialects
+ * `extractTextFromPart` reads. It is the companion predicate that function
+ * cannot provide: an empty return value there means either "not text" or "text
+ * that is empty", and callers deciding whether a remainder is losslessly
+ * collapsible need to tell those apart.
+ */
+export function isTextPart(part: unknown): boolean {
+  if (typeof part === 'string') {
+    return true;
+  }
+
+  if (!isObject(part)) {
+    return false;
+  }
+
+  return (
+    typeof part.text === 'string' ||
+    typeof part.input_text === 'string' ||
+    typeof part.output_text === 'string' ||
+    part.type === 'input_text' ||
+    part.type === 'output_text'
+  );
+}
+
 export function normalizeMessageRole(role: unknown): 'system' | 'user' | 'assistant' {
   const value = String(role || '').toLowerCase();
 

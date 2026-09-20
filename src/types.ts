@@ -124,6 +124,7 @@ export interface ProviderConfig {
   openaiChatStreamUsage?: 'include_usage' | 'disabled';
   openaiChatReasoningSplit?: 'auto' | 'enabled' | 'disabled';
   openaiChatThinkingOptions?: 'auto' | 'enabled' | 'disabled';
+  openaiResponsesToolOutputFormat?: 'native' | 'text';
   modelMetadata?: Record<string, ProviderModelMetadata>;
   extraHeaders: ModelScopedHeadersConfig;
   extraBody: ModelScopedBodyConfig;
