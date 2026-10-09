@@ -4055,6 +4055,277 @@ describe('openAIResponsesTargetAdapter', () => {
       }
     ]);
   });
+
+  // The Responses source parser emits one standard message per
+  // function_call_output, so a legitimate parallel batch arrives split. The
+  // trailing image message has to wait for the batch to actually close.
+  it('trails the images of a split parallel tool batch in chat conversion', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'target-model',
+      input: [
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_one',
+          output: [
+            { type: 'input_text', text: 'first' },
+            { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }
+          ]
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_two',
+          output: [
+            { type: 'input_text', text: 'second' },
+            { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }
+          ]
+        }
+      ]
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as { messages: Array<Record<string, unknown>> };
+    expect(body.messages.map((message) => message.role)).toEqual([
+      'assistant',
+      'tool',
+      'tool',
+      'user'
+    ]);
+    expect(body.messages[3]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } }
+      ]
+    });
+  });
+
+  it('trails the images of a split parallel tool batch in text output mode', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'target-model',
+      input: [
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_one',
+          output: [
+            { type: 'input_text', text: 'first' },
+            { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }
+          ]
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_two',
+          output: [
+            { type: 'input_text', text: 'second' },
+            { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }
+          ]
+        }
+      ]
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { openaiResponsesToolOutputFormat: 'text' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as { input: Array<Record<string, unknown>> };
+    expect(body.input.map((item) => item.type)).toEqual([
+      'function_call',
+      'function_call',
+      'function_call_output',
+      'function_call_output',
+      'message'
+    ]);
+    expect(body.input[4]).toEqual({
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+        { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }
+      ]
+    });
+  });
+
+  // A batch message that also carries its own text must not open the user turn
+  // either: the text rides along with the images once the batch closes.
+  it('defers the batch message content alongside the images in chat conversion', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: 'first',
+              images: ['data:image/png;base64,Zmlyc3Q=']
+            },
+            { type: 'input_text', text: 'carry on' }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: 'second',
+              images: ['data:image/png;base64,c2Vjb25k']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { type: 'openai_chat_completions' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as { messages: Array<Record<string, unknown>> };
+    expect(body.messages.map((message) => message.role)).toEqual([
+      'assistant',
+      'tool',
+      'tool',
+      'user'
+    ]);
+    expect(body.messages[3]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+        { type: 'text', text: 'carry on' }
+      ]
+    });
+  });
+
+  it('defers the batch message content alongside the images in text output mode', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} }]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: 'first',
+              images: ['data:image/png;base64,Zmlyc3Q=']
+            },
+            { type: 'input_text', text: 'carry on' }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: 'second',
+              images: ['data:image/png;base64,c2Vjb25k']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: { headers: {} } as never,
+      standardRequest,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: { openaiResponsesToolOutputFormat: 'text' } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as { input: Array<Record<string, unknown>> };
+    expect(body.input.map((item) => item.type)).toEqual([
+      'function_call',
+      'function_call_output',
+      'function_call_output',
+      'message'
+    ]);
+    expect(body.input[3]).toEqual({
+      type: 'message',
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+        { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+        { type: 'input_text', text: 'carry on' }
+      ]
+    });
+  });
 });
 
 function buildAnthropicOpenAITargetBody(

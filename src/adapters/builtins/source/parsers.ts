@@ -497,12 +497,16 @@ function normalizeGeminiInteractionInputItem(
       return null;
     }
     const name = asString(item.name) || toolNamesById.get(callId);
+    const normalizedResult = normalizeGeminiInteractionResultContent(item.result);
     const toolResult: StandardRequestInputContent = {
       type: 'tool_result',
       tool_use_id: callId,
       ...(name ? { name } : {}),
-      content: normalizeGeminiInteractionResultContent(item.result)
+      content: normalizedResult.content
     };
+    if (normalizedResult.images && normalizedResult.images.length > 0) {
+      toolResult.images = normalizedResult.images;
+    }
     return {
       type: 'message',
       role: 'user',
@@ -706,26 +710,25 @@ function normalizeGeminiInteractionThoughtSummary(value: unknown): string {
     .trim();
 }
 
-function normalizeGeminiInteractionResultContent(result: unknown): string {
+/**
+ * A `function_result.result` is a list of subcontent entries whose union is
+ * text or image, so it splits into text plus images exactly like every other
+ * dialect's tool output. Folding it into a bare string would drop the images
+ * whenever the result also carries text.
+ */
+function normalizeGeminiInteractionResultContent(result: unknown): NormalizedToolResultContent {
   if (typeof result === 'string') {
-    return result;
+    return { content: result };
   }
 
-  if (Array.isArray(result)) {
-    const text = result.map(extractTextFromPart).filter(Boolean).join('\n').trim();
-    if (text) {
-      return text;
-    }
-  }
-
-  if (isObject(result)) {
+  if (isObject(result) && !Array.isArray(result)) {
     const text = extractTextFromPart(result);
     if (text) {
-      return text;
+      return { content: text };
     }
   }
 
-  return normalizeToolResultContent(result).content;
+  return normalizeToolResultContent(result);
 }
 
 function coalesceResponsesInputMessages(messages: StandardRequestInputMessage[]): StandardRequestInputMessage[] {

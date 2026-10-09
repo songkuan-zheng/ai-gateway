@@ -1850,7 +1850,7 @@ describe('geminiGenerateContentTargetAdapter', () => {
     expect(serialized).not.toContain('"parts":[{"inlineData"');
   });
 
-  it('keeps tool_result images for Interactions in a trailing user_input step', () => {
+  it('keeps tool_result images inside the native Interactions function_result subcontent', () => {
     const built = geminiGenerateContentTargetAdapter.buildRequestFromStandard({
       request: {
         headers: {},
@@ -1903,18 +1903,29 @@ describe('geminiGenerateContentTargetAdapter', () => {
     }
 
     const steps = (built.value.body as { input: Array<Record<string, unknown>> }).input;
-    // The function_result batch stays contiguous and both images survive.
+    // The batch stays contiguous and each image stays bound to its own call_id
+    // instead of being re-attributed to a trailing user turn.
     expect(steps.map((step) => step.type)).toEqual([
       'function_call',
       'function_call',
       'function_result',
-      'function_result',
-      'user_input'
+      'function_result'
     ]);
-    expect(steps[4]).toEqual({
-      type: 'user_input',
-      content: [
-        { type: 'image', mime_type: 'image/png', data: 'Zmlyc3Q=' },
+    expect(steps[2]).toEqual({
+      type: 'function_result',
+      call_id: 'toolu_one',
+      name: 'screenshot',
+      result: [
+        { type: 'text', text: 'first' },
+        { type: 'image', mime_type: 'image/png', data: 'Zmlyc3Q=' }
+      ]
+    });
+    expect(steps[3]).toEqual({
+      type: 'function_result',
+      call_id: 'toolu_two',
+      name: 'screenshot',
+      result: [
+        { type: 'text', text: 'second' },
         { type: 'image', mime_type: 'image/png', data: 'c2Vjb25k' }
       ]
     });

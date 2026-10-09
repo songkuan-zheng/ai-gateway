@@ -118,6 +118,68 @@ describe('parseOpenAIResponsesRequest', () => {
     });
   });
 
+  // An untagged business object with a `text` field is not a protocol text
+  // block: collapsing it would keep that field and silently drop every sibling.
+  it('keeps a plain object carrying a text field as JSON', () => {
+    const result = parseOpenAIResponsesRequest({
+      model: 'gpt-5.5',
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'call_product',
+          output: [{ text: 'product', price: 123, sku: 'ABC' }]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    const toolResult = result.value.input
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .find((item) => item.type === 'tool_result');
+    expect(toolResult).toMatchObject({
+      type: 'tool_result',
+      tool_use_id: 'call_product',
+      content: '[{"text":"product","price":123,"sku":"ABC"}]'
+    });
+  });
+
+  it('keeps a plain object carrying a text field as JSON for anthropic tool results', () => {
+    const result = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-5',
+      max_tokens: 128,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_product',
+              content: [{ text: 'product', price: 123, sku: 'ABC' }]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok || typeof result.value.input === 'string') {
+      return;
+    }
+
+    const toolResult = result.value.input
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .find((item) => item.type === 'tool_result');
+    expect(toolResult).toMatchObject({
+      type: 'tool_result',
+      tool_use_id: 'call_product',
+      content: '[{"text":"product","price":123,"sku":"ABC"}]'
+    });
+  });
+
   it('lifts developer and system messages into instructions', () => {
     const result = parseOpenAIResponsesRequest({
       model: 'gpt-5.5',

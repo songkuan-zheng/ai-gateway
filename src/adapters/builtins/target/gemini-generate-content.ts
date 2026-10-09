@@ -245,7 +245,6 @@ function standardInputToGeminiInteractionsInput(
 
   for (const message of collectStandardInputMessages(input)) {
     const pendingContent: Array<Record<string, unknown>> = [];
-    const toolResultImages: Array<Record<string, unknown>> = [];
     const flushContent = () => {
       if (pendingContent.length === 0) {
         return;
@@ -333,41 +332,37 @@ function standardInputToGeminiInteractionsInput(
 
       if (item.type === 'tool_result') {
         const name = item.name || toolNamesById.get(item.tool_use_id) || item.tool_use_id;
+        // `result` is a list of subcontent entries whose union is text or
+        // image, so the images ride inline here and each stays bound to its own
+        // call_id. Deferring them to a trailing user_input step would drop that
+        // attribution and re-open a user turn inside a parallel result batch.
+        const result: Array<Record<string, unknown>> = [
+          {
+            type: 'text',
+            text: appendToolReferencesToResultContent(
+              item.content,
+              item.tool_references,
+              tools
+            )
+          }
+        ];
+        for (const imageUrl of item.images ?? []) {
+          const imageContent = standardImageToGeminiInteractionContent(imageUrl);
+          if (imageContent) {
+            result.push(imageContent);
+          }
+        }
+
         steps.push({
           type: 'function_result',
           call_id: item.tool_use_id,
           name,
-          result: [
-            {
-              type: 'text',
-              text: appendToolReferencesToResultContent(
-                item.content,
-                item.tool_references,
-                tools
-              )
-            }
-          ]
+          result
         });
-        // `function_result.result` only documents text subcontent, so the
-        // images ride in a user_input step instead of being dropped. It trails
-        // the whole message so a batch of function_result steps stays
-        // contiguous.
-        for (const imageUrl of item.images ?? []) {
-          const imageContent = standardImageToGeminiInteractionContent(imageUrl);
-          if (imageContent) {
-            toolResultImages.push(imageContent);
-          }
-        }
       }
     }
 
     flushContent();
-    if (toolResultImages.length > 0) {
-      steps.push({
-        type: 'user_input',
-        content: toolResultImages
-      });
-    }
   }
 
   return steps.length > 0
