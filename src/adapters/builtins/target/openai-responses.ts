@@ -405,6 +405,7 @@ function standardInputToOpenAIChatMessages(
   }
 
   const standardMessages = collectStandardInputMessages(input);
+  const batchContinues = computeToolBatchContinuation(standardMessages);
   // A tool message's content only accepts text parts, so tool-result images
   // ride in an adjacent user message. It must trail the *whole* parallel
   // tool_calls batch: opening a user turn between two tool messages leaves the
@@ -502,15 +503,9 @@ function standardInputToOpenAIChatMessages(
       pendingTrailingParts.push(contentParts);
     }
 
-    const next = standardMessages[index + 1];
-    const stillInBatch =
-      next !== undefined &&
-      next.role !== 'assistant' &&
-      hasToolResultContent(next.content);
-
     // Still inside the parallel group: hold this message's own content back so
     // nothing opens a user turn before the remaining results arrive.
-    if (!stillInBatch) {
+    if (!batchContinues[index]) {
       flushToolBatch();
     }
   }
@@ -532,6 +527,7 @@ function standardInputToOpenAIResponsesInput(
 
   const items: Array<Record<string, unknown>> = [];
   const standardMessages = collectStandardInputMessages(input);
+  const batchContinues = computeToolBatchContinuation(standardMessages);
   // `text` mode has no image position inside `function_call_output`, so the
   // images queue up and drain in one user message once the parallel tool batch
   // closes — which spans standard messages, since a source parser emits one per
@@ -539,7 +535,13 @@ function standardInputToOpenAIResponsesInput(
   // inside the batch waits in the same queue.
   const pendingToolImages: string[] = [];
   const pendingTrailingMessages: Array<{ role: string; content: Array<Record<string, unknown>> }> = [];
+  // Whether the previous message left the batch open, i.e. this message is a
+  // continuation of it. The batch's *last* message has no successor to look
+  // ahead to, yet still sits inside the batch: its content must queue behind
+  // what earlier messages already deferred, not jump ahead of it.
+  let batchOpen = false;
   const flushToolBatch = () => {
+    batchOpen = false;
     if (pendingToolImages.length > 0) {
       const imageParts = pendingToolImages.map((url) => ({
         type: 'input_image',
@@ -560,12 +562,11 @@ function standardInputToOpenAIResponsesInput(
 
   for (const [index, message] of standardMessages.entries()) {
     const role = message.role === 'assistant' ? 'assistant' : 'user';
-    const next = standardMessages[index + 1];
-    const stillInBatch =
-      message.role !== 'assistant' &&
-      next !== undefined &&
-      next.role !== 'assistant' &&
-      hasToolResultContent(next.content);
+    const stillInBatch = message.role !== 'assistant' && batchContinues[index];
+    // Inside a multi-message batch every flush is held back until it closes, so
+    // the batch's outputs stay contiguous and the deferred user content drains
+    // in its original order.
+    const holdBack = batchOpen || stillInBatch;
 
     if (message.role === 'assistant') {
       flushToolBatch();
@@ -681,7 +682,7 @@ function standardInputToOpenAIResponsesInput(
       if (item.type !== 'tool_search_output') {
         continue;
       }
-      flushPendingUserMessage();
+      flushPendingUserMessage(holdBack);
       items.push({
         type: 'tool_search_output',
         execution: item.execution,
@@ -690,9 +691,7 @@ function standardInputToOpenAIResponsesInput(
         tools: item.tools
       });
     }
-    // Held back when a further result of the same batch follows, so the batch
-    // stays contiguous.
-    flushPendingUserMessage(stillInBatch);
+    flushPendingUserMessage(holdBack);
 
     const toolResults = collectUserToolResults(message.content);
     for (const toolResult of toolResults) {
@@ -773,7 +772,9 @@ function standardInputToOpenAIResponsesInput(
       pendingToolImages.push(...toolImages);
     }
 
-    if (!stillInBatch) {
+    if (stillInBatch) {
+      batchOpen = true;
+    } else {
       flushToolBatch();
     }
   }
@@ -1054,12 +1055,55 @@ function collectAssistantReasoning(content: StandardRequestInputContent[]):
 
 /**
  * Whether a message still carries tool output, i.e. the batch it belongs to is
- * not closed yet. Cheap on purpose: it runs as a lookahead for every message,
- * where the full `collectUserToolResults` extraction would only yield a boolean.
+ * not closed yet. Cheap on purpose: it runs over every message, where the full
+ * `collectUserToolResults` extraction would only yield a boolean.
  */
 function hasToolResultContent(content: StandardRequestInputContent[]): boolean {
   return content.some(
     (item) => item.type === 'tool_result' || item.type === 'tool_search_output'
+  );
+}
+
+/**
+ * For each message, whether it sits inside a parallel tool batch that a later
+ * message still answers. A batch opens at an assistant turn that issues tool
+ * calls (or, for orphan outputs with no such turn in the input, at the first
+ * tool output) and closes at the next assistant turn. Outputs of one batch need
+ * not be adjacent — a client may interleave plain user messages — so this looks
+ * for any tool output before the next assistant turn, not just in the immediate
+ * successor. A user message that precedes the batch is never held back.
+ */
+function computeToolBatchContinuation(messages: StandardRequestInputMessage[]): boolean[] {
+  const laterToolOutput: boolean[] = new Array(messages.length).fill(false);
+  let seen = false;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    laterToolOutput[index] = seen;
+    const message = messages[index];
+    if (message.role === 'assistant') {
+      seen = false;
+    } else if (hasToolResultContent(message.content)) {
+      seen = true;
+    }
+  }
+
+  const continues: boolean[] = new Array(messages.length).fill(false);
+  let batchOpen = false;
+  for (const [index, message] of messages.entries()) {
+    if (message.role === 'assistant') {
+      batchOpen = hasToolCallContent(message.content);
+      continue;
+    }
+    if (hasToolResultContent(message.content)) {
+      batchOpen = true;
+    }
+    continues[index] = batchOpen && laterToolOutput[index];
+  }
+  return continues;
+}
+
+function hasToolCallContent(content: StandardRequestInputContent[]): boolean {
+  return content.some(
+    (item) => item.type === 'tool_use' || item.type === 'tool_search_call'
   );
 }
 

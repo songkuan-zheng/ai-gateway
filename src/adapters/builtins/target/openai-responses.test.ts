@@ -4326,6 +4326,364 @@ describe('openAIResponsesTargetAdapter', () => {
       ]
     });
   });
+
+  // The batch's last message has no successor to look ahead to, yet it still
+  // belongs to the batch: its text has to queue behind what the earlier
+  // messages deferred instead of jumping ahead of it.
+  describe('keeps the user text of a split tool batch in order', () => {
+    const anthropicRequest = {
+      model: 'target-model',
+      max_tokens: 128,
+      messages: [
+        { role: 'user', content: 'take two screenshots' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'Zmlyc3Q=' } }
+              ]
+            },
+            { type: 'text', text: 'earlier note' }
+          ]
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: [
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'c2Vjb25k' } }
+              ]
+            },
+            { type: 'text', text: 'later note' }
+          ]
+        }
+      ]
+    };
+
+    it('in native output mode', () => {
+      const body = buildAnthropicOpenAITargetBody(anthropicRequest, {}) as {
+        input: Array<Record<string, unknown>>;
+      };
+      expect(body.input.slice(1)).toEqual([
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_one',
+          output: [{ type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }]
+        },
+        {
+          type: 'function_call_output',
+          call_id: 'call_two',
+          output: [{ type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }]
+        },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'earlier note' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'later note' }] }
+      ]);
+    });
+
+    it('in text output mode', () => {
+      const body = buildAnthropicOpenAITargetBody(anthropicRequest, {
+        openaiResponsesToolOutputFormat: 'text'
+      }) as { input: Array<Record<string, unknown>> };
+      expect(body.input.slice(1)).toEqual([
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_one', output: '' },
+        { type: 'function_call_output', call_id: 'call_two', output: '' },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+            { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+            { type: 'input_text', text: 'earlier note' }
+          ]
+        },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'later note' }] }
+      ]);
+    });
+
+    it('in chat conversion', () => {
+      const body = buildAnthropicOpenAITargetBody(anthropicRequest, {
+        type: 'openai_chat_completions'
+      }) as { messages: Array<Record<string, unknown>> };
+      expect(body.messages.slice(1)).toEqual([
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            { id: 'call_one', type: 'function', function: { name: 'screenshot', arguments: '{}' } },
+            { id: 'call_two', type: 'function', function: { name: 'screenshot', arguments: '{}' } }
+          ]
+        },
+        { role: 'tool', tool_call_id: 'call_one', content: '' },
+        { role: 'tool', tool_call_id: 'call_two', content: '' },
+        {
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+            { type: 'text', text: 'earlier note' }
+          ]
+        },
+        { role: 'user', content: 'later note' }
+      ]);
+    });
+  });
+
+  // Outputs of one batch need not be adjacent: a client may put a plain user
+  // message between them. Looking only one message ahead would close the batch
+  // at that message and open a user turn while call_two is still unanswered.
+  describe('keeps a batch open across an interleaved plain user message', () => {
+    const responsesRequest = {
+      model: 'target-model',
+      input: [
+        { type: 'function_call', call_id: 'call_one', name: 'screenshot', arguments: '{}' },
+        { type: 'function_call', call_id: 'call_two', name: 'screenshot', arguments: '{}' },
+        {
+          type: 'function_call_output',
+          call_id: 'call_one',
+          output: [{ type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' }]
+        },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'between' }] },
+        {
+          type: 'function_call_output',
+          call_id: 'call_two',
+          output: [{ type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' }]
+        }
+      ]
+    };
+
+    function build(targetProviderConfig: Record<string, unknown>): Record<string, unknown> {
+      const parsed = parseOpenAIResponsesRequest(responsesRequest);
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        throw new Error(parsed.error);
+      }
+      const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+        request: { headers: {} } as never,
+        standardRequest: parsed.value,
+        config: { openaiApiKey: 'sk-test', openaiBaseUrl: 'https://mock.local/v1' } as never,
+        targetProviderConfig: targetProviderConfig as never
+      });
+      expect(built.ok).toBe(true);
+      if (!built.ok) {
+        throw new Error(built.error);
+      }
+      return built.value.body as Record<string, unknown>;
+    }
+
+    it('in native output mode', () => {
+      const body = build({}) as { input: Array<Record<string, unknown>> };
+      expect(body.input.map((item) => item.type)).toEqual([
+        'function_call',
+        'function_call',
+        'function_call_output',
+        'function_call_output',
+        'message'
+      ]);
+      expect(body.input[4]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'between' }]
+      });
+    });
+
+    it('in text output mode', () => {
+      const body = build({ openaiResponsesToolOutputFormat: 'text' }) as {
+        input: Array<Record<string, unknown>>;
+      };
+      expect(body.input.map((item) => item.type)).toEqual([
+        'function_call',
+        'function_call',
+        'function_call_output',
+        'function_call_output',
+        'message'
+      ]);
+      expect(body.input[4]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+          { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+          { type: 'input_text', text: 'between' }
+        ]
+      });
+    });
+
+    it('in chat conversion', () => {
+      const body = build({ type: 'openai_chat_completions' }) as {
+        messages: Array<Record<string, unknown>>;
+      };
+      expect(body.messages.map((message) => message.role)).toEqual([
+        'assistant',
+        'tool',
+        'tool',
+        'user'
+      ]);
+      expect(body.messages[3]).toEqual({
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+          { type: 'text', text: 'between' }
+        ]
+      });
+    });
+  });
+
+  // A tool_search_output answers the same batch as the function outputs, so the
+  // user text that precedes it inside an open batch has to wait for the batch
+  // to close rather than splitting the outputs.
+  describe('holds user text ahead of a tool_search_output inside an open batch', () => {
+    const standardRequest = {
+      model: 'target-model',
+      max_output_tokens: 128,
+      input: [
+        {
+          type: 'message',
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'call_one', name: 'screenshot', input: {} },
+            {
+              type: 'tool_search_call',
+              execution: 'client',
+              call_id: 'search_one',
+              arguments: { query: 'calendar' }
+            },
+            { type: 'tool_use', id: 'call_two', name: 'screenshot', input: {} }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_one',
+              content: 'first',
+              images: ['data:image/png;base64,Zmlyc3Q=']
+            }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            { type: 'input_text', text: 'searching next' },
+            { type: 'tool_search_output', execution: 'client', call_id: 'search_one', tools: [] }
+          ]
+        },
+        {
+          type: 'message',
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_two',
+              content: 'second',
+              images: ['data:image/png;base64,c2Vjb25k']
+            }
+          ]
+        }
+      ]
+    } as never;
+
+    function build(targetProviderConfig: Record<string, unknown>): Record<string, unknown> {
+      const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+        request: { headers: {} } as never,
+        standardRequest,
+        config: { openaiApiKey: 'sk-test', openaiBaseUrl: 'https://mock.local/v1' } as never,
+        targetProviderConfig: targetProviderConfig as never
+      });
+      expect(built.ok).toBe(true);
+      if (!built.ok) {
+        throw new Error(built.error);
+      }
+      return built.value.body as Record<string, unknown>;
+    }
+
+    it('in native output mode', () => {
+      const body = build({}) as { input: Array<Record<string, unknown>> };
+      expect(body.input.map((item) => item.type)).toEqual([
+        'function_call',
+        'tool_search_call',
+        'function_call',
+        'function_call_output',
+        'tool_search_output',
+        'function_call_output',
+        'message'
+      ]);
+      expect(body.input[6]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'searching next' }]
+      });
+    });
+
+    it('in text output mode', () => {
+      const body = build({ openaiResponsesToolOutputFormat: 'text' }) as {
+        input: Array<Record<string, unknown>>;
+      };
+      expect(body.input.map((item) => item.type)).toEqual([
+        'function_call',
+        'tool_search_call',
+        'function_call',
+        'function_call_output',
+        'tool_search_output',
+        'function_call_output',
+        'message'
+      ]);
+      expect(body.input[6]).toEqual({
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: 'data:image/png;base64,Zmlyc3Q=' },
+          { type: 'input_image', image_url: 'data:image/png;base64,c2Vjb25k' },
+          { type: 'input_text', text: 'searching next' }
+        ]
+      });
+    });
+
+    it('in chat conversion', () => {
+      const body = build({ type: 'openai_chat_completions' }) as {
+        messages: Array<Record<string, unknown>>;
+      };
+      expect(body.messages.map((message) => message.role)).toEqual([
+        'assistant',
+        'tool',
+        'tool',
+        'tool',
+        'user'
+      ]);
+      expect(body.messages.slice(1, 4).map((message) => message.tool_call_id)).toEqual([
+        'call_one',
+        'search_one',
+        'call_two'
+      ]);
+      expect(body.messages[4]).toEqual({
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,Zmlyc3Q=' } },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,c2Vjb25k' } },
+          { type: 'text', text: 'searching next' }
+        ]
+      });
+    });
+  });
 });
 
 function buildAnthropicOpenAITargetBody(
